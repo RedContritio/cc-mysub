@@ -1,0 +1,18 @@
+serverAddr = "<frps host or IP>"
+serverPort = 7000
+auth.method = "token"
+auth.token = "REPLACE-WITH-YOUR-FRPS-TOKEN"
+transport.tls.enable = true
+
+# https + https2http: TLS 终结在本机, frps 看不到明文
+[[proxies]]
+name = "cc-mysub"
+type = "https"
+customDomains = ["cc-mysub.<your-domain>"]
+
+[proxies.plugin]
+type = "https2http"
+localAddr = "127.0.0.1:8788"
+crtPath = "/Users/<you>/.config/cc-mysub/certs/cc-mysub.<your-domain>.crt"
+keyPath = "/Users/<you>/.config/cc-mysub/certs/cc-mysub.<your-domain>.key"
+hostHeaderRewrite = "cc-mysub.<your-domain>"
