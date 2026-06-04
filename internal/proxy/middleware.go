@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -29,7 +31,7 @@ func DeviceLabel(ctx context.Context) string {
 }
 
 // AuthMiddleware validates the per-device token (Bearer or x-api-key) and
-// injects the resolved device into the request context. Unknown tokens → 401.
+// injects the resolved device into the request context. Unknown tokens get 401.
 func AuthMiddleware(a Authenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +89,7 @@ type captureWriter struct {
 	status  int
 	buf     bytes.Buffer
 	isSSE   bool
+	gzipEnc bool
 	capped  bool
 	wroteHd bool
 }
@@ -94,6 +97,7 @@ type captureWriter struct {
 func (c *captureWriter) WriteHeader(code int) {
 	c.status = code
 	c.isSSE = strings.Contains(c.Header().Get("Content-Type"), "text/event-stream")
+	c.gzipEnc = strings.Contains(c.Header().Get("Content-Encoding"), "gzip")
 	c.wroteHd = true
 	c.ResponseWriter.WriteHeader(code)
 }
@@ -117,11 +121,48 @@ func (c *captureWriter) Flush() {
 	}
 }
 
-func (c *captureWriter) usage() Usage {
-	if c.isSSE {
-		return SniffUsageSSE(c.buf.Bytes())
+// ReadFrom forces ReverseProxy's io.Copy through Write so the buffer is teed.
+// Without this, captureWriter would inherit the underlying ResponseWriter's
+// ReadFrom (via embedding) and io.Copy would bypass Write, losing usage data.
+func (c *captureWriter) ReadFrom(src io.Reader) (int64, error) {
+	buf := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := c.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return total, nil
+			}
+			return total, rerr
+		}
 	}
-	return SniffUsageJSON(c.buf.Bytes())
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (c *captureWriter) Unwrap() http.ResponseWriter { return c.ResponseWriter }
+
+// usage sniffs model + token counts from the buffered response, transparently
+// gunzipping first when the upstream used Content-Encoding: gzip (Claude's API
+// does when the client sends Accept-Encoding: gzip, which real CC always does).
+func (c *captureWriter) usage() Usage {
+	data := c.buf.Bytes()
+	if c.gzipEnc {
+		if zr, err := gzip.NewReader(bytes.NewReader(data)); err == nil {
+			if dec, _ := io.ReadAll(zr); len(dec) > 0 {
+				data = dec // partial decode tolerated when the buffer was capped
+			}
+		}
+	}
+	if c.isSSE {
+		return SniffUsageSSE(data)
+	}
+	return SniffUsageJSON(data)
 }
 
 // AccessLog records device/status/usage/baseline for each request.

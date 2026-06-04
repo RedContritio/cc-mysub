@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bytes"
+	"compress/gzip"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/redcontritio/cc-mysub/internal/auth"
@@ -92,5 +95,40 @@ func TestAccessLogOutboundWarn(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages", nil))
 	if got.OutboundWarn != "upstream_auth_rejected" {
 		t.Errorf("outbound warn = %q", got.OutboundWarn)
+	}
+}
+
+func TestCaptureWriterReadFromTees(t *testing.T) {
+	rec := httptest.NewRecorder()
+	cw := &captureWriter{ResponseWriter: rec, status: 200}
+	cw.Header().Set("Content-Type", "application/json")
+	cw.WriteHeader(200)
+	body := `{"model":"m","usage":{"input_tokens":3,"output_tokens":4}}`
+	if _, err := cw.ReadFrom(strings.NewReader(body)); err != nil {
+		t.Fatal(err)
+	}
+	u := cw.usage()
+	if u.Model != "m" || u.InputTokens != 3 || u.OutputTokens != 4 {
+		t.Errorf("usage via ReadFrom not captured: %+v", u)
+	}
+	if rec.Body.String() != body {
+		t.Errorf("body not forwarded: %q", rec.Body.String())
+	}
+}
+
+func TestCaptureWriterDecodesGzip(t *testing.T) {
+	rec := httptest.NewRecorder()
+	cw := &captureWriter{ResponseWriter: rec, status: 200}
+	cw.Header().Set("Content-Type", "application/json")
+	cw.Header().Set("Content-Encoding", "gzip")
+	cw.WriteHeader(200)
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	_, _ = zw.Write([]byte(`{"model":"gz","usage":{"input_tokens":7,"output_tokens":8}}`))
+	_ = zw.Close()
+	_, _ = cw.Write(gz.Bytes())
+	u := cw.usage()
+	if u.Model != "gz" || u.InputTokens != 7 || u.OutputTokens != 8 {
+		t.Errorf("gzip usage not decoded: %+v", u)
 	}
 }
