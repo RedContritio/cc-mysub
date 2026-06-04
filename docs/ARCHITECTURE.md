@@ -11,6 +11,7 @@ CC MySub 是一个本地代理，让你在**任意设备**上运行原生 Claude
    │  ANTHROPIC_BASE_URL=<你的入口>
    │  CLAUDE_CODE_OAUTH_TOKEN=<per-device token>
    │  CLAUDE_CODE_OAUTH_SCOPES=user:inference
+   │  CLAUDE_CODE_SUBSCRIPTION_TYPE=<tier，如 max>
    ▼
 [加密信道: Tailscale / TLS / frp https]
    ▼
@@ -24,7 +25,22 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 ## 为什么客户端用 CLAUDE_CODE_OAUTH_TOKEN
 
-要让远程 CC **保持订阅模式**（而非降级为 API 计费），客户端必须用 `CLAUDE_CODE_OAUTH_TOKEN` + `CLAUDE_CODE_OAUTH_SCOPES=user:inference`，配合 `ANTHROPIC_BASE_URL`。Claude Code 的 provider 判定不看 base_url（仍视为 first-party），订阅判定只看 OAuth scope——因此「自定义 base_url + 订阅模式」可以共存。用 `ANTHROPIC_AUTH_TOKEN` 则会被判为非订阅凭据，丢失订阅行为。
+要让远程 CC 走**订阅认证**（而非降级为 API 计费），客户端必须用 `CLAUDE_CODE_OAUTH_TOKEN` + `CLAUDE_CODE_OAUTH_SCOPES=user:inference`，配合 `ANTHROPIC_BASE_URL`。Claude Code 的 provider 判定不看 base_url（仍视为 first-party），认证模式判定只看 OAuth scope——因此「自定义 base_url + 订阅认证」可以共存。用 `ANTHROPIC_AUTH_TOKEN` 则会被判为非订阅凭据，丢失订阅行为。
+
+## 订阅认证 vs 订阅档位（两个正交判定）
+
+客户端 CC 的「认证模式」与「订阅档位」是**两个正交判定**，输入不同，互不替代：
+
+- **认证模式**（是否走订阅 OAuth、是否带 `oauth-2025-04-20` beta、是否用非 api-key 的 Bearer）：**只看 OAuth scope**，即上面的 `CLAUDE_CODE_OAUTH_SCOPES`（不设时默认含 `user:inference`）。这一层决定请求是否以订阅身份发出，与档位无关。
+- **订阅档位**（pro / max / team / enterprise，对应 UI 上的「Claude Max」标签与 tier 功能）：**只来自客户端 env `CLAUDE_CODE_SUBSCRIPTION_TYPE`**。不设此 env 时档位为 `null`，于是 UI 显示「Claude API」、auto 权限模式下的 Bash classifier 不工作（卡在逐个命令确认）、1M 变体不可选、tier 相关 beta 不下发。把它设为你的真实档位（如 `CLAUDE_CODE_SUBSCRIPTION_TYPE=max`），即可恢复 Max 标签、auto 权限模式 classifier（每次工具调用前先发一个极小请求逐个放行）、1M 变体可选与 tier beta 下发。
+
+早先把「经代理后掉成 API 模式、丢 auto mode」误判为**认证**问题，实为只缺**档位** env：认证那层（scope）一直成立、从未失败，缺的只是 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。
+
+**1M 是可选变体而非默认**：`CLAUDE_CODE_SUBSCRIPTION_TYPE=max` 解锁的是「1M 变体可被选择」，默认仍是 200k；需在 CC 里 `/model` 选「Opus 4.8 (1M context)」才切到 1M，切后 `/status` 才显示 1M。
+
+**诚实标注**：`CLAUDE_CODE_SUBSCRIPTION_TYPE` 是客户端**本地 env 声明、CC 不验真**——在 `CLAUDE_CODE_OAUTH_TOKEN` 路径下，客户端 CC 直读此 env、不做真伪校验。因此客户端的 tier 自我认知 ≠ 服务端鉴权：上游真 Anthropic 是否接受这套，取决于代理后面挂的真 setup-token 的真实权限，二进制层面无法断言服务端如何处理占位的 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。这不改变本方案「真 CC + 纯透传、逐字节不可区分」的合规定位，而 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env；但绝不可由此声称「服务端必然接受」或「凭空获得 Max 权益」。
+
+**代理对这些 env 全程无感**：`CLAUDE_CODE_OAUTH_SCOPES` 与 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 都在客户端 CC 侧设置、由客户端 CC 自行消费，代理既不读取也不注入，只做透传——这正呼应下文「代理不实现任何认证逻辑」。
 
 ## 代理核心：头变换
 
@@ -56,9 +72,11 @@ per-device token 与真 setup-token 是**两个独立随机串，无密码学关
 
 ## 认证与凭据管理（`~/.config/cc-mysub/`）
 
-- `config.json` — 监听设置 `{listen, tls?}`。
+- `config.json` — 监听设置 `{listen, tls?}`，可选 `client`（部署常量：`public_host` / `frps_ip` / `subscription_type`，供签发设备时填 wrapper）。
 - `upstream.json`（chmod 600）— `{oauthToken}`，你的真 setup-token。
 - `devices.json` — `[{label, token_sha256, rate_limit}]`，代理只存 token 的 sha256。
+
+签发设备用 `cc-mysub add-device --label <设备名>`：它签发 per-device token、把 sha256 追加进 `devices.json`，并生成一份已填好的 `myclaude` wrapper（设置好客户端那几个 env、把代理域名直连 frps IP、跳过 onboarding）交给该设备。
 
 吊销 = 删 `devices.json` 条目；文件改动通过 mtime polling 热重载，无需重启。
 

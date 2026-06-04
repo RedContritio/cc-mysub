@@ -38,6 +38,15 @@ CC MySub 属于 **B 类**方案：每台设备运行**真正的 Claude Code 二�
 
 **注意**：使用消费级 OAuth 凭据须遵守 Anthropic 的服务条款；多设备共享单份订阅应控制在合理个人使用范围内。
 
+## 订阅档位声明（subscriptionType）的诚实边界
+
+客户端要在 UI 上显示 Max 标签、解锁 auto mode 的 Bash classifier、让 1M 变体可选、收到 tier beta，依赖客户端本地环境变量 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 声明订阅档位（pro/max/team/enterprise）。需要诚实说明它的边界：
+
+- **这是客户端本地 env 声明，CC 不验真。** 在占位 token（OAUTH_TOKEN 路径）下，真 CC 直接读取本机 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 来决定 tier 自我认知，不对其真伪做任何校验。它只影响客户端自己的界面与门控，不是一道服务端授权。
+- **客户端 tier 自我认知 ≠ 服务端鉴权。** 上游真 Anthropic 是否接受这套档位，取决于代理后面挂的**真 setup-token 的真实权限**，而非客户端声明的 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。二进制层面无法断言服务端如何处理占位 subscriptionType——不要据此声称"服务端必然接受"。
+- **它不改变 B 类定位。** 整链仍是真 CC + 纯透传、与设备直连逐字节不可区分；`CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env，由客户端自行声明其持有的档位。
+- **不要据此"凭空获得"未持有的订阅权益。** 该 env 只让客户端按声明的档位呈现界面与功能门控；真正的订阅权益与计费归属，始终落在代理后那份真 setup-token 对应的账户上。请按你实际持有的档位填写。
+
 ## 4. 报告漏洞
 
 请通过 GitHub 的**私有 security advisory** 上报：仓库页面 → **Security** 标签 → **Report a vulnerability**。
