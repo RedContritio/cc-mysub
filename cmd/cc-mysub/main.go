@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -9,10 +11,24 @@ import (
 
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
+	"github.com/redcontritio/cc-mysub/internal/enroll"
 	"github.com/redcontritio/cc-mysub/internal/proxy"
 )
 
 func main() {
+	// Subcommands. Bare invocation (no subcommand) still serves, so launchd and
+	// existing `cc-mysub [--config-dir ...]` usage keep working unchanged.
+	if len(os.Args) > 1 && os.Args[1] == "add-device" {
+		if err := enroll.Run(os.Args[2:], defaultConfigDir(), os.Stdout); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			fmt.Fprintln(os.Stderr, "add-device:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfgDir := flag.String("config-dir", defaultConfigDir(), "config directory")
 	flag.Parse()
 

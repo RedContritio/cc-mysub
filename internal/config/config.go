@@ -11,10 +11,20 @@ type TLSConfig struct {
 	Key  string `json:"key"`
 }
 
+// ClientConfig holds the deployment-facing constants used to generate a
+// per-device `myclaude` wrapper (see `cc-mysub add-device`). They are fixed for
+// a given deployment; only the device label and token vary per device.
+type ClientConfig struct {
+	PublicHost       string `json:"public_host"`       // 代理对外域名 (frp https vhost)
+	FrpsIP           string `json:"frps_ip"`           // frps 公网 IP, 供 wrapper 绕本地 DNS 直连
+	SubscriptionType string `json:"subscription_type"` // 你的真实订阅档: pro/max/team/enterprise
+}
+
 type Config struct {
-	Listen          string     `json:"listen"`
-	TLS             *TLSConfig `json:"tls,omitempty"`
-	UpstreamBaseURL string     `json:"upstream_base_url,omitempty"`
+	Listen          string        `json:"listen"`
+	TLS             *TLSConfig    `json:"tls,omitempty"`
+	UpstreamBaseURL string        `json:"upstream_base_url,omitempty"`
+	Client          *ClientConfig `json:"client,omitempty"`
 }
 
 type Upstream struct {

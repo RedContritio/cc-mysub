@@ -1,0 +1,285 @@
+package enroll
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/redcontritio/cc-mysub/internal/auth"
+	"github.com/redcontritio/cc-mysub/internal/config"
+)
+
+// ---- GenerateToken ----
+
+func TestGenerateTokenFormat(t *testing.T) {
+	tok, err := GenerateToken()
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	if !strings.HasPrefix(tok, "cco_dev_") {
+		t.Errorf("token %q lacks cco_dev_ prefix", tok)
+	}
+	body := strings.TrimPrefix(tok, "cco_dev_")
+	// 24 random bytes -> 48 hex chars (matches README's `openssl rand -hex 24`).
+	if !regexp.MustCompile(`^[0-9a-f]{48}$`).MatchString(body) {
+		t.Errorf("token body %q is not 48 lowercase hex chars", body)
+	}
+}
+
+func TestGenerateTokenUnique(t *testing.T) {
+	a, _ := GenerateToken()
+	b, _ := GenerateToken()
+	if a == b {
+		t.Errorf("two GenerateToken calls returned identical token %q", a)
+	}
+}
+
+// ---- RenderWrapper ----
+
+func TestRenderWrapperFillsValues(t *testing.T) {
+	p := Params{PublicHost: "ccapi.example.com", FrpsIP: "203.0.113.10", SubType: "max"}
+	out, err := RenderWrapper(p, "cco_dev_deadbeef")
+	if err != nil {
+		t.Fatalf("RenderWrapper: %v", err)
+	}
+	for _, want := range []string{
+		`PROXY_HOST="ccapi.example.com"`,
+		`FRPS_IP="203.0.113.10"`,
+		`DEVICE_TOKEN="cco_dev_deadbeef"`,
+		`SUB_TYPE="max"`,
+		`CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered wrapper missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// 核心契约: 工具绝不替用户预设小模型。
+func TestRenderWrapperDoesNotDecideSmallModel(t *testing.T) {
+	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	if err != nil {
+		t.Fatalf("RenderWrapper: %v", err)
+	}
+	if strings.Contains(out, "claude-haiku") {
+		t.Errorf("wrapper bakes in a concrete small model (claude-haiku); must not decide for user\n%s", out)
+	}
+	// 不得有任何【未注释】的 ANTHROPIC_SMALL_FAST_MODEL 赋值/导出。
+	active := regexp.MustCompile(`(?m)^\s*(export\s+)?ANTHROPIC_SMALL_FAST_MODEL=`)
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue // 注释里给个 <placeholder> 示例是允许的
+		}
+		if active.MatchString(line) {
+			t.Errorf("wrapper actively sets ANTHROPIC_SMALL_FAST_MODEL (decides for user): %q", line)
+		}
+	}
+}
+
+func TestRenderWrapperIsValidBash(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	if err != nil {
+		t.Fatalf("RenderWrapper: %v", err)
+	}
+	f := filepath.Join(t.TempDir(), "myclaude")
+	if err := os.WriteFile(f, []byte(out), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := exec.Command("bash", "-n", f).CombinedOutput(); err != nil {
+		t.Errorf("rendered wrapper is not valid bash: %v\n%s", err, b)
+	}
+}
+
+// ---- AppendDevice ----
+
+func readDevices(t *testing.T, path string) []auth.Device {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read devices: %v", err)
+	}
+	var list []auth.Device
+	if err := json.Unmarshal(b, &list); err != nil {
+		t.Fatalf("parse devices: %v", err)
+	}
+	return list
+}
+
+func TestAppendDeviceCreatesFileWithCorrectHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	p := Params{Label: "laptop", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max", RateLimit: 120}
+	const tok = "cco_dev_abc123"
+	if err := AppendDevice(path, p, tok); err != nil {
+		t.Fatalf("AppendDevice: %v", err)
+	}
+	list := readDevices(t, path)
+	if len(list) != 1 {
+		t.Fatalf("want 1 device, got %d", len(list))
+	}
+	d := list[0]
+	if d.Label != "laptop" || d.RateLimit != 120 {
+		t.Errorf("unexpected device %+v", d)
+	}
+	if d.TokenSHA256 != auth.HashToken(tok) {
+		t.Errorf("stored sha256 %q != HashToken(token) %q", d.TokenSHA256, auth.HashToken(tok))
+	}
+	// 明文 token 绝不入库。
+	if strings.Contains(string(mustRead(t, path)), tok) {
+		t.Errorf("plaintext token leaked into devices.json")
+	}
+}
+
+func TestAppendDevicePreservesExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_a"))
+	must(t, AppendDevice(path, Params{Label: "b", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_b"))
+	list := readDevices(t, path)
+	if len(list) != 2 {
+		t.Fatalf("want 2 devices, got %d", len(list))
+	}
+	if list[0].Label != "a" || list[1].Label != "b" {
+		t.Errorf("order/content wrong: %+v", list)
+	}
+}
+
+func TestAppendDeviceRejectsDuplicateLabel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "dup", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_1"))
+	err := AppendDevice(path, Params{Label: "dup", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_2")
+	if err == nil {
+		t.Fatalf("expected error on duplicate label, got nil")
+	}
+	if !strings.Contains(err.Error(), "dup") {
+		t.Errorf("error should mention the duplicate label: %v", err)
+	}
+}
+
+// ---- Resolve ----
+
+func TestResolveFlagOverridesConfig(t *testing.T) {
+	def := &config.ClientConfig{PublicHost: "cfg.example.com", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	got, err := Resolve(def, Params{Label: "x", SubType: "pro"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.PublicHost != "cfg.example.com" || got.FrpsIP != "1.1.1.1" {
+		t.Errorf("config defaults not applied: %+v", got)
+	}
+	if got.SubType != "pro" {
+		t.Errorf("flag override not applied, want pro got %q", got.SubType)
+	}
+}
+
+func TestResolveUsesConfigWhenNoFlags(t *testing.T) {
+	def := &config.ClientConfig{PublicHost: "cfg.example.com", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	got, err := Resolve(def, Params{Label: "x"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.PublicHost != "cfg.example.com" || got.FrpsIP != "1.1.1.1" || got.SubType != "max" {
+		t.Errorf("config not used as default: %+v", got)
+	}
+}
+
+func TestResolveRequiresLabel(t *testing.T) {
+	def := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	if _, err := Resolve(def, Params{}); err == nil {
+		t.Errorf("expected error when label missing")
+	}
+}
+
+func TestResolveRequiresHostFrpsSub(t *testing.T) {
+	cases := map[string]*config.ClientConfig{
+		"no host": {FrpsIP: "1.1.1.1", SubscriptionType: "max"},
+		"no frps": {PublicHost: "h", SubscriptionType: "max"},
+		"no sub":  {PublicHost: "h", FrpsIP: "1.1.1.1"},
+		"nil cfg": nil,
+	}
+	for name, def := range cases {
+		if _, err := Resolve(def, Params{Label: "x"}); err == nil {
+			t.Errorf("%s: expected error for missing required field", name)
+		}
+	}
+}
+
+// ---- Run (integration) ----
+
+func TestRunEndToEnd(t *testing.T) {
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","subscription_type":"max"}}`), 0o644))
+
+	outDir := t.TempDir()
+	wrapperPath := filepath.Join(outDir, "myclaude-laptop")
+	var sb strings.Builder
+	err := Run([]string{"--label", "laptop", "--out", wrapperPath}, cfgDir, &sb)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// devices.json 落了一条
+	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
+	if len(list) != 1 || list[0].Label != "laptop" {
+		t.Fatalf("devices.json not written correctly: %+v", list)
+	}
+
+	// wrapper 文件写出且可执行
+	fi, err := os.Stat(wrapperPath)
+	if err != nil {
+		t.Fatalf("wrapper not written: %v", err)
+	}
+	if fi.Mode().Perm()&0o100 == 0 {
+		t.Errorf("wrapper not executable: %v", fi.Mode())
+	}
+	w := string(mustRead(t, wrapperPath))
+	if !strings.Contains(w, `PROXY_HOST="ccapi.example.com"`) || !strings.Contains(w, `SUB_TYPE="max"`) {
+		t.Errorf("wrapper not filled from config: \n%s", w)
+	}
+
+	// 打印的明文 token 与库内 sha256 对得上，且 wrapper 里也带着它
+	printed := sb.String()
+	tok := extractToken(t, printed)
+	if list[0].TokenSHA256 != auth.HashToken(tok) {
+		t.Errorf("printed token does not match stored hash")
+	}
+	if !strings.Contains(w, tok) {
+		t.Errorf("wrapper does not embed the generated token")
+	}
+}
+
+// ---- helpers ----
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+var tokenRE = regexp.MustCompile(`cco_dev_[0-9a-f]{48}`)
+
+func extractToken(t *testing.T, s string) string {
+	t.Helper()
+	m := tokenRE.FindString(s)
+	if m == "" {
+		t.Fatalf("no cco_dev_ token found in output:\n%s", s)
+	}
+	return m
+}
