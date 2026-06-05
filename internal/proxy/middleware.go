@@ -111,6 +111,17 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 	}
 }
 
+// NOTE: globalAnonLimiter is package-shared across all RateLimitByDevice
+// instances (the global cap is intentionally process-wide). The existing
+// TestRateLimit_ExemptsTelemetry / TestRateLimitByDevice429 inject a device, so
+// they take the device branch and are unaffected. But because the global bucket
+// is shared, tests that exercise the anon branch and EXPECT a 200 must run
+// under fresh budget — globalAnonPerMin=60 gives ample headroom and the burst
+// (=60) is fresh at NewLimiter; no test exhausts it before asserting 200 except
+// TestGlobalAnonCap itself which asserts the 61st. If contract_test or other
+// anon-path tests in the same package later flake, key by a per-instance
+// limiter instead — but spec wants a process-wide cap, so keep package-shared.
+
 // AccessRecord is one structured access-log entry.
 type AccessRecord struct {
 	Device       string
