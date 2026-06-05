@@ -82,7 +82,7 @@ func main() {
 	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
 	// allowlist 仅 MITM Anthropic 控制面/数据面 host（纵深防御，拒其余）。
 	fp := proxy.NewForwardProxy(minter, store, up, nil,
-		[]string{"api.anthropic.com", "console.anthropic.com"}, cfg.Client.PublicHost)
+		[]string{"api.anthropic.com", "console.anthropic.com"}, cfg.Client.PublicHost, 512)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
