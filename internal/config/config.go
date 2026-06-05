@@ -27,8 +27,60 @@ type Config struct {
 	Client          *ClientConfig `json:"client,omitempty"`
 }
 
+// UpstreamToken 是 token 池中的单个条目，导出类型供跨包构造字面量（如 proxy 包测试）。
+type UpstreamToken struct {
+	ID    string `json:"id"`
+	Token string `json:"token"`
+}
+
 type Upstream struct {
-	OAuthToken string `json:"oauthToken"`
+	OAuthToken  string          `json:"oauthToken,omitempty"`  // 旧单 token
+	OAuthTokens []UpstreamToken `json:"oauthTokens,omitempty"` // 池
+}
+
+// PickToken 按 id 从池中取 token：id 命中返回对应 token；空 id 返回池首个（或旧单 token）；
+// 未命中返回空串（调用方负责 fail）。返回空串唯一地表示「未命中」——parseUpstream 已保证池条目
+// id/token 非空，故 "" 不会是某个合法条目的值。
+func (u *Upstream) PickToken(id string) string {
+	if len(u.OAuthTokens) == 0 {
+		// legacy 单 token：仅默认（空 id）取用；指定 id 在无池下属未命中，不静默回退（治理总纲：错误可见）。
+		if id == "" {
+			return u.OAuthToken
+		}
+		return ""
+	}
+	if id == "" {
+		return u.OAuthTokens[0].Token
+	}
+	for _, t := range u.OAuthTokens {
+		if t.ID == id {
+			return t.Token
+		}
+	}
+	return ""
+}
+
+// parseUpstream 将 JSON 字节解析为 Upstream，校验至少存在一种 token 配置；池条目严格校验
+// id/token 非空且 id 不重复，使误配在加载期即暴露（治理总纲：错误可见、禁止静默默认）。
+func parseUpstream(b []byte) (*Upstream, error) {
+	var u Upstream
+	if err := json.Unmarshal(b, &u); err != nil {
+		return nil, fmt.Errorf("parse upstream: %w", err)
+	}
+	if u.OAuthToken == "" && len(u.OAuthTokens) == 0 {
+		return nil, fmt.Errorf("upstream.json: no oauthToken(s)")
+	}
+	seen := make(map[string]bool, len(u.OAuthTokens))
+	for i, t := range u.OAuthTokens {
+		if t.ID == "" || t.Token == "" {
+			return nil, fmt.Errorf("upstream.json: pool entry %d has empty id or token", i)
+		}
+		if seen[t.ID] {
+			return nil, fmt.Errorf("upstream.json: duplicate pool id %q", t.ID)
+		}
+		seen[t.ID] = true
+	}
+	return &u, nil
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -54,12 +106,5 @@ func LoadUpstream(path string) (*Upstream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read upstream: %w", err)
 	}
-	var u Upstream
-	if err := json.Unmarshal(b, &u); err != nil {
-		return nil, fmt.Errorf("parse upstream: %w", err)
-	}
-	if u.OAuthToken == "" {
-		return nil, fmt.Errorf("upstream.json: oauthToken is empty")
-	}
-	return &u, nil
+	return parseUpstream(b)
 }

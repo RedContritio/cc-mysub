@@ -45,3 +45,45 @@ func TestLoadUpstreamRejectsEmpty(t *testing.T) {
 		t.Fatal("expected error on empty oauthToken")
 	}
 }
+
+func TestUpstream_PoolAndLegacy(t *testing.T) {
+	// 旧单 token 兼容
+	u1, err := parseUpstream([]byte(`{"oauthToken":"sk-ant-oat01-A"}`))
+	if err != nil || u1.PickToken("") != "sk-ant-oat01-A" {
+		t.Fatalf("legacy single: %v %q", err, u1.PickToken(""))
+	}
+	// legacy 模式 + 非空 id：无池可命中 → 未命中 → 空串（不静默回退单 token）
+	if u1.PickToken("some-id") != "" {
+		t.Errorf("legacy with non-empty id should be empty, got %q", u1.PickToken("some-id"))
+	}
+	// 池 + 按 id 取
+	u2, err := parseUpstream([]byte(`{"oauthTokens":[{"id":"a","token":"sk-ant-oat01-A"},{"id":"b","token":"sk-ant-oat01-B"}]}`))
+	if err != nil {
+		t.Fatalf("pool parse: %v", err)
+	}
+	if u2.PickToken("b") != "sk-ant-oat01-B" {
+		t.Errorf("pool pick b = %q", u2.PickToken("b"))
+	}
+	if u2.PickToken("") != "sk-ant-oat01-A" { // 空 id 取第一个(默认)
+		t.Errorf("pool default = %q", u2.PickToken(""))
+	}
+	if u2.PickToken("zzz") != "" { // 未知 id → 空(调用方 fail)
+		t.Errorf("unknown id should be empty")
+	}
+}
+
+// TestParseUpstream_StrictContract 覆盖严格契约：两种 token 全空、空池、池条目空 id/token、重复 id 均须报错。
+func TestParseUpstream_StrictContract(t *testing.T) {
+	cases := map[string]string{
+		"both empty":          `{}`,
+		"explicit empty pool": `{"oauthTokens":[]}`,
+		"empty token in pool": `{"oauthTokens":[{"id":"a","token":""}]}`,
+		"empty id in pool":    `{"oauthTokens":[{"id":"","token":"sk-ant-oat01-A"}]}`,
+		"duplicate pool id":   `{"oauthTokens":[{"id":"a","token":"X"},{"id":"a","token":"Y"}]}`,
+	}
+	for name, body := range cases {
+		if _, err := parseUpstream([]byte(body)); err == nil {
+			t.Errorf("%s: expected error, got nil", name)
+		}
+	}
+}
