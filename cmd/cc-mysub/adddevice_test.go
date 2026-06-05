@@ -69,11 +69,12 @@ func TestAddDeviceSubcommand(t *testing.T) {
 		t.Errorf("wrapper missing NODE_EXTRA_CA_CERTS:\n%s", w)
 	}
 
-	// wrapper 含明文 DEVICE_TOKEN：须 0o600(无 group/other 位，无 exec-by-others)。
+	// wrapper 含明文 DEVICE_TOKEN：须 0o700(owner rwx，group/other 无权)。
+	// 0o700 确保 owner 可执行（放入 PATH 后可直接调用），同时 group/other 无法读取 token。
 	if fi, err := os.Stat(wrapper); err != nil {
 		t.Fatalf("stat wrapper: %v", err)
-	} else if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Errorf("wrapper mode = %#o want 0o600", perm)
+	} else if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Errorf("wrapper mode = %#o want 0o700", perm)
 	}
 }
 
