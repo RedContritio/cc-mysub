@@ -1,0 +1,8 @@
+# catch-all: 一切域名 → 127.0.0.2 (collector)；PROXY_HOST → 127.0.0.1 (cc-mysub)。
+# 只配 A（IPv4）；故 AAAA 查询天然返回 NODATA → 逼 claude 走 v4（collector/cc-mysub 仅 IPv4 监听）。
+no-resolv
+no-hosts
+bind-interfaces
+listen-address=127.0.0.1
+address=/#/127.0.0.2
+address=/__PROXY_HOST__/127.0.0.1
