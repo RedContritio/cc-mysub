@@ -62,7 +62,8 @@ build_bins() {
   mkdir -p "$WORK/bin" "$WORK/cfg" "$WORK/certs" "$WORK/home"
   ( cd "$REPO" && go build -o "$WORK/bin/cc-mysub" ./cmd/cc-mysub \
                 && go build -o "$WORK/bin/mock" ./ci/egress/mock \
-                && go build -o "$WORK/bin/collector" ./ci/egress/collector ) || fail "go build"
+                && go build -o "$WORK/bin/collector" ./ci/egress/collector \
+                && go build -o "$WORK/bin/diag" ./ci/egress/diag ) || fail "go build"
   openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$WORK/certs/key.pem" -out "$WORK/certs/cert.pem" \
     -subj "/CN=$PROXY_HOST" -addext "subjectAltName=DNS:$PROXY_HOST" >/dev/null 2>&1 || fail "openssl"
@@ -130,7 +131,7 @@ run_claude() {
     CLAUDE_CODE_OAUTH_TOKEN="$TOK" \
     CLAUDE_CODE_OAUTH_SCOPES="user:inference" \
     CLAUDE_CODE_SUBSCRIPTION_TYPE="max" \
-    NODE_EXTRA_CA_CERTS="$WORK/certs/cert.pem" \
+    NODE_EXTRA_CA_CERTS="${CA_FOR_CLAUDE:-$WORK/certs/cert.pem}" \
     DISABLE_AUTOUPDATER=1 \
     timeout 120 claude -p "reply with the single word OK" > "$WORK/claude.out" 2>&1
   echo "[run.sh] claude rc=$?"
@@ -150,6 +151,40 @@ dump_and_assert() {
   claude --version 2>/dev/null || true
 }
 
+# --- Phase 1 调查: TLS-MITM 刻画绕过 base_url 的直连 ---
+WORK_CA="$WORK/ca"
+gen_ca_and_leaf() {
+  mkdir -p "$WORK_CA"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout "$WORK_CA/ca.key" -out "$WORK_CA/ca.crt" -subj "/CN=egress-ci-CA" >/dev/null 2>&1
+  openssl req -newkey rsa:2048 -nodes -keyout "$WORK_CA/leaf.key" -out "$WORK_CA/leaf.csr" -subj "/CN=$PROXY_HOST" >/dev/null 2>&1
+  openssl x509 -req -in "$WORK_CA/leaf.csr" -CA "$WORK_CA/ca.crt" -CAkey "$WORK_CA/ca.key" -CAcreateserial -days 1 \
+    -extfile <(printf "subjectAltName=DNS:%s" "$PROXY_HOST") -out "$WORK_CA/leaf.crt" >/dev/null 2>&1
+  cat > "$WORK/cfg/config.json" <<JSON
+{"listen":"127.0.0.1:443","tls":{"cert":"$WORK_CA/leaf.crt","key":"$WORK_CA/leaf.key"},
+ "upstream_base_url":"http://127.0.0.1:9443",
+ "client":{"public_host":"$PROXY_HOST","frps_ip":"127.0.0.1","subscription_type":"max"}}
+JSON
+  echo "{\"oauthToken\":\"$MOCKTEST\"}" > "$WORK/cfg/upstream.json"
+  echo '[]' > "$WORK/cfg/devices.json"
+}
+start_services_diag() {
+  in_ns bash -c "exec '$WORK/bin/mock' > '$WORK/mock.out' 2>'$WORK/mock.err'" &
+  in_ns bash -c "CA_CERT='$WORK_CA/ca.crt' CA_KEY='$WORK_CA/ca.key' exec '$WORK/bin/diag' > '$WORK/diag.out' 2>'$WORK/diag.err'" &
+  in_ns bash -c "exec '$WORK/bin/cc-mysub' --config-dir '$WORK/cfg' > '$WORK/cc.out' 2>'$WORK/cc.err'" &
+  sleep 2
+  in_ns timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null || fail "cc-mysub not on :443"
+  log "services up (diag mode: mock + TLS-MITM diag + cc-mysub)"
+}
+stage_diag() {
+  setup_netns; apply_firewall; build_bins; gen_ca_and_leaf; start_dns; start_services_diag; enroll
+  CA_FOR_CLAUDE="$WORK_CA/ca.crt" run_claude
+  $SUDO pkill -INT -f "$WORK/bin/diag" 2>/dev/null || true
+  $SUDO pkill -INT -f "$WORK/bin/mock" 2>/dev/null || true
+  sleep 1
+  echo "===== MOCK AUTHS (经 cc-mysub 换 token 后) ====="; cat "$WORK/mock.out" 2>/dev/null
+  echo "===== DIAG: 绕过 base_url 的直连 (TLS-MITM, 含 path + Authorization) ====="; cat "$WORK/diag.out" 2>/dev/null
+}
+
 stage1() { setup_netns; apply_firewall; selfcheck_seal; }
 stage2() { setup_netns; apply_firewall; start_dns; assert_dns; }
 stage3() { setup_netns; apply_firewall; build_bins; start_dns; start_services; enroll; curl_token_swap; }
@@ -160,6 +195,7 @@ case "$STAGE" in
   --stage2) stage2 ;;
   --stage3) stage3 ;;
   --stage4|--all) stage4 ;;
-  *) echo "usage: $0 [--stage1|--stage2|--stage3|--stage4|--all]"; exit 2 ;;
+  --diag) stage_diag ;;
+  *) echo "usage: $0 [--stage1|--stage2|--stage3|--stage4|--all|--diag]"; exit 2 ;;
 esac
 log "stage '$STAGE' done."
