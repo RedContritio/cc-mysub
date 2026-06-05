@@ -18,9 +18,6 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:9000" {
 		t.Errorf("Listen = %q", cfg.Listen)
 	}
-	if cfg.UpstreamBaseURL != "https://api.anthropic.com" {
-		t.Errorf("UpstreamBaseURL default = %q", cfg.UpstreamBaseURL)
-	}
 }
 
 func TestLoadUpstream(t *testing.T) {

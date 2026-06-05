@@ -6,11 +6,6 @@ import (
 	"os"
 )
 
-type TLSConfig struct {
-	Cert string `json:"cert"`
-	Key  string `json:"key"`
-}
-
 // ClientConfig holds the deployment-facing constants used to generate a
 // per-device `myclaude` wrapper (see `cc-mysub add-device`). They are fixed for
 // a given deployment; only the device label and token vary per device.
@@ -21,10 +16,8 @@ type ClientConfig struct {
 }
 
 type Config struct {
-	Listen          string        `json:"listen"`
-	TLS             *TLSConfig    `json:"tls,omitempty"`
-	UpstreamBaseURL string        `json:"upstream_base_url,omitempty"`
-	Client          *ClientConfig `json:"client,omitempty"`
+	Listen string        `json:"listen"`
+	Client *ClientConfig `json:"client,omitempty"`
 }
 
 // UpstreamToken 是 token 池中的单个条目，导出类型供跨包构造字面量（如 proxy 包测试）。
@@ -94,9 +87,6 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:8788"
-	}
-	if c.UpstreamBaseURL == "" {
-		c.UpstreamBaseURL = "https://api.anthropic.com"
 	}
 	return &c, nil
 }
