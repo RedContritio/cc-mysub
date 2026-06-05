@@ -176,9 +176,14 @@ func TestCaptureWriterDecodesGzip(t *testing.T) {
 // 已鉴权请求走 device 分支、永不触碰全局 limiter -> 不受影响。豁免遥测路径
 // 即便匿名也永不 cap(字节级保真)。
 //
-// 该测试直接驱动 RateLimitByDevice(全局 cap 内嵌于其匿名分支)，且每次构造新的
-// 中间件实例以拿到 fresh 的全局 limiter(避免跨测试污染共享 bucket)。
+// 该测试直接驱动 RateLimitByDevice(全局 cap 内嵌于其匿名分支)。globalAnonLimiter
+// 是包级单例(process-wide cap by design)，构造新的中间件实例不会重置它。为保证
+// 测试顺序无关性，在本测试开始时用 fresh limiter 替换包级变量并在结束时恢复。
 func TestGlobalAnonCap(t *testing.T) {
+	saved := globalAnonLimiter
+	globalAnonLimiter = newAnonLimiter()
+	t.Cleanup(func() { globalAnonLimiter = saved })
+
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	// 不注入 device => 匿名分支。defaultPerMin 取大值，证明 cap 来自全局而非 per-device。
 	h := RateLimitByDevice(100000)(next)
@@ -203,6 +208,10 @@ func TestGlobalAnonCap(t *testing.T) {
 // TestGlobalAnonCap_AuthedUnaffected 契约：已鉴权请求不被全局匿名 cap 影响。
 // 即便全局 anon 桶已耗尽，带 device 的请求(高 per-device 限额)照常通过。
 func TestGlobalAnonCap_AuthedUnaffected(t *testing.T) {
+	saved := globalAnonLimiter
+	globalAnonLimiter = newAnonLimiter()
+	t.Cleanup(func() { globalAnonLimiter = saved })
+
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	h := RateLimitByDevice(100000)(next)
 

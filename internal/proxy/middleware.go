@@ -68,10 +68,15 @@ func isExempt(path string) bool {
 // exempt telemetry paths (byte-faithful passthrough).
 const globalAnonPerMin = 60
 
+// newAnonLimiter constructs a fresh Limiter for the global anonymous bucket.
+// Extracted so tests can substitute a fresh instance per test run without
+// reaching into the ratelimit package directly.
+func newAnonLimiter() *ratelimit.Limiter { return ratelimit.NewLimiter(nil) }
+
 // globalAnonLimiter is the single shared bucket for all anonymous inner
 // requests. Keyed by a fixed sentinel so every anon request draws from one
 // global quota regardless of source.
-var globalAnonLimiter = ratelimit.NewLimiter(nil)
+var globalAnonLimiter = newAnonLimiter()
 
 const globalAnonKey = "" // device-independent: one global anon bucket
 
@@ -112,15 +117,10 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 }
 
 // NOTE: globalAnonLimiter is package-shared across all RateLimitByDevice
-// instances (the global cap is intentionally process-wide). The existing
-// TestRateLimit_ExemptsTelemetry / TestRateLimitByDevice429 inject a device, so
-// they take the device branch and are unaffected. But because the global bucket
-// is shared, tests that exercise the anon branch and EXPECT a 200 must run
-// under fresh budget — globalAnonPerMin=60 gives ample headroom and the burst
-// (=60) is fresh at NewLimiter; no test exhausts it before asserting 200 except
-// TestGlobalAnonCap itself which asserts the 61st. If contract_test or other
-// anon-path tests in the same package later flake, key by a per-instance
-// limiter instead — but spec wants a process-wide cap, so keep package-shared.
+// instances (the global cap is intentionally process-wide). Tests that exercise
+// the anon non-exempt branch must save/restore globalAnonLimiter via
+// t.Cleanup so they are hermetic regardless of execution order or -count.
+// newAnonLimiter() is provided for exactly this purpose.
 
 // AccessRecord is one structured access-log entry.
 type AccessRecord struct {
