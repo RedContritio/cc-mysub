@@ -1,33 +1,37 @@
 # CC MySub
 
-一个 Go 单二进制本地代理，让**任意设备**上的真·Claude Code 通过 `ANTHROPIC_BASE_URL` 指向你的本机，复用本机持有的**单份订阅** setup-token，完整保留订阅功能（包括 auto 权限模式）。订阅凭据集中本机、永不下发；每台设备只持有一个可独立吊销的 per-device token。
+一个 Go 单二进制，让**任意设备**上的真·Claude Code 通过**egress 收口**复用本机持有的单份订阅。
+设备只设 `HTTPS_PROXY` 指向本地 `cc-mysub helper`（用户态、无系统改动）；helper **仅把 `api.anthropic.com`/`console.anthropic.com` 流量**经外层 TLS 转发到远程 cc-mysub forward-proxy，后者做内层 MITM token 换发；**其余一切**（WebFetch 目标、MCP、更新、第三方遥测、包管理器）helper 本地直连真主机，永不接触 cc-mysub。`base_url` 保持默认 `api.anthropic.com`，不改。
+
+订阅凭据集中本机、永不下发；每台设备只持有一个可独立吊销的 per-device token。
 
 它**不是** Web 终端——每台设备跑的是真正的 Claude Code CLI，本机只做纯传输代理。架构细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，安全与合规见 [`SECURITY.md`](SECURITY.md)。
 
 ## ⚠️ 安全前提
 
-客户端是真 CC（不可改），无法在应用层做防重放签名 → 安全必须来自**信道加密**。
+客户端是真 CC（不可改），无法在应用层做防重放签名。安全必须来自**信道加密**：cc-mysub 自有 CA 签发 `public_host` 身份证书，helper 用已下发 CA 公证书验证外层 TLS；设备经 `NODE_EXTRA_CA_CERTS` 信任 cc-mysub CA 做内层 MITM 验证。
 
-**裸明文 http（零加密层）传 per-device token 不安全。** 请用下表任一加密信道暴露本机端口。代理代码对入口层无感，监听本地端口即可。
+frp 入口层必须用 **`type=tcp`** 透传——外层 TLS 由 cc-mysub 自己终结，frp 不可在边缘终结 TLS（`https`/`https2http` 在 v4 作废）。
 
-## 入口层加密矩阵
+## 入口层
 
-| 方案 | 客户端 `ANTHROPIC_BASE_URL` | 加密层 | 备注 |
-|---|---|---|---|
-| Tailscale / WireGuard（首推）| `http://<ts-ip>:8788` | 网络层 WireGuard | 零证书 / 零域名，穿透 NAT |
-| 代理自签 TLS | `https://<host>:8788` | 代理 `config.tls` | 无域名；客户端设 `NODE_EXTRA_CA_CERTS` 指向自签 CA |
-| 真域名 + Let's Encrypt | `https://<your-domain>` | frp `https2http` / 代理 TLS | 客户端零配置（见 `deploy/frpc.example.toml`）|
+远程暴露使用 frp **`type=tcp`** 透传（L4 直通，外层 TLS 完整到达 cc-mysub）。见 [`deploy/frpc.example.toml`](deploy/frpc.example.toml)。
 
-## 客户端配置
+## 客户端工作方式（v4 helper 形态）
 
-在每台设备上设置以下四个环境变量（`base_url` 取上表对应行）：
+`add-device` 生成的 `myclaude` wrapper 形如：
 
 ```bash
-export ANTHROPIC_BASE_URL=<上表 base_url>
-export CLAUDE_CODE_OAUTH_TOKEN=<你给该设备签发的 per-device token>
-export CLAUDE_CODE_OAUTH_SCOPES=user:inference
-export CLAUDE_CODE_SUBSCRIPTION_TYPE=<你的订阅档: pro / max / team / enterprise>
+exec cc-mysub helper \
+  --upstream <frps_ip:proxy_port> \
+  --server-name <public_host> \
+  --ca <path/to/ca.crt> \
+  -- claude "$@"
 ```
+
+wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA）、占位 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_SCOPES=user:inference`、`CLAUDE_CODE_SUBSCRIPTION_TYPE`。`HTTPS_PROXY` 由 helper 在运行时注入（指向本地临时端口），**不在 wrapper 中硬编码**。
+
+设备**无需设置 `ANTHROPIC_BASE_URL`**——`base_url` 保持默认 `api.anthropic.com`，helper 的分流逻辑负责把 Anthropic 流量路由到 cc-mysub。
 
 这里涉及两个相互正交的判定，输入各自不同：
 
@@ -37,8 +41,6 @@ export CLAUDE_CODE_SUBSCRIPTION_TYPE=<你的订阅档: pro / max / team / enterp
 注意 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 只是客户端本地的自我声明，CC 不对其做真伪校验；上游真 Anthropic 是否接受这套，取决于本机代理后面挂的真 setup-token 的实际权限——它本就是给订阅用户使用的 env，但不代表凭它就能凭空获得相应权益。
 
 仍须用 `CLAUDE_CODE_OAUTH_TOKEN`：用 `ANTHROPIC_AUTH_TOKEN` 会被判为非订阅凭据，丢失订阅行为。
-
-> 实践中你**不必手动设置**这些 env——用 [`cc-mysub add-device`](#签发一台设备cc-mysub-add-device) 在签发设备时生成的 `myclaude` wrapper 会自动设好它们（含 `base_url`、token、scope、订阅档），你在设备上直接运行 `myclaude` 即可。上面的语义说明用于理解每个 env 的作用。
 
 ### 订阅档位与 1M
 
@@ -52,9 +54,11 @@ export CLAUDE_CODE_SUBSCRIPTION_TYPE=<你的订阅档: pro / max / team / enterp
 
 | 文件 | 内容 | 权限 |
 |---|---|---|
-| `config.json` | `{"listen":"127.0.0.1:8788"}`（可选 `"tls":{...}`、`"client":{...}`，见下）| — |
-| `upstream.json` | `{"oauthToken":"sk-ant-oat01-..."}`，你的真 setup-token | chmod 600 |
-| `devices.json` | `[{"label":"laptop","token_sha256":"<sha256 of per-device token>","rate_limit":120}]`，由 `add-device` 维护 | — |
+| `config.json` | `{"listen":"127.0.0.1:8788","client":{"public_host":"...","frps_ip":"...","proxy_port":8788,"subscription_type":"max"}}` | — |
+| `upstream.json` | token 池：`{"oauthTokens":[{"id":"a","token":"sk-ant-oat01-..."}]}`（chmod 600；旧式 `{"oauthToken":"..."}` 单 token 仍可用）| chmod 600 |
+| `devices.json` | `[{"label":"laptop","token_sha256":"...","upstream":"a","rate_limit":120}]`，由 `add-device` 维护；`upstream` 字段指向使用哪个池中 token | — |
+| `ca.crt` | cc-mysub 自有 CA 公证书，由 `add-device` 首次生成，需拷到设备 | 0644 |
+| `ca.key` | CA 私钥，由 `add-device` 首次生成，**永不入 git、永不离开本机** | 0600 |
 
 代理只存 per-device token 的 sha256，从不存明文。文件改动通过 mtime polling 热重载，无需重启。
 
@@ -68,23 +72,30 @@ export CLAUDE_CODE_SUBSCRIPTION_TYPE=<你的订阅档: pro / max / team / enterp
   "client": {
     "public_host": "ccapi.example.com",
     "frps_ip": "203.0.113.10",
+    "proxy_port": 8788,
     "subscription_type": "max"
   }
 }
 ```
 
-之后每台设备只需一条命令——它签发 per-device token、把 sha256 写入 `devices.json`，并生成一份**已填好**的 `myclaude` wrapper：
+之后每台设备只需一条命令——它签发 per-device token、把 sha256 写入 `devices.json`、指定使用的池中 token id，并首次生成 `ca.crt`/`ca.key`（幂等：已存在则复用），最后生成一份**已填好**的 `myclaude` wrapper：
 
 ```bash
-cc-mysub add-device --label laptop
+cc-mysub add-device --label laptop --upstream a
 # → 打印交给该设备的明文 token（仅此一次）
 # → 写入 devices.json（只存 sha256）
-# → 生成 ./myclaude-laptop（已填入 host / frps_ip / token / 订阅档）
+# → 首次生成 ca.crt / ca.key（已有则跳过）
+# → 生成 ./myclaude-laptop（已填入 upstream / server-name / ca / token / 订阅档）
 ```
 
-把生成的 `myclaude-laptop` 拷到该设备的 PATH（如 `~/.local/bin/myclaude`），之后在该设备上用 `myclaude` 代替 `claude` 即可——wrapper 内部设置好上面那四个 env、把代理域名直连 frps IP（绕本地 DNS 分流）、跳过 onboarding 预检，再把所有参数透传给真 `claude`。
+**设备部署三件事**：
+1. 拷贝 `cc-mysub` 二进制（用于运行 `helper` 子命令）
+2. 拷贝 `ca.crt`（公证书，路径见 add-device 输出）
+3. 拷贝生成的 `myclaude-laptop` wrapper 到 PATH（如 `~/.local/bin/myclaude`）
 
-任一部署常量都可用 flag 覆盖：`cc-mysub add-device --label work --sub pro`（亦支持 `--host` / `--frps-ip` / `--rate-limit` / `--out` / `--config-dir`）。生成的 wrapper **不会**替你预设 classifier 小模型（`ANTHROPIC_SMALL_FAST_MODEL`）；需要时取消 wrapper 里那行注释、自行填入即可。
+之后在该设备上用 `myclaude` 代替 `claude` 即可。helper 直拨 `frps_ip:proxy_port` 的 cc-mysub forward-proxy，外层 TLS 验证其 `public_host` 身份；non-Anthropic 流量 helper 本地直连，不经 cc-mysub。
+
+任一部署常量都可用 flag 覆盖：`cc-mysub add-device --label work --sub pro`（亦支持 `--host` / `--frps-ip` / `--proxy-port` / `--rate-limit` / `--out` / `--config-dir`）。生成的 wrapper **不会**替你预设 classifier 小模型（`ANTHROPIC_SMALL_FAST_MODEL`）；需要时取消 wrapper 里那行注释、自行填入即可。
 
 代理热重载会自动加载新设备，无需重启。
 

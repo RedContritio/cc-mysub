@@ -4,15 +4,12 @@ auth.method = "token"
 auth.token = "REPLACE-WITH-YOUR-FRPS-TOKEN"
 transport.tls.enable = true
 
-# https + https2http: TLS 终结在本机, frps 看不到明文
+# v4: tcp 透传(L4)。外层 TLS 由 cc-mysub 自己终结(身份=public_host)，frp 不可在边缘终结 TLS，
+# 否则会破坏 helper↔cc-mysub 的外层 TLS。旧的 https/https2http(边缘终结 TLS)在 v4 作废。
 [[proxies]]
 name = "cc-mysub"
-type = "https"
-customDomains = ["cc-mysub.<your-domain>"]
-
-[proxies.plugin]
-type = "https2http"
-localAddr = "127.0.0.1:8788"
-crtPath = "/Users/<you>/.config/cc-mysub/certs/cc-mysub.<your-domain>.crt"
-keyPath = "/Users/<you>/.config/cc-mysub/certs/cc-mysub.<your-domain>.key"
-hostHeaderRewrite = "cc-mysub.<your-domain>"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8788          # cc-mysub forward-proxy 监听端口
+remotePort = 8788         # frps 暴露的端口 = 客户端 helper 的 --upstream 端口(ProxyPort)
+                          # 必须与 config.json client.proxy_port 一致
