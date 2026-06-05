@@ -367,7 +367,7 @@ func newSpyProxy(t *testing.T, tokenToUpstream map[string]string, allow []string
 	store := newTestStore(t, tokenToUpstream)
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, serverName, 8)
-	fp.minter = spy // overwrite with spy (both satisfy certMinter)
+	fp.minter = spy // 覆写为 spy(both satisfy certMinter)
 	caPool := x509.NewCertPool()
 	caPool.AddCert(ca.Cert)
 	return fp, spy, caPool
