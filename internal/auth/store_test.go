@@ -34,6 +34,38 @@ func TestStoreLookup(t *testing.T) {
 	}
 }
 
+func TestDevice_UpstreamField(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "devices.json")
+	tok := "cco_dev_x"
+	writeDevices(t, p, `[{"label":"l","token_sha256":"`+HashToken(tok)+`","upstream":"b"}]`)
+	s, err := NewDeviceStore(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, ok := s.Lookup(tok)
+	if !ok || d.Upstream != "b" {
+		t.Fatalf("upstream = %q ok=%v", d.Upstream, ok)
+	}
+
+	// 哨兵值 "" = 使用默认 token：字段缺失 与 显式 "upstream":"" 两种零值路径都须解析为 ""。
+	missing, explicit := "cco_dev_missing", "cco_dev_explicit"
+	writeDevices(t, p, `[`+
+		`{"label":"m","token_sha256":"`+HashToken(missing)+`"},`+
+		`{"label":"e","token_sha256":"`+HashToken(explicit)+`","upstream":""}`+
+		`]`)
+	s2, err := NewDeviceStore(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range []string{missing, explicit} {
+		d, ok := s2.Lookup(tk)
+		if !ok || d.Upstream != "" {
+			t.Errorf("token %q: upstream = %q ok=%v, want empty sentinel", tk, d.Upstream, ok)
+		}
+	}
+}
+
 func TestStoreHotReload(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")

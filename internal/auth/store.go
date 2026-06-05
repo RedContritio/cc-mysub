@@ -12,6 +12,7 @@ type Device struct {
 	Label       string `json:"label"`
 	TokenSHA256 string `json:"token_sha256"`
 	RateLimit   int    `json:"rate_limit"` // 每分钟请求数; 0 = 用默认
+	Upstream    string `json:"upstream"`   // 所属 setup-token id; 空 = 使用默认 token
 }
 
 type DeviceStore struct {
