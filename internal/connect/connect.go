@@ -42,3 +42,73 @@ func ValidHost(h string) bool {
 	}
 	return true
 }
+
+// ParseProxyAuthorization 解析单条 CONNECT 头行,提取信道层 Bearer token。
+// 头名须 EqualFold 精确等于 "Proxy-Authorization"(拒前缀/后缀影射如
+// X-Proxy-Authorization / Proxy-Authorization-Foo,拒名与冒号间空白);scheme 须
+// Bearer(大小写不敏感)。token 空/全空白/含内部空格/控制字符/CR/LF/NUL/非可打印
+// → ok=false(空为硬不变量,不委托上层 Lookup,镜像 ValidHost 白名单)。
+//
+// 调用方(forward.go)用 br.ReadString('\n') 读头,行尾带 \r\n,故先剥恰一个行尾
+// 终止符;剥后任何内部 CR/LF 视为注入,拒。
+func ParseProxyAuthorization(headerLine string) (string, bool) {
+	line := headerLine
+	if strings.HasSuffix(line, "\r\n") {
+		line = strings.TrimSuffix(line, "\r\n")
+	} else if strings.HasSuffix(line, "\n") {
+		line = strings.TrimSuffix(line, "\n")
+	}
+	// 剥行尾后,任何残留 CR/LF 都是注入(如 "Bearer a\rb")。
+	if strings.ContainsAny(line, "\r\n") {
+		return "", false
+	}
+
+	i := strings.IndexByte(line, ':')
+	if i < 0 {
+		return "", false
+	}
+	name := line[:i]
+	// 拒名与冒号间空白(如 "Proxy-Authorization "):名末位不得为 SP/TAB。
+	if name == "" || name[len(name)-1] == ' ' || name[len(name)-1] == '\t' {
+		return "", false
+	}
+	if !strings.EqualFold(name, "Proxy-Authorization") {
+		return "", false
+	}
+
+	val := line[i+1:]
+	// 标准头 OWS:恰剥一个可选前导 SP(Go/客户端发出的规范形)。
+	if strings.HasPrefix(val, " ") {
+		val = val[1:]
+	}
+	// scheme = 首个 SP 前的子串;须 EqualFold "Bearer"。须存在分隔 SP 与 token。
+	sp := strings.IndexByte(val, ' ')
+	if sp < 0 {
+		return "", false // "Bearer"(无值无空格) / 无 scheme
+	}
+	if !strings.EqualFold(val[:sp], "Bearer") {
+		return "", false
+	}
+	token := val[sp+1:]
+	if !validToken(token) {
+		return "", false
+	}
+	return token, true
+}
+
+// validToken 接受非空、仅含 token-合法可打印 ASCII 的 token;拒空、空格、TAB、
+// 控制字符、NUL、非 ASCII。字符集为 ValidHost 白名单的 token 超集(加 _ ~ + / = .)。
+func validToken(t string) bool {
+	if t == "" {
+		return false
+	}
+	for _, r := range t {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_', r == '~', r == '+', r == '/', r == '=':
+		default:
+			return false
+		}
+	}
+	return true
+}
