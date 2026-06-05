@@ -3,10 +3,17 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
 )
+
+// emptyTokenHash is the sha256 of the empty token. A devices.json row carrying
+// this digest can only ever be matched by an empty presented token, which is
+// itself rejected at Lookup's entry — so such a row is always inert. Reject it
+// at load so it never even occupies a map slot.
+var emptyTokenHash = HashToken("")
 
 type Device struct {
 	Label       string `json:"label"`
@@ -49,9 +56,10 @@ func (s *DeviceStore) reload() error {
 	}
 	m := make(map[string]Device, len(list))
 	for _, d := range list {
-		if d.TokenSHA256 != "" {
-			m[d.TokenSHA256] = d
+		if d.TokenSHA256 == "" || d.TokenSHA256 == emptyTokenHash {
+			continue
 		}
+		m[d.TokenSHA256] = d
 	}
 	s.mu.Lock()
 	s.byHash = m
@@ -61,6 +69,9 @@ func (s *DeviceStore) reload() error {
 }
 
 func (s *DeviceStore) Lookup(token string) (Device, bool) {
+	if token == "" {
+		return Device{}, false
+	}
 	h := HashToken(token)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -85,7 +96,10 @@ func (s *DeviceStore) StartWatch() {
 				changed := fi.ModTime().After(s.lastMod)
 				s.mu.RUnlock()
 				if changed {
-					_ = s.reload() // 解析失败保留旧表
+					if err := s.reload(); err != nil {
+						// 保留旧表，但大声 surface 失败：手滑改坏 devices.json 不得静默不撤销。
+						slog.Error("devices reload failed; keeping previous table", "err", err)
+					}
 				}
 			}
 		}
