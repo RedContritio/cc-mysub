@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 	"sync"
 	"time"
 
@@ -99,34 +98,36 @@ func newRewriteHandler(a Authenticator, up *config.Upstream, rt http.RoundTrippe
 	return conditionalAuth(a, up)(forwardSwap(rt))
 }
 
+// certMinter is the subset of *mitm.Minter that handle() needs: synthesize a
+// leaf cert for a host. A package-local interface (not the concrete *mitm.Minter)
+// lets forward_test inject a spy that records CertFor(host) calls, so the
+// '407/400 path never mints a leaf for the CONNECT host' contract is observable.
+// *mitm.Minter satisfies this unchanged.
+type certMinter interface {
+	CertFor(host string) (*tls.Certificate, error)
+}
+
 // ForwardProxy 是 CONNECT forward-proxy。整个 device↔cc-mysub 跳被外层 TLS 包裹
 // （外层呈现 cc-mysub 自身身份证书 serverName，使 CONNECT 目标 host 不以明文上线）；
 // 在外层 TLS 内读 CONNECT 目标、按 allowlist 拒非法 host（纵深防御），回 200 后再按 host
 // 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP 请求经 rewrite handler 转发到真目标 host。
 type ForwardProxy struct {
-	minter     certMinter      // 现签证书；*mitm.Minter 满足此接口；spy 可注入
-	auth       Authenticator   // 信道层准入 Lookup（CONNECT Proxy-Authorization 验证）
+	minter     certMinter      // 现签外层身份证书 + 内层 MITM 叶证书（spy 可注入）
 	handler    http.Handler    // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
+	auth       Authenticator   // 信道层准入：CONNECT 头 Proxy-Authorization 校验（spec §3.2）
 	allow      map[string]bool // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
 	serverName string          // 外层 TLS 身份（cc-mysub public_host），现签证书的 CN/SAN
-	sema       chan struct{}    // 全局并发上限；saturated → Accept+Close（shed）
+	sema       chan struct{}   // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
 	wg         sync.WaitGroup  // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
-}
-
-// certMinter is the interface satisfied by *mitm.Minter; extracted so forward_test
-// can inject a spy that records which hosts are signed (security assertion: 407/400
-// paths must never mint a leaf for the CONNECT host).
-type certMinter interface {
-	CertFor(host string) (*tls.Certificate, error)
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
 // handle goroutine + FD 永久占住（写出 200 后清除，交内层 http.Server 的 ReadHeaderTimeout 接管）。
 const handshakeReadTimeout = 15 * time.Second
 
-// maxConnectHeaderBytes 是 CONNECT 请求行 + 所有头行的总字节上限（pre-200 阶段）。
-// 超限返回 400 并断连，防攻击方用超大 CONNECT 头 OOM / 占满 goroutine。
-// 不用 io.LimitReader 包 conn（会被 bufio 预读误计，破坏 prefixConn 回放），故手动字节累加。
+// maxConnectHeaderBytes 限定 pre-200 阶段（CONNECT 行 + 全部 CONNECT 头）的累计字节数，
+// 防超长头打爆 handle goroutine 内存。手动累加器，不用 io.LimitReader——后者会与 bufio 预读
+// 互相误计并破坏 br.Buffered()/prefixConn 的流水线回放（spec §3.2 第 1 点）。
 const maxConnectHeaderBytes = 8192
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
@@ -152,31 +153,23 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 			),
 		),
 	)
-	sema := make(chan struct{}, maxInFlight)
 	return &ForwardProxy{
 		minter:     m,
-		auth:       a,
 		handler:    handler,
+		auth:       a,
 		allow:      allowSet,
 		serverName: serverName,
-		sema:       sema,
+		sema:       make(chan struct{}, maxInFlight),
 	}
 }
 
 // Serve 接受连接并逐个 MITM 处理，直到 ln 关闭。
-// 并发上限由 fp.sema 控制：获取 token 后才派发 goroutine；饱和时立即关闭连接（shed）。
 func (fp *ForwardProxy) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			fp.wg.Wait() // 等在途连接收尾，避免孤儿 goroutine 在调用方释放资源后访问
 			return err
-		}
-		select {
-		case fp.sema <- struct{}{}:
-		default:
-			conn.Close() // shed: semaphore saturated
-			continue
 		}
 		fp.wg.Add(1)
 		go fp.handle(conn)
@@ -185,7 +178,6 @@ func (fp *ForwardProxy) Serve(ln net.Listener) error {
 
 func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	defer fp.wg.Done()
-	defer func() { <-fp.sema }()
 	// 外层 TLS：呈现 cc-mysub 自身身份证书（serverName），终结 device↔cc-mysub 跳。
 	// 此后所有读写都走 outer（Close(outer) 即 Close(rawConn)）。
 	outer := tls.Server(rawConn, &tls.Config{
@@ -196,17 +188,8 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	// slowloris 防护：外层握手 + CONNECT 读取阶段设读 deadline；写出 200 后清除。
 	_ = outer.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
 	br := bufio.NewReader(outer)
-	// 手动字节累加器(pre-200 cap，§3.2 第 1 点):CONNECT 行 + 每个头行的长度累加,
-	// 超 maxConnectHeaderBytes → 400 + Close。不用 io.LimitReader 包 conn——会被 bufio
-	// 预读误计并破坏 br.Buffered()/prefixConn 回放。
 	line, err := br.ReadString('\n')
 	if err != nil {
-		outer.Close()
-		return
-	}
-	byteCount := len(line)
-	if byteCount > maxConnectHeaderBytes {
-		_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 		outer.Close()
 		return
 	}
@@ -217,60 +200,22 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
-	// 信道层准入(§3.2):读完 CONNECT 头到空行,精确计数 Proxy-Authorization。
-	//   - 行首 SP/TAB(obs-fold 续行)→ 407(拒头折叠走私)
-	//   - 每行调 connect.ParseProxyAuthorization,name 命中即计数
-	//   - count != 1(0 或 >1,禁 last-wins)→ 407
-	//   - count == 1 且 ok==false → 407
-	// 校验置于 allowlist 之前:tokenless 一律 407、不泄露 allowlist 成员(消 host oracle)。
-	var token string
-	paCount := 0
-	channelFail := false
+	// allowlist 纵深防御：只 MITM 白名单内的 host，其余一律 403，不签证书、不建内层隧道。
+	if !fp.allow[host] {
+		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+		outer.Close()
+		return
+	}
+	// 读完剩余 CONNECT 请求头直到空行
 	for {
 		h, err := br.ReadString('\n')
 		if err != nil {
 			outer.Close()
 			return
 		}
-		byteCount += len(h)
-		if byteCount > maxConnectHeaderBytes {
-			_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-			outer.Close()
-			return
-		}
 		if h == "\r\n" || h == "\n" {
 			break
 		}
-		if len(h) > 0 && (h[0] == ' ' || h[0] == '\t') {
-			channelFail = true // obs-fold 续行:拒
-			continue
-		}
-		if tok, valid := connect.ParseProxyAuthorization(h); valid {
-			paCount++
-			token = tok
-		} else if isProxyAuthName(h) {
-			// 名命中但值非法(空/控制字符/CRLF):计入但标记失败,使 count==1&&ok==false → 407
-			paCount++
-			channelFail = true
-		}
-	}
-	// 407 判定:折叠续行 / 名命中但值非法 / count != 1 / Lookup 未命中。任一不过 → 407,
-	// 绝不写 200、不签 leaf、不 echo token、日志不含 token。
-	if channelFail || paCount != 1 {
-		_, _ = outer.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
-		outer.Close()
-		return
-	}
-	if _, hit := fp.auth.Lookup(token); !hit {
-		_, _ = outer.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
-		outer.Close()
-		return
-	}
-	// 信道校验全部通过后才做 allowlist 纵深防御:已鉴权设备请求非白名单 host → 403。
-	if !fp.allow[host] {
-		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
-		outer.Close()
-		return
 	}
 	if _, err := outer.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		outer.Close()
@@ -297,23 +242,6 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	nc := &notifyConn{Conn: tlsConn, closed: closed}
 	srv := &http.Server{Handler: fp.handler, ReadHeaderTimeout: 30 * time.Second}
 	_ = srv.Serve(&oneConnListener{conn: nc, closed: closed})
-}
-
-// isProxyAuthName reports whether headerLine's field-name is exactly
-// Proxy-Authorization (case-insensitive, no whitespace before ':', no prefix
-// shadow like X-Proxy-Authorization / Proxy-Authorization-Foo). Used to count a
-// name-matching header even when its VALUE is malformed (so count==1 && bad-value
-// still yields 407 rather than being silently dropped as 'unrelated header').
-func isProxyAuthName(headerLine string) bool {
-	i := strings.IndexByte(headerLine, ':')
-	if i < 0 {
-		return false
-	}
-	name := headerLine[:i]
-	if name != strings.TrimRight(name, " \t") { // 名与 ':' 间空白 → 拒
-		return false
-	}
-	return strings.EqualFold(name, "Proxy-Authorization")
 }
 
 // prefixConn 在读取底层 conn 之前先回放 prefix（被 bufio 预读的 TLS 字节）。
