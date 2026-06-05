@@ -13,13 +13,17 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -120,11 +124,15 @@ func main() {
 
 	var hmu sync.Mutex
 	hits := map[string]*hit{}
+	dumpDir := os.Getenv("DIAG_DUMP_DIR")
+	var seq int64
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		key := fmt.Sprintf("%s %s %s", r.Host, r.Method, r.URL.Path)
-		sample := fmt.Sprintf("auth=%s x-api-key=%s clen=%s",
-			authState(r.Header.Get("Authorization")), presence(r.Header.Get("x-api-key")), r.Header.Get("Content-Length"))
+		sample := fmt.Sprintf("auth=%s x-api-key=%s clen=%d enc=%s ctype=%s",
+			authState(r.Header.Get("Authorization")), presence(r.Header.Get("x-api-key")),
+			len(body), presence(r.Header.Get("Content-Encoding")), r.Header.Get("Content-Type"))
 		hmu.Lock()
 		h := hits[key]
 		if h == nil {
@@ -134,6 +142,12 @@ func main() {
 		h.count++
 		h.sample = sample
 		hmu.Unlock()
+		if dumpDir != "" && len(body) > 0 {
+			n := atomic.AddInt64(&seq, 1)
+			safe := strings.NewReplacer("/", "_", ":", "_", " ", "_").Replace(r.Host + r.URL.Path)
+			// 只落原始 body(元数据已在 stderr/hits 的 sample 行: enc/ctype/clen/auth)
+			_ = os.WriteFile(filepath.Join(dumpDir, fmt.Sprintf("%03d_%s.body", n, safe)), body, 0o644)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{}`))

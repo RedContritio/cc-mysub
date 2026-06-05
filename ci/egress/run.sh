@@ -63,7 +63,8 @@ build_bins() {
   ( cd "$REPO" && go build -o "$WORK/bin/cc-mysub" ./cmd/cc-mysub \
                 && go build -o "$WORK/bin/mock" ./ci/egress/mock \
                 && go build -o "$WORK/bin/collector" ./ci/egress/collector \
-                && go build -o "$WORK/bin/diag" ./ci/egress/diag ) || fail "go build"
+                && go build -o "$WORK/bin/diag" ./ci/egress/diag \
+                && go build -o "$WORK/bin/fwdproxy" ./ci/egress/fwdproxy ) || fail "go build"
   openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout "$WORK/certs/key.pem" -out "$WORK/certs/cert.pem" \
     -subj "/CN=$PROXY_HOST" -addext "subjectAltName=DNS:$PROXY_HOST" >/dev/null 2>&1 || fail "openssl"
@@ -169,7 +170,8 @@ JSON
 }
 start_services_diag() {
   in_ns bash -c "exec '$WORK/bin/mock' > '$WORK/mock.out' 2>'$WORK/mock.err'" &
-  in_ns bash -c "CA_CERT='$WORK_CA/ca.crt' CA_KEY='$WORK_CA/ca.key' exec '$WORK/bin/diag' > '$WORK/diag.out' 2>'$WORK/diag.err'" &
+  mkdir -p "$WORK/diagdump"
+  in_ns bash -c "CA_CERT='$WORK_CA/ca.crt' CA_KEY='$WORK_CA/ca.key' DIAG_DUMP_DIR='$WORK/diagdump' exec '$WORK/bin/diag' > '$WORK/diag.out' 2>'$WORK/diag.err'" &
   in_ns bash -c "exec '$WORK/bin/cc-mysub' --config-dir '$WORK/cfg' > '$WORK/cc.out' 2>'$WORK/cc.err'" &
   sleep 2
   in_ns timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/443' 2>/dev/null || fail "cc-mysub not on :443"
@@ -183,6 +185,52 @@ stage_diag() {
   sleep 1
   echo "===== MOCK AUTHS (经 cc-mysub 换 token 后) ====="; cat "$WORK/mock.out" 2>/dev/null
   echo "===== DIAG: 绕过 base_url 的直连 (TLS-MITM, 含 path + Authorization) ====="; cat "$WORK/diag.out" 2>/dev/null
+  echo "===== DIAG BODIES (隐私字段排查) ====="
+  for d in "$WORK/diagdump"/*.body; do
+    [ -f "$d" ] || continue
+    echo "----- $(basename "$d")  ($(wc -c <"$d") bytes) -----"
+    if head -c2 "$d" | od -An -tx1 2>/dev/null | grep -qiE '1f *8b'; then
+      echo "[gzip] gunzip 前 2000 字节:"; gunzip -c "$d" 2>/dev/null | head -c 2000; echo
+    else
+      echo "[plain] 前 2000 字节:"; head -c 2000 "$d"; echo
+    fi
+  done
+}
+
+# --- Phase 1 调查: HTTPS_PROXY 覆盖率实测 ---
+start_dns_bypass() {
+  cat > "$WORK/dnsmasq-bypass.conf" <<EOF
+no-resolv
+no-hosts
+bind-interfaces
+listen-address=127.0.0.1
+address=/#/127.0.0.3
+EOF
+  in_ns dnsmasq --conf-file="$WORK/dnsmasq-bypass.conf" --pid-file="$WORK/dnsmasq.pid"
+  sleep 1
+}
+stage_proxytest() {
+  setup_netns; apply_firewall; build_bins; gen_certs; start_dns_bypass
+  in_ns bash -c "exec '$WORK/bin/mock' > '$WORK/mock.out' 2>/dev/null" &
+  in_ns bash -c "COLLECTOR_ADDR=127.0.0.2:443 exec '$WORK/bin/collector' > '$WORK/collA.out' 2>/dev/null" &
+  in_ns bash -c "COLLECTOR_ADDR=127.0.0.3:443 exec '$WORK/bin/collector' > '$WORK/collB.out' 2>/dev/null" &
+  in_ns bash -c "PROXY_HOST='$PROXY_HOST' CC_ADDR=127.0.0.1:443 COLL_A_ADDR=127.0.0.2:443 FWD_ADDR=127.0.0.1:8080 exec '$WORK/bin/fwdproxy' > '$WORK/fwd.out' 2>/dev/null" &
+  in_ns bash -c "exec '$WORK/bin/cc-mysub' --config-dir '$WORK/cfg' > '$WORK/cc.out' 2>'$WORK/cc.err'" &
+  sleep 2
+  enroll; prep_home
+  log "running claude -p with HTTPS_PROXY (覆盖率测试) ..."
+  in_ns env HOME="$WORK/home" \
+    ANTHROPIC_BASE_URL="https://$PROXY_HOST" \
+    CLAUDE_CODE_OAUTH_TOKEN="$TOK" CLAUDE_CODE_OAUTH_SCOPES="user:inference" CLAUDE_CODE_SUBSCRIPTION_TYPE="max" \
+    NODE_EXTRA_CA_CERTS="$WORK/certs/cert.pem" DISABLE_AUTOUPDATER=1 \
+    HTTPS_PROXY="http://127.0.0.1:8080" HTTP_PROXY="http://127.0.0.1:8080" ALL_PROXY="http://127.0.0.1:8080" \
+    NO_PROXY="" NODE_USE_ENV_PROXY=1 \
+    timeout 120 claude -p "reply with the single word OK" > "$WORK/claude.out" 2>&1
+  echo "[run.sh] claude rc=$?"; head -5 "$WORK/claude.out"
+  $SUDO pkill -INT -f "$WORK/bin/" 2>/dev/null; sleep 1
+  echo "===== FWDPROXY: claude 经 HTTPS_PROXY 交出的 CONNECT 目标 ====="; cat "$WORK/fwd.out" 2>/dev/null
+  echo "===== collector-A @127.0.0.2 (经 proxy 落点) ====="; cat "$WORK/collA.out" 2>/dev/null
+  echo "===== collector-B @127.0.0.3 (★绕过 proxy 直连 = 验证点,应为空) ====="; cat "$WORK/collB.out" 2>/dev/null
 }
 
 stage1() { setup_netns; apply_firewall; selfcheck_seal; }
@@ -196,6 +244,7 @@ case "$STAGE" in
   --stage3) stage3 ;;
   --stage4|--all) stage4 ;;
   --diag) stage_diag ;;
-  *) echo "usage: $0 [--stage1|--stage2|--stage3|--stage4|--all|--diag]"; exit 2 ;;
+  --proxytest) stage_proxytest ;;
+  *) echo "usage: $0 [--stage1|--stage2|--stage3|--stage4|--all|--diag|--proxytest]"; exit 2 ;;
 esac
 log "stage '$STAGE' done."
