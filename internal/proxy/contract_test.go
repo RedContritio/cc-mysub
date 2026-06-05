@@ -1,62 +1,62 @@
 package proxy
 
 import (
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/redcontritio/cc-mysub/internal/auth"
+	"github.com/redcontritio/cc-mysub/internal/config"
 )
 
-type oneDevice struct{ hash string }
-
-func (o oneDevice) Lookup(tok string) (auth.Device, bool) {
-	if auth.HashToken(tok) == o.hash {
-		return auth.Device{Label: "laptop", RateLimit: 1000}, true
-	}
-	return auth.Device{}, false
-}
-
-// TestContractFullChain is the CI guardrail: a CC-style request with a
-// per-device placeholder token must reach the mock upstream rewritten to the
-// real token, with no per-device token leakage and x-api-key stripped.
+// TestContractFullChain is the CI guardrail for the v4 forward-proxy serving
+// chain (conditionalAuth → RateLimit → AccessLog → forwardSwap, as assembled by
+// NewForwardProxy). A CC-style request carrying a per-device token must reach the
+// mock upstream rewritten to that device's pool token, with no per-device token
+// leakage and x-api-key stripped; anthropic-beta passes through untouched. The
+// v4 handler forwards to the request's OWN scheme/host, so the request URL IS the
+// upstream — mirror TestRewrite_Conditional: drive the chain's ServeHTTP directly
+// on a recorder with the inbound URL set to the live httptest upstream.
 func TestContractFullChain(t *testing.T) {
 	var got http.Request
+	var mu sync.Mutex
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		got = *r.Clone(r.Context())
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer up.Close()
 
-	p, err := New(up.URL, "sk-ant-oat01-REAL")
-	if err != nil {
-		t.Fatal(err)
-	}
-	chain := AuthMiddleware(oneDevice{hash: auth.HashToken("dev-secret")})(
-		RateLimitByDevice(1000)(
-			AccessLog(nil)(p.Handler()),
+	// 池：设备 dev-secret → upstream id "b" → 真 token sk-ant-oat01-REAL。
+	store := newTestStore(t, map[string]string{"dev-secret": "b"})
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
+
+	// Build the serving chain exactly as NewForwardProxy does. rt=nil → default
+	// retryTransport; the inbound request URL (up.URL) IS the upstream.
+	chain := conditionalAuth(store, cfgUp)(
+		RateLimitByDevice(120)(
+			AccessLog(nil)(
+				forwardSwap(nil),
+			),
 		),
 	)
-	srv := httptest.NewServer(chain)
-	defer srv.Close()
 
 	// Legit request: per-device token + CC fingerprint headers.
-	req, _ := http.NewRequest("POST", srv.URL+"/v1/messages", strings.NewReader(`{}`))
+	req := httptest.NewRequest("POST", up.URL+"/v1/messages", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer dev-secret")
 	req.Header.Set("X-Api-Key", "dev-secret")
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	rec := httptest.NewRecorder()
+	chain.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d", rec.Code)
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("status %d", resp.StatusCode)
-	}
+
+	mu.Lock()
+	defer mu.Unlock()
 	if got.Header.Get("Authorization") != "Bearer sk-ant-oat01-REAL" {
 		t.Errorf("auth not rewritten: %q", got.Header.Get("Authorization"))
 	}
@@ -70,16 +70,12 @@ func TestContractFullChain(t *testing.T) {
 		t.Error("anthropic-beta not passed through")
 	}
 
-	// Unknown token → 401.
-	bad, _ := http.NewRequest("POST", srv.URL+"/v1/messages", nil)
+	// Unknown token → 401, not forwarded.
+	bad := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
 	bad.Header.Set("Authorization", "Bearer wrong")
-	r2, err := http.DefaultClient.Do(bad)
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, r2.Body)
-	r2.Body.Close()
-	if r2.StatusCode != 401 {
-		t.Errorf("unknown token status = %d want 401", r2.StatusCode)
+	rec2 := httptest.NewRecorder()
+	chain.ServeHTTP(rec2, bad)
+	if rec2.Code != 401 {
+		t.Errorf("unknown token status = %d want 401", rec2.Code)
 	}
 }

@@ -47,13 +47,32 @@ func AuthMiddleware(a Authenticator) func(http.Handler) http.Handler {
 	}
 }
 
+// rateLimitExemptPrefixes 是免限流的路径前缀：匿名遥测/注册表查询走这些端点，限流它们会
+// 干扰真客户端的正常带外流量（治理总纲 §0：遥测逐字节不动，不引入与直连可区分的行为）。
+var rateLimitExemptPrefixes = []string{"/api/", "/mcp-registry"}
+
+func isExempt(path string) bool {
+	for _, p := range rateLimitExemptPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // RateLimitByDevice limits per device using its RateLimit (or defaultPerMin
-// when the device has none). Must run after AuthMiddleware.
+// when the device has none). Must run after conditionalAuth (reads the injected
+// device). Skips limiting for anonymous requests (no authed device — telemetry
+// passthrough must stay byte-faithful) and for exempt path prefixes.
 func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 	l := ratelimit.NewLimiter(nil)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			dev, _ := r.Context().Value(deviceKey).(auth.Device)
+			dev, ok := r.Context().Value(deviceKey).(auth.Device)
+			if !ok || dev.Label == "" || isExempt(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			perMin := defaultPerMin
 			if dev.RateLimit > 0 {
 				perMin = dev.RateLimit

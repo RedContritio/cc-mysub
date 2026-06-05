@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,6 +67,43 @@ func TestRateLimitByDevice429(t *testing.T) {
 	}
 	if mk() != http.StatusTooManyRequests {
 		t.Error("second should be 429")
+	}
+}
+
+// injectDevice 把已认证设备塞进 ctx，模拟 conditionalAuth 的前置注入，使 RateLimit 能读到设备。
+func injectDevice(dev auth.Device, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), deviceKey, dev)))
+	})
+}
+
+// TestRateLimit_ExemptsTelemetry 验证 V7：免限流路径前缀（/api/）即使同一设备高频命中也永不 429，
+// 而非豁免路径（/v1/messages）超出该设备限额后照常 429。匿名遥测的限流豁免由 dev.Label=="" 分支
+// 单独保证（见 TestRewrite_Conditional 的匿名透传 + 此处的 isExempt 路径豁免）。
+func TestRateLimit_ExemptsTelemetry(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	dev := auth.Device{Label: "laptop", RateLimit: 1}
+	h := injectDevice(dev, RateLimitByDevice(1)(next))
+
+	hit := func(path string) int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", path, nil))
+		return w.Code
+	}
+
+	// 豁免遥测端点：远超 limit=1 的连打仍永不 429
+	for i := 0; i < 20; i++ {
+		if code := hit("/api/event_logging/v2/batch"); code != 200 {
+			t.Fatalf("telemetry hit %d got %d want 200 (exempt path must never rate-limit)", i, code)
+		}
+	}
+
+	// 非豁免推理端点：首发过、再发被限
+	if code := hit("/v1/messages"); code != 200 {
+		t.Fatalf("first /v1/messages got %d want 200", code)
+	}
+	if code := hit("/v1/messages"); code != http.StatusTooManyRequests {
+		t.Errorf("second /v1/messages got %d want 429", code)
 	}
 }
 
