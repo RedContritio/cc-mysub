@@ -164,29 +164,29 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 	}
 }
 
-// Serve 接受连接并逐个 MITM 处理，直到 ln 关闭。
-// 并发上限由 fp.sema 控制：获取 token 后才派发 goroutine；饱和时立即关闭连接（shed）。
+// Serve 接受连接并逐个 MITM 处理,直到 ln 关闭。全局 semaphore self-cap(§3.4):
+// 槽位满时 Accept 后立即 Close(shed),不 spawn handle——把 DoS 收敛上限钉死在
+// maxInFlight,而非无界 goroutine。per-source-IP 限流委托 nftables(frp 塌源 IP)。
 func (fp *ForwardProxy) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fp.wg.Wait() // 等在途连接收尾，避免孤儿 goroutine 在调用方释放资源后访问
+			fp.wg.Wait() // 等在途连接收尾,避免孤儿 goroutine 在调用方释放资源后访问
 			return err
 		}
 		select {
-		case fp.sema <- struct{}{}:
-		default:
-			conn.Close() // shed: semaphore saturated
-			continue
+		case fp.sema <- struct{}{}: // 抢到槽位
+			fp.wg.Add(1)
+			go fp.handle(conn)
+		default: // 饱和:立即 shed,不 spawn handle、不握手
+			conn.Close()
 		}
-		fp.wg.Add(1)
-		go fp.handle(conn)
 	}
 }
 
 func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	defer fp.wg.Done()
-	defer func() { <-fp.sema }()
+	defer func() { <-fp.sema }() // 释放并发槽位(与 Serve 的 fp.sema<-struct{}{} 配对)
 	// 外层 TLS：呈现 cc-mysub 自身身份证书（serverName），终结 device↔cc-mysub 跳。
 	// 此后所有读写都走 outer（Close(outer) 即 Close(rawConn)）。
 	outer := tls.Server(rawConn, &tls.Config{
