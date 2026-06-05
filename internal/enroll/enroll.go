@@ -26,13 +26,20 @@ import (
 //go:embed myclaude.tmpl
 var wrapperTmpl string
 
+// deviceCACertPath 是 wrapper 在目标设备上引用 cc-mysub CA 公证书的固定路径。
+// add-device 生成 ca.crt 于服务端 config-dir，操作者将其拷到设备的此路径；
+// wrapper 的 --ca / NODE_EXTRA_CA_CERTS 都指向它。用 ${HOME} 由设备运行时展开。
+const deviceCACertPath = "${HOME}/.config/cc-mysub/ca.crt"
+
 // Params are the resolved values needed to enroll one device.
 type Params struct {
 	Label      string
 	PublicHost string
 	FrpsIP     string
+	ProxyPort  int
 	SubType    string
 	RateLimit  int
+	Upstream   string // 该设备所属 setup-token id; 空 = 使用默认 token
 }
 
 // GenerateToken returns a fresh per-device token: "cco_dev_" + 48 hex chars
@@ -46,17 +53,22 @@ func GenerateToken() (string, error) {
 	return "cco_dev_" + hex.EncodeToString(b[:]), nil
 }
 
-// RenderWrapper renders the myclaude wrapper for p + token. The wrapper never
-// bakes in a small model — that choice is left to the user (commented example).
-func RenderWrapper(p Params, token string) (string, error) {
+// RenderWrapper renders the v4 myclaude wrapper for p + token. caCertPath is the
+// device-side path to the cc-mysub CA cert (where the operator places ca.crt);
+// the wrapper references it for both --ca and NODE_EXTRA_CA_CERTS. The wrapper
+// never bakes in a small model — that choice is left to the user (commented
+// example).
+func RenderWrapper(p Params, token, caCertPath string) (string, error) {
 	t, err := template.New("myclaude").Parse(wrapperTmpl)
 	if err != nil {
 		return "", fmt.Errorf("parse wrapper template: %w", err)
 	}
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, struct {
-		PublicHost, FrpsIP, DeviceToken, SubType string
-	}{p.PublicHost, p.FrpsIP, token, p.SubType}); err != nil {
+		PublicHost, FrpsIP  string
+		ProxyPort           int
+		DeviceToken, SubType, CACertPath string
+	}{p.PublicHost, p.FrpsIP, p.ProxyPort, token, p.SubType, caCertPath}); err != nil {
 		return "", fmt.Errorf("render wrapper: %w", err)
 	}
 	return buf.String(), nil
@@ -73,9 +85,15 @@ func Resolve(def *config.ClientConfig, override Params) (Params, error) {
 		if out.FrpsIP == "" {
 			out.FrpsIP = def.FrpsIP
 		}
+		if out.ProxyPort == 0 {
+			out.ProxyPort = def.ProxyPort
+		}
 		if out.SubType == "" {
 			out.SubType = def.SubscriptionType
 		}
+	}
+	if out.ProxyPort == 0 {
+		out.ProxyPort = 8788 // frp 暴露的 cc-mysub forward-proxy 默认端口
 	}
 	if out.Label == "" {
 		return Params{}, fmt.Errorf("--label is required")
@@ -115,6 +133,7 @@ func AppendDevice(path string, p Params, token string) error {
 		Label:       p.Label,
 		TokenSHA256: auth.HashToken(token),
 		RateLimit:   p.RateLimit,
+		Upstream:    p.Upstream,
 	})
 
 	out, err := json.MarshalIndent(list, "", "  ")
@@ -136,13 +155,14 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	fs := flag.NewFlagSet("add-device", flag.ContinueOnError)
 	fs.SetOutput(out)
 	var (
-		cfgDir  = fs.String("config-dir", defaultCfgDir, "config directory")
-		label   = fs.String("label", "", "device label (required, unique)")
-		host    = fs.String("host", "", "proxy public host (overrides config client.public_host)")
-		frpsIP  = fs.String("frps-ip", "", "frps public IP (overrides config client.frps_ip)")
-		sub     = fs.String("sub", "", "subscription tier: pro/max/team/enterprise (overrides config)")
-		rate    = fs.Int("rate-limit", 0, "per-minute request cap for this device (0 = proxy default)")
-		outPath = fs.String("out", "", "wrapper output path (default ./myclaude-<label>)")
+		cfgDir   = fs.String("config-dir", defaultCfgDir, "config directory")
+		label    = fs.String("label", "", "device label (required, unique)")
+		host     = fs.String("host", "", "proxy public host (overrides config client.public_host)")
+		frpsIP   = fs.String("frps-ip", "", "frps public IP (overrides config client.frps_ip)")
+		sub      = fs.String("sub", "", "subscription tier: pro/max/team/enterprise (overrides config)")
+		rate     = fs.Int("rate-limit", 0, "per-minute request cap for this device (0 = proxy default)")
+		upstream = fs.String("upstream", "", "setup-token id this device draws from (empty = default token)")
+		outPath  = fs.String("out", "", "wrapper output path (default ./myclaude-<label>)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -159,7 +179,15 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 		FrpsIP:     *frpsIP,
 		SubType:    *sub,
 		RateLimit:  *rate,
+		Upstream:   *upstream,
 	})
+	if err != nil {
+		return err
+	}
+
+	// 一次性建立 cc-mysub 自有 CA（幂等：ca.crt 已存在则复用，绝不重生成）。
+	// serverCACertPath 是服务端 config-dir 下的 ca.crt，需拷到设备的 deviceCACertPath。
+	serverCACertPath, err := EnsureCA(*cfgDir, "cc-mysub CA")
 	if err != nil {
 		return err
 	}
@@ -174,7 +202,8 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 		return err
 	}
 
-	wrapper, err := RenderWrapper(p, token)
+	// wrapper 引用设备侧固定路径（运行时由设备 ${HOME} 展开），不是服务端路径。
+	wrapper, err := RenderWrapper(p, token, deviceCACertPath)
 	if err != nil {
 		return err
 	}
@@ -187,9 +216,11 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 		return fmt.Errorf("write wrapper %s: %w", dest, err)
 	}
 	absDest, _ := filepath.Abs(dest)
+	absCA, _ := filepath.Abs(serverCACertPath)
 
 	fmt.Fprintf(out, "✓ 已为设备 %q 签发 per-device token 并写入 %s\n", p.Label, devicesPath)
 	fmt.Fprintf(out, "\nper-device token (交给该设备, 明文仅此一次):\n  %s\n", token)
+	fmt.Fprintf(out, "\ncc-mysub CA 公证书 (拷到该设备的 %s):\n  %s\n", deviceCACertPath, absCA)
 	fmt.Fprintf(out, "\nwrapper 已生成 (拷到该设备的 PATH, 如 ~/.local/bin/myclaude):\n  %s\n", absDest)
 	fmt.Fprintf(out, "\n代理热重载会自动加载新设备, 无需重启。吊销 = 删 %s 里该条。\n", devicesPath)
 	return nil

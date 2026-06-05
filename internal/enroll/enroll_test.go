@@ -41,27 +41,42 @@ func TestGenerateTokenUnique(t *testing.T) {
 // ---- RenderWrapper ----
 
 func TestRenderWrapperFillsValues(t *testing.T) {
-	p := Params{PublicHost: "ccapi.example.com", FrpsIP: "203.0.113.10", SubType: "max"}
-	out, err := RenderWrapper(p, "cco_dev_deadbeef")
+	p := Params{PublicHost: "ccapi.example.com", FrpsIP: "203.0.113.10", ProxyPort: 8788, SubType: "max"}
+	const caPath = "${HOME}/.config/cc-mysub/ca.crt"
+	out, err := RenderWrapper(p, "cco_dev_deadbeef", caPath)
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
 	for _, want := range []string{
-		`PROXY_HOST="ccapi.example.com"`,
-		`FRPS_IP="203.0.113.10"`,
+		`PUBLIC_HOST="ccapi.example.com"`,
+		`PROXY_ENTRY="203.0.113.10:8788"`,
 		`DEVICE_TOKEN="cco_dev_deadbeef"`,
 		`SUB_TYPE="max"`,
+		`CA_CERT="` + caPath + `"`,
+		`CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"`,
 		`CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"`,
+		`NODE_EXTRA_CA_CERTS="$CA_CERT"`,
+		`exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered wrapper missing %q\n---\n%s", want, out)
+		}
+	}
+	// v4 收口: OLD v3 形态(base_url 直连 / unshare / hosts)必须彻底删除。
+	for _, banned := range []string{
+		"ANTHROPIC_BASE_URL=https://",
+		"unshare",
+		"/etc/hosts",
+	} {
+		if strings.Contains(out, banned) {
+			t.Errorf("rendered wrapper still contains obsolete v3 token %q\n---\n%s", banned, out)
 		}
 	}
 }
 
 // 核心契约: 工具绝不替用户预设小模型。
 func TestRenderWrapperDoesNotDecideSmallModel(t *testing.T) {
-	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}, "cco_dev_x", "/dev/null")
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -85,7 +100,7 @@ func TestRenderWrapperIsValidBash(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
-	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}, "cco_dev_x", "/dev/null")
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -150,6 +165,17 @@ func TestAppendDevicePreservesExisting(t *testing.T) {
 	}
 }
 
+// TestAppendDeviceStoresUpstream 验证 Params.Upstream 写入设备记录（决定该设备抽哪个 setup-token）。
+func TestAppendDeviceStoresUpstream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	p := Params{Label: "work", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max", Upstream: "team-b"}
+	must(t, AppendDevice(path, p, "cco_dev_work"))
+	list := readDevices(t, path)
+	if len(list) != 1 || list[0].Upstream != "team-b" {
+		t.Fatalf("device upstream not persisted: %+v", list)
+	}
+}
+
 func TestAppendDeviceRejectsDuplicateLabel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
 	must(t, AppendDevice(path, Params{Label: "dup", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_1"))
@@ -186,6 +212,26 @@ func TestResolveUsesConfigWhenNoFlags(t *testing.T) {
 	}
 	if got.PublicHost != "cfg.example.com" || got.FrpsIP != "1.1.1.1" || got.SubType != "max" {
 		t.Errorf("config not used as default: %+v", got)
+	}
+}
+
+// TestResolveProxyPortDefault 验证 ProxyPort 缺省回退 8788，配置/flag 给值则优先。
+func TestResolveProxyPortDefault(t *testing.T) {
+	// config/flag 都没给 → 默认 8788
+	got, err := Resolve(&config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}, Params{Label: "x"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.ProxyPort != 8788 {
+		t.Errorf("default ProxyPort = %d, want 8788", got.ProxyPort)
+	}
+	// config 显式给值 → 用配置值
+	got2, err := Resolve(&config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max", ProxyPort: 9999}, Params{Label: "x"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got2.ProxyPort != 9999 {
+		t.Errorf("config ProxyPort = %d, want 9999", got2.ProxyPort)
 	}
 }
 
@@ -240,8 +286,27 @@ func TestRunEndToEnd(t *testing.T) {
 		t.Errorf("wrapper not executable: %v", fi.Mode())
 	}
 	w := string(mustRead(t, wrapperPath))
-	if !strings.Contains(w, `PROXY_HOST="ccapi.example.com"`) || !strings.Contains(w, `SUB_TYPE="max"`) {
+	if !strings.Contains(w, `PUBLIC_HOST="ccapi.example.com"`) || !strings.Contains(w, `SUB_TYPE="max"`) {
 		t.Errorf("wrapper not filled from config: \n%s", w)
+	}
+	// v4 helper 形态: 必须有 helper exec 行, 不得残留 v3 直连/隔离形态。
+	if !strings.Contains(w, `exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`) {
+		t.Errorf("wrapper missing v4 helper exec line:\n%s", w)
+	}
+	if strings.Contains(w, "ANTHROPIC_BASE_URL=https://") || strings.Contains(w, "unshare") {
+		t.Errorf("wrapper still contains obsolete v3 form:\n%s", w)
+	}
+
+	// add-device 首次运行须落 cc-mysub CA（ca.crt + ca.key, key 0600）。
+	if _, err := os.Stat(filepath.Join(cfgDir, "ca.crt")); err != nil {
+		t.Errorf("ca.crt not generated: %v", err)
+	}
+	keyFI, err := os.Stat(filepath.Join(cfgDir, "ca.key"))
+	if err != nil {
+		t.Fatalf("ca.key not generated: %v", err)
+	}
+	if keyFI.Mode().Perm() != 0o600 {
+		t.Errorf("ca.key mode = %v, want 0600", keyFI.Mode().Perm())
 	}
 
 	// 打印的明文 token 与库内 sha256 对得上，且 wrapper 里也带着它
@@ -252,6 +317,29 @@ func TestRunEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(w, tok) {
 		t.Errorf("wrapper does not embed the generated token")
+	}
+}
+
+// TestRunAssignsUpstream 验证 --upstream 写入 devices.json 的 upstream 字段。
+func TestRunAssignsUpstream(t *testing.T) {
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+
+	wrapperPath := filepath.Join(t.TempDir(), "myclaude-work")
+	var sb strings.Builder
+	err := Run([]string{"--label", "work", "--upstream", "b", "--out", wrapperPath}, cfgDir, &sb)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
+	if len(list) != 1 || list[0].Upstream != "b" {
+		t.Fatalf("--upstream b not written to devices.json: %+v", list)
+	}
+	raw := string(mustRead(t, filepath.Join(cfgDir, "devices.json")))
+	if !strings.Contains(raw, `"upstream": "b"`) {
+		t.Errorf("devices.json missing upstream field:\n%s", raw)
 	}
 }
 

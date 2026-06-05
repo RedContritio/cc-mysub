@@ -1,35 +1,27 @@
 #!/usr/bin/env bash
-# myclaude — Claude Code wrapper (cc-mysub client)
-#
-# 由 `cc-mysub add-device` 生成。透明地让本机 Claude Code 经 cc-mysub 代理复用
-# 订阅:内部处理好 env、hosts、onboarding,然后 exec 真正的 claude,并把所有命令
-# 行参数原样透传。
-#
-#   用法:  myclaude            # 等同 claude
-#          myclaude -p "hi"    # 等同 claude -p "hi"
-#          myclaude --resume   # 任意 claude 参数都透传
-#
-# 安全:本设备只持有 per-device 占位 token,真 setup-token 永不出本机代理。
-#      占位 token 泄露可在代理侧删 devices.json 一条即吊销。
+# myclaude — Claude Code wrapper (cc-mysub client, v4 split-egress)
+# 由 cc-mysub add-device 生成。本机只持 per-device 占位 token + cc-mysub CA 公证书；
+# 真 setup-token 永不出 cc-mysub。只有 Anthropic 流量经 cc-mysub(外层 TLS+MITM 换 token)，
+# 其余一切(WebFetch/MCP/更新/第三方)由本地 helper 直连、不碰 cc-mysub。
 set -euo pipefail
 
 # ============ 本设备配置(由 cc-mysub add-device 生成) ============
-PROXY_HOST="{{.PublicHost}}"     # 代理域名(frp https vhost)
-FRPS_IP="{{.FrpsIP}}"            # frps 公网 IP(绕本地 DNS 分流直连)
-DEVICE_TOKEN="{{.DeviceToken}}"  # 代理侧为本设备签的占位 token(其 sha256 已写入 devices.json)
-SUB_TYPE="{{.SubType}}"          # 订阅档位: 决定 Max 标签 + auto mode + 1M 可用性
-# 可选: 给 auto 模式的命令 classifier 指定更省成本的小模型。是否启用、用哪个由你
-#       自行决定; 不设则用 CC 默认。取消注释并填入你选的模型 id 即可:
+PUBLIC_HOST="{{.PublicHost}}"   # cc-mysub 外层 TLS 身份(证书 SAN)，helper 用它验证
+PROXY_ENTRY="{{.FrpsIP}}:{{.ProxyPort}}"  # helper 直拨的 cc-mysub forward-proxy 入口
+DEVICE_TOKEN="{{.DeviceToken}}" # 代理侧为本设备签的占位 token(sha256 入 devices.json)
+SUB_TYPE="{{.SubType}}"         # 订阅档: Max 标签 + auto mode + 1M 可用性
+CA_CERT="{{.CACertPath}}"       # cc-mysub CA 公证书路径(由 add-device 下发, 拷到本设备)
+# 可选小模型(是否启用/用哪个由你决定; 不设用 CC 默认):
 # export ANTHROPIC_SMALL_FAST_MODEL="<small-model-id>"
 # ===============================================================
 
-# 1) 订阅模式 + 推理走代理所需的环境变量(全是占位/声明,无真凭据)
-export ANTHROPIC_BASE_URL="https://${PROXY_HOST}"
+# 1) 订阅认证 env(全是占位/声明, 无真凭据); base_url 保持默认(不导出); HTTPS_PROXY 由 helper 注入
 export CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"
 export CLAUDE_CODE_OAUTH_SCOPES="user:inference"
 export CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"
+export NODE_EXTRA_CA_CERTS="$CA_CERT"   # 信任 cc-mysub CA(验证其 MITM 的 api.anthropic.com 证书)
 
-# 2) 跳过启动预检(platform.claude.com 的 /hello 写死、不走代理,纯净设备会卡在这)
+# 2) 跳过启动预检(platform.claude.com 的 /hello 写死, 纯净设备会卡这)
 CJSON="${HOME}/.claude.json"
 if ! grep -qs '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$CJSON"; then
   if [ -s "$CJSON" ] && command -v jq >/dev/null 2>&1; then
@@ -39,16 +31,6 @@ if ! grep -qs '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$CJSON"; 
   fi
 fi
 
-# 3) 把 PROXY_HOST 直连 FRPS_IP(绕过本地 fake-ip / DNS 分流)。
-#    用 user+mount namespace 隔离 /etc/hosts:改动只对本进程树可见,全局 /etc/hosts 不动、无需 sudo。
-if unshare -mr true 2>/dev/null; then
-  HOSTS_TMP="$(mktemp)"
-  cat /etc/hosts >"$HOSTS_TMP"
-  printf '%s %s\n' "$FRPS_IP" "$PROXY_HOST" >>"$HOSTS_TMP"
-  exec unshare -mr bash -c 'mount --bind "$1" /etc/hosts; shift; exec claude "$@"' _ "$HOSTS_TMP" "$@"
-else
-  # 退路:user namespace 被禁。要求 PROXY_HOST 已能解析到 FRPS_IP
-  # (系统 DNS 正常,或你已手动加 /etc/hosts);否则会因连不上代理而重试。
-  echo "myclaude: 无法隔离 hosts(unshare -mr 不可用)。请确保 ${PROXY_HOST} 解析到 ${FRPS_IP}。" >&2
-  exec claude "$@"
-fi
+# 3) 经 cc-mysub helper 启动 claude: helper 绑本地分流器(Anthropic→cc-mysub, 其余直连)
+#    并把 HTTPS_PROXY 注入 claude 子进程。纯用户态分流, 不改主机网络/DNS。
+exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"
