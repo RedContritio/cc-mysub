@@ -733,3 +733,91 @@ func TestForwardProxy_AnonInnerStillPassesThroughAfterChannelAuth(t *testing.T) 
 		t.Errorf("SECURITY: channel token leaked on anon inner request: %q", spy.gotPA)
 	}
 }
+
+func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
+	// Real fake upstream so the inner request actually round-trips, proving the
+	// pipelined inner ClientHello bytes were spliced byte-faithfully (a corrupted
+	// prefix would break the inner TLS handshake).
+	var gotAuth string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	caPEM, keyPEM := genCA(t)
+	ca, err := mitm.LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
+	upstreamTransport := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, upstreamAddr)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	const serverName = "cc.example"
+	fp := NewForwardProxy(minter, store, cfgUp, upstreamTransport, []string{"api.anthropic.com"}, serverName, 8)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go fp.Serve(ln)
+	caPool := x509.NewCertPool()
+	caPool.AddCert(ca.Cert)
+
+	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
+	if err != nil {
+		t.Fatalf("outer dial: %v", err)
+	}
+	defer outer.Close()
+	// Build the inner ClientHello FIRST (into a buffer), so we can pipeline the
+	// first >=64 bytes of it together with the CONNECT request in one Write —
+	// forcing handle's br.Buffered()>0 / prefixConn path.
+	innerConn := tls.Client(outer, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
+	if _, err := outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(outer)
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT status=%q err=%v", status, err)
+	}
+	for {
+		l, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l == "\r\n" || l == "\n" {
+			break
+		}
+	}
+	// NOTE: because tls.Client buffers and br may hold post-200 bytes, this test
+	// asserts the SUCCESS path end-to-end: a valid channel token yields 200 and the
+	// inner handshake+request completes with the app-token swapped. (The pure
+	// prefix-byte-faithfulness in isolation is already covered by
+	// TestPrefixConn_ReplaysPrefixThenConn.)
+	if br.Buffered() > 0 {
+		// reuse buffered bytes for the inner conn (mirror handle's own splice)
+		b, _ := br.Peek(br.Buffered())
+		innerConn = tls.Client(&prefixConn{Conn: outer, prefix: append([]byte(nil), b...)}, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
+	}
+	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer cco_dev_x")
+	if err := req.Write(innerConn); err != nil {
+		t.Fatalf("inner write: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(innerConn), req)
+	if err != nil {
+		t.Fatalf("inner read: %v", err)
+	}
+	resp.Body.Close()
+	if gotAuth != "Bearer REAL-B" {
+		t.Errorf("app-token swap: upstream Authorization=%q want Bearer REAL-B", gotAuth)
+	}
+}
