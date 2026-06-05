@@ -30,10 +30,10 @@ type Splitter struct {
 
 // New 构造分流器。channelToken 作为链式 CONNECT 的 Proxy-Authorization Bearer 值出示给 cc-mysub；
 // caPool/serverName 用于验证 cc-mysub 外层身份; dial 为直连拨号(nil→默认)。
-// channelToken 含 CR/LF/空白/控制字符时返回 error（严格契约、错误可见，防 CONNECT 头注入）。
+// channelToken 为空或含非 RFC 7230 VCHAR 字符（控制字符/空格/非 ASCII）时返回 error。
 func New(upstreamAddr string, caPool *x509.CertPool, channelToken string, serverName string, allow []string, dial dialFunc) (*Splitter, error) {
 	if !validChannelToken(channelToken) {
-		return nil, fmt.Errorf("splitter: channel token contains forbidden character (CR/LF/space/control)")
+		return nil, fmt.Errorf("splitter: channel token must be non-empty and contain only RFC 7230 VCHAR (0x21-0x7e)")
 	}
 	allowSet := make(map[string]bool, len(allow))
 	for _, h := range allow {
@@ -53,12 +53,15 @@ func New(upstreamAddr string, caPool *x509.CertPool, channelToken string, server
 	}, nil
 }
 
-// validChannelToken 拒绝任何会破坏 CONNECT 头形态或可被注入的字符：
-// CR/LF（头注入）、空格（分割 scheme/value 之外的注入）、其余控制字符（<0x20 或 0x7f）。
-// 空 token 在此放行（由 helper 单独强制非空），保持本函数为纯字符集闸门。
+// validChannelToken 使用白名单：接受非空、仅含 RFC 7230 VCHAR（0x21–0x7e）的 token；
+// 拒绝空串、空格（0x20）、控制字符（<0x21）、DEL（0x7f）及任何非 ASCII 码点（>0x7e）。
+// 白名单策略与 connect.validToken 精神一致，杜绝 CONNECT 头注入及非 ASCII 字节写入头行。
 func validChannelToken(t string) bool {
+	if t == "" {
+		return false
+	}
 	for _, r := range t {
-		if r == '\r' || r == '\n' || r == ' ' || r < 0x20 || r == 0x7f {
+		if r < 0x21 || r > 0x7e {
 			return false
 		}
 	}

@@ -43,6 +43,8 @@ func writeTestCA(t *testing.T) string {
 }
 
 func TestHelper_InjectsProxyAndRunsChild(t *testing.T) {
+	// 设置合法 token：validChannelToken 现在拒绝空串（防止 Bearer 空值 → 407）
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "test_token_abc123")
 	caPath := writeTestCA(t)
 	outPath := filepath.Join(t.TempDir(), "env.out")
 	code := runHelper([]string{

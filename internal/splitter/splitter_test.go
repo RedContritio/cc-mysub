@@ -348,10 +348,13 @@ func TestSplitter_NewRejectsBadChannelToken(t *testing.T) {
 		"tok\r\nInjected: x", // CRLF injection
 		"tok\nx",             // bare LF
 		"tok\rx",             // bare CR
-		"tok with space",     // space
-		"tok\tx",             // tab (control)
+		"tok with space",     // space (0x20, not VCHAR)
+		"tok\tx",             // tab (control <0x21)
 		"tok\x00x",           // NUL
-		"tok\x7fx",           // DEL
+		"tok\x7fx",           // DEL (0x7f)
+		"",                   // empty: must be rejected (emits empty Bearer value)
+		"tok\x80x",           // non-ASCII (0x80): malforms HTTP header line
+		"tok\xc3\xa9x",       // multi-byte UTF-8 (é): non-ASCII via clipboard paste
 	} {
 		_, err := New("127.0.0.1:9", caPool, bad, "cc.example", []string{"api.anthropic.com"}, nil)
 		if err == nil {
