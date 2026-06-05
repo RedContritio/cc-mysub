@@ -28,6 +28,9 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "helper" {
+		os.Exit(runHelper(os.Args[2:]))
+	}
 
 	cfgDir := flag.String("config-dir", defaultConfigDir(), "config directory")
 	flag.Parse()
