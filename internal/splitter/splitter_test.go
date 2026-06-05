@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"net"
 	"strings"
@@ -44,18 +45,18 @@ func selfSigned(t *testing.T, name string) (tls.Certificate, *x509.CertPool) {
 }
 
 // readConnectHost 从 conn 读 "CONNECT host:port ..." 首行, 返回 host:port 部分。
-func readConnectHost(t *testing.T, conn net.Conn) string {
-	t.Helper()
+// 出错返回 ("", err)，调用方负责处理——不在此处调用 t.Fatal，以便在 goroutine 中安全使用。
+func readConnectHost(conn net.Conn) (string, error) {
 	br := bufio.NewReader(conn)
 	line, err := br.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read CONNECT: %v", err)
+		return "", fmt.Errorf("read CONNECT: %w", err)
 	}
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
-		t.Fatalf("bad CONNECT line %q", line)
+		return "", fmt.Errorf("bad CONNECT line %q", line)
 	}
-	return fields[1]
+	return fields[1], nil
 }
 
 func TestSplitter_RoutesAnthropicToUpstreamElseDirect(t *testing.T) {
@@ -78,7 +79,11 @@ func TestSplitter_RoutesAnthropicToUpstreamElseDirect(t *testing.T) {
 			}
 			go func(c net.Conn) {
 				defer c.Close()
-				h := readConnectHost(t, c)
+				h, err := readConnectHost(c)
+				if err != nil {
+					t.Errorf("readConnectHost: %v", err)
+					return
+				}
 				upMu.Lock()
 				upHosts = append(upHosts, h)
 				upMu.Unlock()
@@ -173,25 +178,25 @@ const chTok = "cco_dev_abc123"
 
 // readConnectBlock reads the CONNECT request line + all header lines up to the
 // blank line, returning the raw header lines (without the request line).
-func readConnectBlock(t *testing.T, conn net.Conn) (reqLine string, headers []string) {
-	t.Helper()
+// 出错返回 ("", nil, err)，调用方负责处理——不在此处调用 t.Fatal，以便在 goroutine 中安全使用。
+func readConnectBlock(conn net.Conn) (reqLine string, headers []string, err error) {
 	br := bufio.NewReader(conn)
 	line, err := br.ReadString('\n')
 	if err != nil {
-		t.Fatalf("read CONNECT line: %v", err)
+		return "", nil, fmt.Errorf("read CONNECT line: %w", err)
 	}
 	reqLine = line
 	for {
 		h, err := br.ReadString('\n')
 		if err != nil {
-			t.Fatalf("read header: %v", err)
+			return "", nil, fmt.Errorf("read header: %w", err)
 		}
 		if h == "\r\n" || h == "\n" {
 			break
 		}
 		headers = append(headers, h)
 	}
-	return reqLine, headers
+	return reqLine, headers, nil
 }
 
 func TestSplitter_EmitsChannelTokenOnAllowBranch(t *testing.T) {
@@ -212,7 +217,11 @@ func TestSplitter_EmitsChannelTokenOnAllowBranch(t *testing.T) {
 			return
 		}
 		defer c.Close()
-		req, hs := readConnectBlock(t, c)
+		req, hs, err := readConnectBlock(c)
+		if err != nil {
+			t.Errorf("readConnectBlock: %v", err)
+			return
+		}
 		mu.Lock()
 		gotReq, gotHeaders = req, hs
 		mu.Unlock()

@@ -90,15 +90,16 @@ func ParseProxyAuthorization(headerLine string) (string, bool) {
 		return "", false
 	}
 	token := val[sp+1:]
-	if !validToken(token) {
+	if !ValidToken(token) {
 		return "", false
 	}
 	return token, true
 }
 
-// validToken 接受非空、仅含 token-合法可打印 ASCII 的 token;拒空、空格、TAB、
+// ValidToken 接受非空、仅含 token-合法可打印 ASCII 的 token;拒空、空格、TAB、
 // 控制字符、NUL、非 ASCII。字符集为 ValidHost 白名单的 token 超集(加 _ ~ + / = .)。
-func validToken(t string) bool {
+// 同时供 splitter.New 在构造时验证信道 token，保证两端字符集完全一致。
+func ValidToken(t string) bool {
 	if t == "" {
 		return false
 	}
