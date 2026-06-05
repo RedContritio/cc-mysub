@@ -9,6 +9,16 @@
 - **裸明文不安全。** 若外层 TLS 未建立（如 helper 的 CA 验证失败），helper 不转发。**禁止在无外层 TLS 的路径上暴露 cc-mysub forward-proxy。**
 - 代理进程本身只监听本地端口（默认 `127.0.0.1:8788`）；如何把端口安全暴露到远程，完全委托给入口层（frp `type=tcp`）。
 
+## 信道层准入（CONNECT token）
+
+cc-mysub forward-proxy 经 frp 暴露在**公网**端口；frp 的 `auth.token` 只鉴权隧道注册、**不**鉴权客户端访问，外层 TLS 又是**单向**的（cc-mysub 只出示身份、不校验客户端凭据）。因此在信道层加一道**准入门**：设备分流器经外层 TLS 链到 cc-mysub 时，在上游 CONNECT 头里带 `Proxy-Authorization: Bearer <信道 token>`（外层 TLS 内、绝不上行到 Anthropic）；cc-mysub 读 CONNECT 头时校验，**不过则 407 并断**，绝不写 `200 Connection Established`、不签 leaf 证书、不 echo token（日志只记远端 addr + "channel auth failed"）。
+
+**信道 token = 复用 per-device `DEVICE_TOKEN`（经 env）。** wrapper 已 `export CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"`，helper 读该 env、自加 CONNECT 头（无 CLI flag）。cc-mysub 用同一份 `auth.Lookup` 校验。一个 token 两层、删 `devices.json` 一行即两层同时吊销。这是**有意**的统一（纵深损失 largely illusory）：恢复路径就是删行；future option 是 `HKDF(DEVICE_TOKEN,"channel")` 派生出独立信道 token。
+
+**校验置于 allowlist 之前（消除 host oracle）。** tokenless 或坏 token 的客户端**一律 407**，不泄露 allowlist 成员；`403 Forbidden` 只在「**已鉴权设备**请求非 allowlist host」时出现（纵深防御）。若把 allowlist 放在信道校验之前，攻击者就能用 403-vs-407 的差异探测哪些 host 在白名单里——这条 oracle 被准入门顺序焊死消除。
+
+**应用层匿名透传不降级。** 信道 token 只在 CONNECT 层做通过/拒绝，不把设备身份透传内层；内层匿名照旧（无 app token → 透传不注入、字节级不可区分于直连）。真正的 Claude Code 有合法无 OAuth token 请求（registry/遥测），匿名透传从「全公网开放」收紧为「已鉴权可信设备」，不再是洞，故保留、不砍。
+
 ## 2. per-device token 与真 setup-token 分离
 
 per-device token 与真 setup-token 是**两个独立随机串，无密码学关系**：
@@ -66,6 +76,12 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 ## 诚实降级: 不可区分性
 
 每条请求**字节级**与「某台设备直连」不可区分(不碰遥测/性能/用量、匿名零注入、cch 透传); 但**多设备汇聚到本机单一出口 IP** 是直连不存在的关联信号。多 setup-token 池缓解「共用单一凭据」一维, **源 IP 收敛仍在**——定位为承担风险, 非隐私增强。
+
+## 诚实边界：信道 token 暴露面 与 匿名 relay blast radius
+
+**边界 #1（env 不等于「strictly 紧于 argv」）。** 信道 token 经 env 传、**绝不经 CLI flag**——env 消除了 world-readable `argv`（`ps` / `/proc/<pid>/cmdline` 对**其他本地 uid** 可见）这一向量。但 helper 仍把 `CLAUDE_CODE_OAUTH_TOKEN` 继承给它启动的 `claude` 子进程（`cmd.Env = append(os.Environ(), …)`），故 **claude 的后代进程（MCP server / npm / Bash 工具）经继承 env 仍可读**该 token。这层暴露**不变**，且本就是 claude 订阅认证的既有事实——作为 **deliberate accepted exposure** 如实记录。不要据此宣称「env 严格紧于 argv」而不带此限定。
+
+**边界 #2（匿名 relay blast radius）。** 信道准入通过后，内层**匿名**请求（无 app token）走透传且**不受 per-device 限流**（`RateLimitByDevice` 跳过匿名）。故一个泄露的 `DEVICE_TOKEN` 不止换得该设备的限流配额，还开出一条 **un-rate-limited 匿名 relay**：匿名请求被 Anthropic 401、**拿不到订阅**，但仍消耗 cc-mysub 资源、可作隐藏 IP relay。本版以一个**粗粒度全局匿名请求 cap**（`globalAnonPerMin`，与 device 无关、豁免遥测路径）兜底，并由**删 `devices.json` 一行**的吊销路径收敛。这是被接受的残留风险，非零暴露。
 
 ## 订阅档位声明（subscriptionType）的诚实边界
 

@@ -112,3 +112,5 @@ CC MySub 在每台设备运行**真正的 Claude Code 二进制**，用 `claude 
 
 - 不承诺高可用——自用工具，外部 CC 短时不可用是可接受的。
 - 真后端是否持续接受经代理的请求，取决于 Anthropic 后端策略；本项目不规避任何 client-identity 校验，仅做保真透传。
+
+**overlay 网络（headscale / WireGuard / Nebula）已评估并放弃。** overlay 能替代信道 token + frp + 大半 DoS 防护且更强（私钥不离设备、L3 准入），但**因设备侧隐蔽性放弃**：overlay 引入躲不掉的 VPN 进程 + 虚拟网卡 tell，EDR/MDM 把 mesh VPN 当明确检测类别 flag，违背「不引人注目」约束；而本地分流器（A 方案）的 footprint 像「一台普通的被代理开发机」。隐蔽性是硬约束 → 锁定 A 方案。mTLS / 客户端证书（比信道 token 强、私钥不离设备，但运维重）同样留作 future option。
