@@ -31,6 +31,21 @@ func main() {
 		}
 		os.Exit(0)
 	}()
+	// v4 audit wrinkle: cc-mysub dials the real CONNECT host (api.anthropic.com:443)
+	// over HTTPS via http.DefaultTransport, which verifies the server cert against
+	// system roots. In the sealed netns the mock stands in for that host, so it must
+	// present a TLS cert for that name signed by an audit CA installed in the
+	// container trust store. When MOCK_TLS_CERT/MOCK_TLS_KEY are both set, serve
+	// HTTPS; otherwise keep plain HTTP (back-compat with the v3 stages).
+	cert, key := os.Getenv("MOCK_TLS_CERT"), os.Getenv("MOCK_TLS_KEY")
+	if cert != "" && key != "" {
+		fmt.Fprintln(os.Stderr, "mock listening on", addr, "(TLS)")
+		if err := http.ListenAndServeTLS(addr, cert, key, newMux(rec)); err != nil {
+			fmt.Fprintln(os.Stderr, "mock:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	fmt.Fprintln(os.Stderr, "mock listening on", addr)
 	if err := http.ListenAndServe(addr, newMux(rec)); err != nil {
 		fmt.Fprintln(os.Stderr, "mock:", err)

@@ -19,11 +19,15 @@ jobs:
       - name: install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq dnsmasq dnsutils iproute2 iptables
+          # openssl: audit CA + api.anthropic.com/evil.example leaves (stage_split).
+          # ca-certificates: provides update-ca-certificates to install the audit CA
+          # into the system trust store so cc-mysub's default transport trusts the
+          # mock's api.anthropic.com cert (v4 audit wrinkle).
+          sudo apt-get install -y -qq dnsmasq dnsutils iproute2 iptables openssl ca-certificates curl
           sudo systemctl stop dnsmasq 2>/dev/null || true   # 释放宿主 :53（沙箱内自起实例）
       - name: install claude (latest)
         run: npm i -g @anthropic-ai/claude-code
       - name: unit tests
         run: go test ./ci/egress/...
-      - name: run egress audit
-        run: sudo -E "$(command -v bash)" ci/egress/run.sh --all
+      - name: run egress audit (v4 split-egress coverage guard)
+        run: sudo -E "$(command -v bash)" ci/egress/run.sh --split
