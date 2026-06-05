@@ -5,13 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
+	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
 	"github.com/redcontritio/cc-mysub/internal/enroll"
+	"github.com/redcontritio/cc-mysub/internal/mitm"
 	"github.com/redcontritio/cc-mysub/internal/proxy"
 )
 
@@ -52,27 +54,43 @@ func main() {
 	}
 	store.StartWatch()
 
-	p, err := proxy.New(cfg.UpstreamBaseURL, up.OAuthToken)
+	// 加载 cc-mysub CA：既作外层 TLS 身份的现签根，也作内层 MITM 现签根。
+	caCert, err := os.ReadFile(filepath.Join(*cfgDir, "ca.crt"))
 	if err != nil {
-		slog.Error("build proxy", "err", err)
+		slog.Error("read ca.crt", "err", err)
+		os.Exit(1)
+	}
+	caKey, err := os.ReadFile(filepath.Join(*cfgDir, "ca.key"))
+	if err != nil {
+		slog.Error("read ca.key", "err", err)
+		os.Exit(1)
+	}
+	ca, err := mitm.LoadCA(caCert, caKey)
+	if err != nil {
+		slog.Error("load ca", "err", err)
+		os.Exit(1)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+
+	// 外层 TLS 必须呈现 cc-mysub 自身身份证书（public_host 的 CN/SAN），使 CONNECT 目标
+	// host 不以明文上线。缺 public_host 无法签发该身份证书，fail-fast。
+	if cfg.Client == nil || cfg.Client.PublicHost == "" {
+		slog.Error("client.public_host required for outer-TLS identity")
 		os.Exit(1)
 	}
 
-	// Chain: Auth → RateLimit → AccessLog → proxy.
-	// AccessLog runs innermost so it sees the auth-injected device and the
-	// real upstream status; 401/429 are emitted by their own middleware.
-	handler := proxy.AuthMiddleware(store)(
-		proxy.RateLimitByDevice(120)(
-			proxy.AccessLog(nil)(p.Handler()),
-		),
-	)
+	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
+	// allowlist 仅 MITM Anthropic 控制面/数据面 host（纵深防御，拒其余）。
+	fp := proxy.NewForwardProxy(minter, store, up, nil,
+		[]string{"api.anthropic.com", "console.anthropic.com"}, cfg.Client.PublicHost)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-	mux.Handle("/", handler)
-
-	slog.Info("cc-mysub starting", "addr", cfg.Listen, "upstream", cfg.UpstreamBaseURL)
-	if err := serve(cfg, mux); err != nil {
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		slog.Error("listen", "addr", cfg.Listen, "err", err)
+		os.Exit(1)
+	}
+	slog.Info("cc-mysub forward-proxy starting", "addr", cfg.Listen, "identity", cfg.Client.PublicHost)
+	if err := fp.Serve(ln); err != nil {
 		slog.Error("server exited", "err", err)
 		os.Exit(1)
 	}
