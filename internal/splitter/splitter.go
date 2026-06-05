@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -22,12 +23,18 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 type Splitter struct {
 	upstreamAddr string          // cc-mysub forward-proxy 入口(host:port)
 	tlsCfg       *tls.Config     // 外层 TLS 验证 cc-mysub 身份(RootCAs + ServerName)
+	channelToken string         // 信道 token: 链式 CONNECT 的 Proxy-Authorization Bearer 值
 	allow        map[string]bool // 链到 cc-mysub 的 host(其余直连)
 	dial         dialFunc        // 直连拨号(nil→默认 net.Dialer); 测试注入
 }
 
-// New 构造分流器。caPool/serverName 用于验证 cc-mysub 外层身份; dial 为直连拨号(nil→默认)。
-func New(upstreamAddr string, caPool *x509.CertPool, serverName string, allow []string, dial dialFunc) *Splitter {
+// New 构造分流器。channelToken 作为链式 CONNECT 的 Proxy-Authorization Bearer 值出示给 cc-mysub；
+// caPool/serverName 用于验证 cc-mysub 外层身份; dial 为直连拨号(nil→默认)。
+// channelToken 含 CR/LF/空白/控制字符时返回 error（严格契约、错误可见，防 CONNECT 头注入）。
+func New(upstreamAddr string, caPool *x509.CertPool, channelToken string, serverName string, allow []string, dial dialFunc) (*Splitter, error) {
+	if !validChannelToken(channelToken) {
+		return nil, fmt.Errorf("splitter: channel token contains forbidden character (CR/LF/space/control)")
+	}
 	allowSet := make(map[string]bool, len(allow))
 	for _, h := range allow {
 		allowSet[h] = true
@@ -40,9 +47,22 @@ func New(upstreamAddr string, caPool *x509.CertPool, serverName string, allow []
 	return &Splitter{
 		upstreamAddr: upstreamAddr,
 		tlsCfg:       &tls.Config{RootCAs: caPool, ServerName: serverName},
+		channelToken: channelToken,
 		allow:        allowSet,
 		dial:         dial,
+	}, nil
+}
+
+// validChannelToken 拒绝任何会破坏 CONNECT 头形态或可被注入的字符：
+// CR/LF（头注入）、空格（分割 scheme/value 之外的注入）、其余控制字符（<0x20 或 0x7f）。
+// 空 token 在此放行（由 helper 单独强制非空），保持本函数为纯字符集闸门。
+func validChannelToken(t string) bool {
+	for _, r := range t {
+		if r == '\r' || r == '\n' || r == ' ' || r < 0x20 || r == 0x7f {
+			return false
+		}
 	}
+	return true
 }
 
 // Serve 接受连接并分流，直到 ln 关闭或出错。
@@ -87,7 +107,7 @@ func (s *Splitter) handle(c net.Conn) {
 			return
 		}
 		defer up.Close()
-		if _, err := up.Write([]byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n")); err != nil {
+		if _, err := up.Write([]byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\nProxy-Authorization: Bearer " + s.channelToken + "\r\n\r\n")); err != nil {
 			return
 		}
 		ubr := bufio.NewReader(up)
