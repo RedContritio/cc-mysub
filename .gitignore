@@ -18,3 +18,7 @@ config.json
 upstream.json
 devices.json
 certs/
+
+# per-device wrapper(嵌明文 DEVICE_TOKEN)与私钥(防 --config-dir=. 落进 work tree)
+myclaude-*
+*.key

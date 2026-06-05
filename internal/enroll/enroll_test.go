@@ -277,13 +277,13 @@ func TestRunEndToEnd(t *testing.T) {
 		t.Fatalf("devices.json not written correctly: %+v", list)
 	}
 
-	// wrapper 文件写出且可执行
+	// wrapper 文件写出且 mode 0o600（含明文 DEVICE_TOKEN，无需 exec-by-others）
 	fi, err := os.Stat(wrapperPath)
 	if err != nil {
 		t.Fatalf("wrapper not written: %v", err)
 	}
-	if fi.Mode().Perm()&0o100 == 0 {
-		t.Errorf("wrapper not executable: %v", fi.Mode())
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("wrapper mode = %#o want 0o600", perm)
 	}
 	w := string(mustRead(t, wrapperPath))
 	if !strings.Contains(w, `PUBLIC_HOST="ccapi.example.com"`) || !strings.Contains(w, `SUB_TYPE="max"`) {

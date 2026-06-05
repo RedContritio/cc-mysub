@@ -68,6 +68,13 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	if !strings.Contains(string(w), `NODE_EXTRA_CA_CERTS="$CA_CERT"`) {
 		t.Errorf("wrapper missing NODE_EXTRA_CA_CERTS:\n%s", w)
 	}
+
+	// wrapper 含明文 DEVICE_TOKEN：须 0o600(无 group/other 位，无 exec-by-others)。
+	if fi, err := os.Stat(wrapper); err != nil {
+		t.Fatalf("stat wrapper: %v", err)
+	} else if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("wrapper mode = %#o want 0o600", perm)
+	}
 }
 
 // TestAddDeviceRequiresLabel verifies the contract surfaces as a non-zero exit.

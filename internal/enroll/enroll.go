@@ -212,7 +212,7 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	if dest == "" {
 		dest = "myclaude-" + p.Label
 	}
-	if err := os.WriteFile(dest, []byte(wrapper), 0o755); err != nil {
+	if err := os.WriteFile(dest, []byte(wrapper), 0o600); err != nil {
 		return fmt.Errorf("write wrapper %s: %w", dest, err)
 	}
 	absDest, _ := filepath.Abs(dest)
