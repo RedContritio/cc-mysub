@@ -60,16 +60,41 @@ func isExempt(path string) bool {
 	return false
 }
 
+// globalAnonPerMin is a coarse, device-INDEPENDENT cap on anonymous inner
+// requests (those conditionalAuth lets through with no device). It bounds the
+// blast radius of a leaked DEVICE_TOKEN, which otherwise opens an
+// un-rate-limited anonymous relay through the channel (spec §3.7). It must NOT
+// throttle authenticated requests (they take the device-keyed branch below) nor
+// exempt telemetry paths (byte-faithful passthrough).
+const globalAnonPerMin = 60
+
+// globalAnonLimiter is the single shared bucket for all anonymous inner
+// requests. Keyed by a fixed sentinel so every anon request draws from one
+// global quota regardless of source.
+var globalAnonLimiter = ratelimit.NewLimiter(nil)
+
+const globalAnonKey = "" // device-independent: one global anon bucket
+
 // RateLimitByDevice limits per device using its RateLimit (or defaultPerMin
-// when the device has none). Must run after conditionalAuth (reads the injected
-// device). Skips limiting for anonymous requests (no authed device — telemetry
-// passthrough must stay byte-faithful) and for exempt path prefixes.
+// when the device has none). Must run after conditionalAuth. Exempt path
+// prefixes are never limited (telemetry passthrough stays byte-faithful).
+// Anonymous non-exempt requests (no authed device) are bounded by a coarse
+// device-independent global cap (globalAnonPerMin) instead — see §3.7.
 func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 	l := ratelimit.NewLimiter(nil)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isExempt(r.URL.Path) {
+				next.ServeHTTP(w, r) // 豁免遥测：永不限流(per-device 或全局)
+				return
+			}
 			dev, ok := r.Context().Value(deviceKey).(auth.Device)
-			if !ok || dev.Label == "" || isExempt(r.URL.Path) {
+			if !ok || dev.Label == "" {
+				// 匿名内层请求：受与 device 无关的粗粒度全局 cap。
+				if !globalAnonLimiter.Allow(globalAnonKey, globalAnonPerMin) {
+					writeJSONError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+					return
+				}
 				next.ServeHTTP(w, r)
 				return
 			}

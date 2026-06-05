@@ -170,3 +170,69 @@ func TestCaptureWriterDecodesGzip(t *testing.T) {
 		t.Errorf("gzip usage not decoded: %+v", u)
 	}
 }
+
+// TestGlobalAnonCap 契约：匿名内层请求(conditionalAuth 未注入 device)受一个与
+// device 无关的全局速率 cap(globalAnonPerMin=60)；第 61 个匿名请求 -> 429。
+// 已鉴权请求走 device 分支、永不触碰全局 limiter -> 不受影响。豁免遥测路径
+// 即便匿名也永不 cap(字节级保真)。
+//
+// 该测试直接驱动 RateLimitByDevice(全局 cap 内嵌于其匿名分支)，且每次构造新的
+// 中间件实例以拿到 fresh 的全局 limiter(避免跨测试污染共享 bucket)。
+func TestGlobalAnonCap(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	// 不注入 device => 匿名分支。defaultPerMin 取大值，证明 cap 来自全局而非 per-device。
+	h := RateLimitByDevice(100000)(next)
+
+	anonHit := func(path string) int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", path, nil))
+		return w.Code
+	}
+
+	// 前 60 个匿名非豁免请求通过；第 61 个 -> 429。
+	for i := 0; i < 60; i++ {
+		if code := anonHit("/v1/messages"); code != 200 {
+			t.Fatalf("anon request %d got %d want 200 (under global cap)", i, code)
+		}
+	}
+	if code := anonHit("/v1/messages"); code != http.StatusTooManyRequests {
+		t.Fatalf("61st anon request got %d want 429 (global anon cap)", code)
+	}
+}
+
+// TestGlobalAnonCap_AuthedUnaffected 契约：已鉴权请求不被全局匿名 cap 影响。
+// 即便全局 anon 桶已耗尽，带 device 的请求(高 per-device 限额)照常通过。
+func TestGlobalAnonCap_AuthedUnaffected(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	h := RateLimitByDevice(100000)(next)
+
+	// 先耗尽全局匿名桶(>60 个匿名请求)。
+	for i := 0; i < 70; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages", nil))
+	}
+	// 带 device 的请求(高限额)不受全局匿名桶影响。
+	dev := auth.Device{Label: "laptop", RateLimit: 100000}
+	for i := 0; i < 5; i++ {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/v1/messages", nil)
+		injectDevice(dev, h).ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatalf("authenticated request %d got %d want 200 (global anon cap must not throttle authed)", i, w.Code)
+		}
+	}
+}
+
+// TestGlobalAnonCap_ExemptTelemetryUncapped 契约：豁免遥测路径即便匿名也永不被全局
+// cap(治理总纲 §0：遥测逐字节保真)。
+func TestGlobalAnonCap_ExemptTelemetryUncapped(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	h := RateLimitByDevice(100000)(next)
+	for i := 0; i < 100; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/api/event_logging/v2/batch", nil))
+		if w.Code != 200 {
+			t.Fatalf("exempt anon telemetry hit %d got %d want 200 (never capped)", i, w.Code)
+		}
+	}
+}
