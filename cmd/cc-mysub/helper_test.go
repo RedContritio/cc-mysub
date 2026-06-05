@@ -60,9 +60,8 @@ func TestHelper_MissingChannelTokenFailsFast(t *testing.T) {
 }
 
 func TestHelper_InjectsProxyAndRunsChild(t *testing.T) {
-	// 设置合法 token：validChannelToken 现在拒绝空串（防止 Bearer 空值 → 407）
-	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "test_token_abc123")
 	caPath := writeTestCA(t)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "cco_dev_happy")
 	outPath := filepath.Join(t.TempDir(), "env.out")
 	code := runHelper([]string{
 		"--upstream", "127.0.0.1:9", // 不会被本测试真正拨号（child 只 echo env）
