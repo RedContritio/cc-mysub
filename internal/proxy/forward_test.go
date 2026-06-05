@@ -607,6 +607,68 @@ func TestForwardProxy_ChannelTokenNeverLeaksUpstream(t *testing.T) {
 	}
 }
 
+func TestForwardProxy_ShedsWhenSaturated(t *testing.T) {
+	caPEM, keyPEM := genCA(t)
+	ca, err := mitm.LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	const serverName = "cc.example"
+	// maxInFlight=1: the proxy can hold exactly one in-flight handle.
+	fp := NewForwardProxy(minter, store, cfgUp, nil, []string{"api.anthropic.com"}, serverName, 1)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go fp.Serve(ln)
+
+	caPool := x509.NewCertPool()
+	caPool.AddCert(ca.Cert)
+
+	// Client A: complete outer TLS + CONNECT, then PARK (never send inner
+	// ClientHello). handle() stays inside srv.Serve waiting on the inner conn,
+	// so it never returns and never releases the semaphore.
+	connA, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
+	if err != nil {
+		t.Fatalf("A outer dial: %v", err)
+	}
+	defer connA.Close()
+	if _, err := connA.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
+		t.Fatalf("A connect write: %v", err)
+	}
+	brA := bufio.NewReader(connA)
+	statusA, err := brA.ReadString('\n')
+	if err != nil || !strings.Contains(statusA, "200") {
+		t.Fatalf("A CONNECT status=%q err=%v", statusA, err)
+	}
+	for { // drain A's 200 headers; then A parks (no inner ClientHello)
+		line, err := brA.ReadString('\n')
+		if err != nil {
+			t.Fatalf("A drain: %v", err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	// A now holds the only semaphore slot (handle parked in srv.Serve).
+
+	// Client B: the proxy must shed — Serve does Accept then immediate Close
+	// WITHOUT spawning handle, so B's raw TCP conn is closed before any outer
+	// TLS handshake completes. tls.Dial must error (EOF / reset) within the
+	// deadline rather than hang.
+	dialer := &net.Dialer{Deadline: time.Now().Add(3 * time.Second)}
+	connB, err := tls.DialWithDialer(dialer, "tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
+	if err == nil {
+		connB.Close()
+		t.Fatalf("B outer TLS succeeded but proxy was saturated — shed failed")
+	}
+	// err is the shed signal (closed conn during handshake). Test passes.
+}
+
 func TestForwardProxy_AnonInnerStillPassesThroughAfterChannelAuth(t *testing.T) {
 	spy := &rtSpy{}
 	caPEM, keyPEM := genCA(t)
