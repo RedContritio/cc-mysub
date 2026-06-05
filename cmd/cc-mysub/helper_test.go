@@ -42,6 +42,23 @@ func writeTestCA(t *testing.T) string {
 	return p
 }
 
+func TestHelper_MissingChannelTokenFailsFast(t *testing.T) {
+	caPath := writeTestCA(t)
+	// wrapper always exports CLAUDE_CODE_OAUTH_TOKEN; this guards manual/non-wrapper
+	// invocation. t.Setenv("", ...) is invalid, so clear via Setenv to empty then verify.
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	code := runHelper([]string{
+		"--upstream", "127.0.0.1:9",
+		"--ca", caPath,
+		"--server-name", "cc.example",
+		"--",
+		"/bin/sh", "-c", "true",
+	})
+	if code != 2 {
+		t.Fatalf("runHelper with empty CLAUDE_CODE_OAUTH_TOKEN exit = %d, want 2", code)
+	}
+}
+
 func TestHelper_InjectsProxyAndRunsChild(t *testing.T) {
 	// 设置合法 token：validChannelToken 现在拒绝空串（防止 Bearer 空值 → 407）
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "test_token_abc123")

@@ -31,6 +31,12 @@ func runHelper(args []string) int {
 		fmt.Fprintln(os.Stderr, "用法: cc-mysub helper --upstream H:P --ca ca.crt --server-name HOST -- claude [args...]")
 		return 2
 	}
+	channelToken := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN")
+	if channelToken == "" {
+		// wrapper 始终 export 此 env;空仅出现在手工/非 wrapper 调用,fail-fast。
+		fmt.Fprintln(os.Stderr, "缺 CLAUDE_CODE_OAUTH_TOKEN(信道 token);经 myclaude wrapper 运行或先 export")
+		return 2
+	}
 
 	// 读 CA 公证书 → pool
 	caPEM, err := os.ReadFile(*caPath)
@@ -53,7 +59,7 @@ func runHelper(args []string) int {
 	defer ln.Close()
 
 	allow := strings.Split(*allowCSV, ",")
-	sp, err := splitter.New(*upstream, pool, os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"), *serverName, allow, nil)
+	sp, err := splitter.New(*upstream, pool, channelToken, *serverName, allow, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "分流器初始化: %v\n", err)
 		return 2
