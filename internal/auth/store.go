@@ -30,7 +30,9 @@ type DeviceStore struct {
 	byHash  map[string]Device
 	lastMod time.Time
 
-	stop chan struct{}
+	stop      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 func NewDeviceStore(path string) (*DeviceStore, error) {
@@ -80,7 +82,9 @@ func (s *DeviceStore) Lookup(token string) (Device, bool) {
 }
 
 func (s *DeviceStore) StartWatch() {
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		t := time.NewTicker(s.pollInterval)
 		defer t.Stop()
 		for {
@@ -106,4 +110,9 @@ func (s *DeviceStore) StartWatch() {
 	}()
 }
 
-func (s *DeviceStore) StopWatch() { close(s.stop) }
+// StopWatch signals the background goroutine to stop and blocks until it exits.
+// Safe to call multiple times (subsequent calls are no-ops after the first).
+func (s *DeviceStore) StopWatch() {
+	s.closeOnce.Do(func() { close(s.stop) })
+	s.wg.Wait()
+}

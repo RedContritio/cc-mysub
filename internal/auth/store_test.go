@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 )
@@ -137,31 +136,6 @@ func TestReloadRejectsEmptyDigestRow(t *testing.T) {
 	}
 }
 
-// syncBuffer wraps bytes.Buffer with a mutex so it is safe for concurrent use
-// by the slog background goroutine and the test goroutine.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) Contains(sub []byte) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return bytes.Contains(b.buf.Bytes(), sub)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
 // TestReloadParseFailureLogsLoud 契约：热重载遇坏 JSON 时保留旧表 BUT 大声 slog.Error。
 func TestReloadParseFailureLogsLoud(t *testing.T) {
 	dir := t.TempDir()
@@ -172,8 +146,8 @@ func TestReloadParseFailureLogsLoud(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 捕获默认 slog 输出（syncBuffer 保护并发写/读）。
-	var logBuf syncBuffer
+	// 捕获默认 slog 输出。
+	var logBuf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
@@ -181,7 +155,6 @@ func TestReloadParseFailureLogsLoud(t *testing.T) {
 
 	s.pollInterval = 20 * time.Millisecond
 	s.StartWatch()
-	defer s.StopWatch()
 
 	time.Sleep(10 * time.Millisecond)
 	// 写入坏 JSON 触发 reload 失败。
@@ -189,14 +162,11 @@ func TestReloadParseFailureLogsLoud(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if logBuf.Contains([]byte("reload failed")) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !logBuf.Contains([]byte("reload failed")) {
+	// Allow several poll cycles to fire; StopWatch then blocks until the goroutine
+	// exits so that the logBuf reads below happen with no concurrent writer alive.
+	time.Sleep(300 * time.Millisecond)
+	s.StopWatch()
+	if !bytes.Contains(logBuf.Bytes(), []byte("reload failed")) {
 		t.Fatalf("expected loud reload-failure log, got: %q", logBuf.String())
 	}
 	// 旧表保留：t1 仍命中。
