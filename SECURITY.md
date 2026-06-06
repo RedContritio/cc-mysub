@@ -97,3 +97,20 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 请通过 GitHub 的**私有 security advisory** 上报：仓库页面 → **Security** 标签 → **Report a vulnerability**。
 
 请勿在公开 issue、PR 或讨论区披露安全问题。报告中请尽量包含复现步骤、影响范围和受影响版本。我们会在私有 advisory 内跟进并协调修复与披露时间。
+
+## 自举 wrapper 供应链不变量
+
+- **二进制完整性 fail-closed**：wrapper 内嵌 per-platform sha256（离线锚），下载的二进制
+  sha256 不匹配则绝不 exec，并发首次运行下亦持（mktemp 私有临时 + 同目录原子 rename，
+  被 rename 的对象必已校验）。
+- **信任离线锚在 wrapper**：运行时对二进制的校验不依赖对 GitHub 的传输信任；sha256 pin 在
+  `add-device` 时由 operator 联网拉取并烤入，那一刻信任根 = GitHub 平台 + operator 账号
+  （与 CI 在 GitHub 构建同属已纳入 TCB）。reproducible build（pin-Go + `-trimpath`）是可选
+  的独立审计 hedge。
+- **wrapper = 设备凭据**：内嵌明文 per-device token，分发渠道须鉴权（operator 责任，沿用
+  「明文仅此一次」模型）。`.gitignore` 已覆盖 `myclaude-*`。
+- **首次下载 trace 不经 cc-mysub MITM**：bootstrap 在 helper 起本地分流器之前运行，且 GitHub
+  不在 helper allowlist；像普通开发机的 release 下载，deliberate accepted（远低于常驻 VPN，
+  合 v4 隐蔽性约束）。curl/wget 默认 honor 设备 ambient HTTPS_PROXY——与安全无关：sha256
+  离线锚使完整性独立于下载路径。
+- **私有 repo / macOS Gatekeeper / reproducibility 操作化**：见 spec §10 非阻塞后续。

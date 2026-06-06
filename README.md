@@ -19,10 +19,12 @@ frp 入口层必须用 **`type=tcp`** 透传——外层 TLS 由 cc-mysub 自己
 
 ## 客户端工作方式（v4 helper 形态）
 
-`add-device` 生成的 `myclaude` wrapper 形如：
+`add-device` 生成的 `myclaude` wrapper 是**自举型**：首次运行自动按 `uname` 下载
+对应平台的 `cc-mysub` 二进制（sha256 校验 fail-closed）并写出内联 CA，之后秒启。
+末行核心形如：
 
 ```bash
-exec cc-mysub helper \
+exec "$CC_MYSUB_BIN" helper \
   --upstream <frps_ip:proxy_port> \
   --server-name <public_host> \
   --ca <path/to/ca.crt> \
@@ -57,7 +59,7 @@ wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA）、占位 `CLA
 | `config.json` | `{"listen":"127.0.0.1:8788","client":{"public_host":"...","frps_ip":"...","proxy_port":8788,"subscription_type":"max"}}` | — |
 | `upstream.json` | token 池：`{"oauthTokens":[{"id":"a","token":"sk-ant-oat01-..."}]}`（chmod 600；旧式 `{"oauthToken":"..."}` 单 token 仍可用）| chmod 600 |
 | `devices.json` | `[{"label":"laptop","token_sha256":"...","upstream":"a","rate_limit":120}]`，由 `add-device` 维护；`upstream` 字段指向使用哪个池中 token | — |
-| `ca.crt` | cc-mysub 自有 CA 公证书，由 `add-device` 首次生成，需拷到设备 | 0644 |
+| `ca.crt` | cc-mysub 自有 CA 公证书，由 `add-device` 首次生成（幂等）；已内联进 wrapper，设备首次运行时自动写出，无需手动拷贝 | 0644 |
 | `ca.key` | CA 私钥，由 `add-device` 首次生成，**永不入 git、永不离开本机** | 0600 |
 
 代理只存 per-device token 的 sha256，从不存明文。文件改动通过 mtime polling 热重载，无需重启。
@@ -78,24 +80,32 @@ wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA）、占位 `CLA
 }
 ```
 
-之后每台设备只需一条命令——它签发 per-device token、把 sha256 写入 `devices.json`、指定使用的池中 token id，并首次生成 `ca.crt`/`ca.key`（幂等：已存在则复用），最后生成一份**已填好**的 `myclaude` wrapper：
+之后每台设备只需一条命令——从 GitHub Releases 下载 SHA256SUMS 烤入 wrapper、签发 per-device token（sha256 写入 `devices.json`），并首次生成 `ca.crt`/`ca.key`（幂等：已存在则复用），生成一份**自举型**已填好的 `myclaude` wrapper：
 
 ```bash
-cc-mysub add-device --label laptop --upstream a
-# → 打印交给该设备的明文 token（仅此一次）
-# → 写入 devices.json（只存 sha256）
+cc-mysub add-device --label laptop --release v1.0.0
+# → 从 GitHub Releases 下载 SHA256SUMS（per-platform sha256 烤入 wrapper）
+# → 签发 per-device token，写入 devices.json（只存 sha256）
 # → 首次生成 ca.crt / ca.key（已有则跳过）
-# → 生成 ./myclaude-laptop（已填入 upstream / server-name / ca / token / 订阅档）
+# → 生成 ./myclaude-laptop（内联 CA + per-platform sha pin + token + 订阅档）
 ```
 
-**设备部署三件事**：
-1. 拷贝 `cc-mysub` 二进制（用于运行 `helper` 子命令）
-2. 拷贝 `ca.crt`（公证书，路径见 add-device 输出）
-3. 拷贝生成的 `myclaude-laptop` wrapper 到 PATH（如 `~/.local/bin/myclaude`）
+### 设备接入（自举型一文件）
+
+把生成的 `myclaude-laptop` 拷到设备 PATH（如 `~/.local/bin/myclaude`）即可。首次运行自动按
+`uname` 从 GitHub Releases 下载对应平台的 `cc-mysub` 二进制（sha256 校验 fail-closed）、
+写出内联 CA 公证书到 `~/.config/cc-mysub/ca.crt`，之后秒启。**无需另拷二进制或 ca.crt。**
+
+- `--release <tag>` 必填，钉定二进制版本（无默认 latest，杜绝移动目标）。
+- 升级：`add-device --rotate <label> --release <newtag>` 原地换发——吊销旧 token、
+  写新 token、覆写 wrapper；设备换上新 wrapper 即自动重新下载校验新版本。
+- 平台：`linux/darwin × amd64/arm64`（Windows 不支持，wrapper 是 bash）。
+- 二进制托管点默认 `redcontritio/cc-mysub` 的 GitHub Releases，可经 config
+  `client.release_repo` 或 `--release-repo` 覆盖。
 
 之后在该设备上用 `myclaude` 代替 `claude` 即可。helper 直拨 `frps_ip:proxy_port` 的 cc-mysub forward-proxy，外层 TLS 验证其 `public_host` 身份；non-Anthropic 流量 helper 本地直连，不经 cc-mysub。
 
-任一部署常量都可用 flag 覆盖：`cc-mysub add-device --label work --sub pro`（亦支持 `--host` / `--frps-ip` / `--proxy-port` / `--rate-limit` / `--out` / `--config-dir`）。生成的 wrapper **不会**替你预设 classifier 小模型（`ANTHROPIC_SMALL_FAST_MODEL`）；需要时取消 wrapper 里那行注释、自行填入即可。
+任一部署常量都可用 flag 覆盖（亦支持 `--host` / `--frps-ip` / `--proxy-port` / `--sub` / `--rate-limit` / `--release-repo` / `--out` / `--config-dir`）。生成的 wrapper **不会**替你预设 classifier 小模型（`ANTHROPIC_SMALL_FAST_MODEL`）；需要时取消 wrapper 里那行注释、自行填入即可。
 
 代理热重载会自动加载新设备，无需重启。
 
