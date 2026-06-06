@@ -256,6 +256,34 @@ func TestResolveRequiresHostFrpsSub(t *testing.T) {
 	}
 }
 
+// TestResolveReleaseRepoDefault 验证 release_repo 缺省回退默认仓库，config/flag 给值则优先。
+func TestResolveReleaseRepoDefault(t *testing.T) {
+	def := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	got, err := Resolve(def, Params{Label: "x"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.ReleaseRepo != "redcontritio/cc-mysub" {
+		t.Errorf("default ReleaseRepo = %q, want redcontritio/cc-mysub", got.ReleaseRepo)
+	}
+	def2 := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max", ReleaseRepo: "acme/cc-mysub"}
+	got2, err := Resolve(def2, Params{Label: "x"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got2.ReleaseRepo != "acme/cc-mysub" {
+		t.Errorf("config ReleaseRepo = %q, want acme/cc-mysub", got2.ReleaseRepo)
+	}
+	// flag override 优先于 config
+	got3, err := Resolve(def2, Params{Label: "x", ReleaseRepo: "flag/repo"})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got3.ReleaseRepo != "flag/repo" {
+		t.Errorf("flag override ReleaseRepo = %q, want flag/repo", got3.ReleaseRepo)
+	}
+}
+
 // ---- Run (integration) ----
 
 func TestRunEndToEnd(t *testing.T) {

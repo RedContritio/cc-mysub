@@ -14,6 +14,7 @@ type ClientConfig struct {
 	FrpsIP           string `json:"frps_ip"`           // frps 公网 IP, 即 helper 直拨 cc-mysub forward-proxy 的入口
 	ProxyPort        int    `json:"proxy_port"`        // frp 暴露的 cc-mysub forward-proxy 端口, helper 直拨; 0 = 默认 8788
 	SubscriptionType string `json:"subscription_type"` // 你的真实订阅档: pro/max/team/enterprise
+	ReleaseRepo      string `json:"release_repo"`      // 托管 cc-mysub release 二进制的 GitHub owner/repo; 空=默认 redcontritio/cc-mysub
 }
 
 type Config struct {

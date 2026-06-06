@@ -40,6 +40,7 @@ type Params struct {
 	SubType    string
 	RateLimit  int
 	Upstream   string // 该设备所属 setup-token id; 空 = 使用默认 token
+	ReleaseRepo string // 托管 release 二进制的 GitHub owner/repo override; 空走 config/默认
 }
 
 // GenerateToken returns a fresh per-device token: "cco_dev_" + 48 hex chars
@@ -91,9 +92,15 @@ func Resolve(def *config.ClientConfig, override Params) (Params, error) {
 		if out.SubType == "" {
 			out.SubType = def.SubscriptionType
 		}
+		if out.ReleaseRepo == "" {
+			out.ReleaseRepo = def.ReleaseRepo
+		}
 	}
 	if out.ProxyPort == 0 {
 		out.ProxyPort = 8788 // frp 暴露的 cc-mysub forward-proxy 默认端口
+	}
+	if out.ReleaseRepo == "" {
+		out.ReleaseRepo = "redcontritio/cc-mysub" // release 二进制托管点默认仓库
 	}
 	if out.Label == "" {
 		return Params{}, fmt.Errorf("--label is required")
