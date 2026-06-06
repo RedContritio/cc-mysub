@@ -416,6 +416,14 @@ func TestRunEndToEnd(t *testing.T) {
 	if strings.Contains(w, "ANTHROPIC_BASE_URL=https://") || strings.Contains(w, "unshare") {
 		t.Errorf("wrapper still contains obsolete v3 form:\n%s", w)
 	}
+	// §7 硬不变量: 私钥 ca.key 绝不内联(只内联公 ca.crt)。负向守护:误把 serverCACertPath 指向
+	// key、或多读 ca.key 内联的回归须被抓到。
+	if strings.Contains(w, "PRIVATE KEY") {
+		t.Errorf("wrapper leaked a private-key PEM (ca.key must never be inlined):\n%s", w)
+	}
+	if keyPEM, err := os.ReadFile(filepath.Join(cfgDir, "ca.key")); err == nil && strings.Contains(w, strings.TrimSpace(string(keyPEM))) {
+		t.Errorf("wrapper embeds ca.key content (private-key leak)")
+	}
 
 	// add-device 首次运行须落 cc-mysub CA（ca.crt + ca.key, key 0600）。
 	if _, err := os.Stat(filepath.Join(cfgDir, "ca.crt")); err != nil {

@@ -238,3 +238,104 @@ func TestWrapperBootstrapConcurrentFirstRun(t *testing.T) {
 		t.Errorf("expected ≥1 real download on cold-cache concurrent run, got %d", *hits)
 	}
 }
+
+// TestWrapperBootstrapInlineCANoInjection 验证内联 CA 的单引号 heredoc 中和 shell 注入(spec §8
+// 点名契约):含 $(...)/反引号/; 的 CA PEM 必须逐字落盘、绝不被展开或执行。
+func TestWrapperBootstrapInlineCANoInjection(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	srv, _ := mockBinaryServer(t)
+	defer srv.Close()
+	home := t.TempDir()
+	sha := sha256hex([]byte(stubBinary))
+	sentinel := filepath.Join(home, "PWNED")
+	evilPEM := "-----BEGIN CERTIFICATE-----\nLINE-$(touch " + sentinel + ")\n`touch " + sentinel + "`\n; rm -rf should-not-run\n-----END CERTIFICATE-----"
+	tbl := map[string]string{"linux-amd64": sha, "linux-arm64": sha, "darwin-amd64": sha, "darwin-arm64": sha}
+	p := Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}
+	wrapper, err := RenderWrapper(p, "cco_dev_x", filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt"), evilPEM, tbl, "vtest", srv.URL)
+	if err != nil {
+		t.Fatalf("RenderWrapper: %v", err)
+	}
+	out, err := runWrapper(t, wrapper, home, "")
+	if err != nil {
+		t.Fatalf("wrapper failed: %v\n%s", err, out)
+	}
+	// $(...)/`...` 绝不能执行(单引号 heredoc 中和)。
+	if _, statErr := os.Stat(sentinel); statErr == nil {
+		t.Error("CA PEM 中的 $(...)/`...` 被执行了 — 单引号 heredoc 注入防护失效")
+	}
+	// CA 须逐字落盘(元字符原样保留)。
+	caBytes, err := os.ReadFile(filepath.Join(home, ".config", "cc-mysub", "ca.crt"))
+	if err != nil {
+		t.Fatalf("CA not written: %v", err)
+	}
+	if !strings.Contains(string(caBytes), "$(touch") || !strings.Contains(string(caBytes), "`touch") {
+		t.Errorf("CA 未逐字落盘(元字符应原样保留):\n%s", caBytes)
+	}
+}
+
+// TestWrapperBootstrapStaleBinaryRedownloads 验证 D5 升级 linchpin:已存在但 sha 不符的旧二进制
+// (换新 wrapper 场景)触发重下载 + 校验,绝不 exec 旧版本。
+func TestWrapperBootstrapStaleBinaryRedownloads(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	srv, hits := mockBinaryServer(t)
+	defer srv.Close()
+	home := t.TempDir()
+	sha := sha256hex([]byte(stubBinary))
+	bin := filepath.Join(home, ".local", "bin", "cc-mysub")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 sha 不符的旧二进制(模拟升级:新 wrapper 钉的 sha ≠ 旧缓存)。
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\necho STALE_OLD_BINARY\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := renderBootstrap(t, srv.URL, sha) // 烤入 stub 真 sha
+	out, err := runWrapper(t, wrapper, home, "")
+	if err != nil {
+		t.Fatalf("wrapper failed: %v\n%s", err, out)
+	}
+	if *hits != 1 {
+		t.Errorf("stale binary must trigger exactly 1 re-download, got %d", *hits)
+	}
+	if !strings.Contains(out, stubMarker) {
+		t.Errorf("re-downloaded stub not exec'd:\n%s", out)
+	}
+	if strings.Contains(out, "STALE_OLD_BINARY") {
+		t.Errorf("stale binary exec'd instead of re-downloading (upgrade broken):\n%s", out)
+	}
+	b, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("binary missing: %v", err)
+	}
+	if sha256hex(b) != sha {
+		t.Errorf("cached binary not replaced with correct version after upgrade")
+	}
+}
+
+// TestWrapperBootstrapDownloadFailureFailsClosed 验证 §6 fail-closed:二进制下载失败(404)→
+// 非零退出 + 不 exec + 不留缓存。
+func TestWrapperBootstrapDownloadFailureFailsClosed(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r) // 所有路径 404 → 下载失败
+	}))
+	defer srv.Close()
+	home := t.TempDir()
+	wrapper := renderBootstrap(t, srv.URL, strings.Repeat("a", 64))
+	out, err := runWrapper(t, wrapper, home, "")
+	if err == nil {
+		t.Fatalf("expected non-zero exit on download failure; output:\n%s", out)
+	}
+	if strings.Contains(out, stubMarker) {
+		t.Errorf("stub exec'd despite download failure:\n%s", out)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".local", "bin", "cc-mysub")); statErr == nil {
+		t.Error("binary cached despite download failure (not fail-closed)")
+	}
+}
