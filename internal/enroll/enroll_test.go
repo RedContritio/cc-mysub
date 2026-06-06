@@ -214,6 +214,66 @@ func TestAppendDeviceRejectsDuplicateLabel(t *testing.T) {
 	}
 }
 
+func TestReplaceDeviceErrorsWhenLabelAbsent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_a"))
+	err := ReplaceDevice(path, Params{Label: "ghost", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	if err == nil {
+		t.Fatal("expected error rotating an absent label, got nil")
+	}
+	if !strings.Contains(err.Error(), "ghost") {
+		t.Errorf("error should mention the absent label, got: %v", err)
+	}
+	// 失败的 rotate 须零副作用：原设备 a 完好、未半截写入。
+	list := readDevices(t, path)
+	if len(list) != 1 || list[0].Label != "a" || list[0].TokenSHA256 != auth.HashToken("cco_dev_a") {
+		t.Errorf("failed rotate must be side-effect-free; devices.json mutated: %+v", list)
+	}
+}
+
+func TestReplaceDeviceSwapsToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_old"))
+	must(t, ReplaceDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_new"))
+	list := readDevices(t, path)
+	if len(list) != 1 {
+		t.Fatalf("want 1 device after rotate, got %d", len(list))
+	}
+	if list[0].TokenSHA256 != auth.HashToken("cco_dev_new") {
+		t.Errorf("token not swapped to new")
+	}
+}
+
+// TestReplaceDevicePreservesSiblings 验证 rotate 只动目标 label：换发 target 后，同库其它设备行
+// (keep) 的 token 必须原封不动、仍命中。守护「rotate 误伤旁邻设备 = 静默大规模 lockout / 凭据丢失」
+// 这一灾难性回归——对抗 review 变异验证发现：核心契约外，sibling-preservation 此前无守护
+// (把 ReplaceDevice 改成丢弃全部行 + 追加新行的回归能通过整包测试)。
+func TestReplaceDevicePreservesSiblings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "keep", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_keep"))
+	must(t, AppendDevice(path, Params{Label: "target", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_oldtarget"))
+
+	must(t, ReplaceDevice(path, Params{Label: "target", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_newtarget"))
+
+	list := readDevices(t, path)
+	if len(list) != 2 {
+		t.Fatalf("rotate must preserve sibling; want 2 devices, got %d: %+v", len(list), list)
+	}
+	byLabel := map[string]auth.Device{}
+	for _, d := range list {
+		byLabel[d.Label] = d
+	}
+	if byLabel["keep"].TokenSHA256 != auth.HashToken("cco_dev_keep") {
+		t.Errorf("sibling 'keep' token altered by rotate of 'target' (mass-revocation regression)")
+	}
+	if byLabel["target"].TokenSHA256 != auth.HashToken("cco_dev_newtarget") {
+		t.Errorf("target token not swapped to new")
+	}
+	if byLabel["target"].TokenSHA256 == auth.HashToken("cco_dev_oldtarget") {
+		t.Errorf("target still carries old token after rotate")
+	}
+}
+
 // ---- Resolve ----
 
 func TestResolveFlagOverridesConfig(t *testing.T) {
@@ -428,6 +488,76 @@ func TestRunRejectsMalformedRelease(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(cfgDir, "devices.json")); statErr == nil {
 		t.Error("devices.json written despite malformed --release (orphan side effect)")
+	}
+}
+
+// TestRunRotateRevokesOldToken 验证 --rotate 原地换发: 旧 token 不再 Lookup 命中, 新 token 命中, 单行。
+func TestRunRotateRevokesOldToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
+			io.WriteString(w, validSums())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
+
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+
+	var sb1 strings.Builder
+	must(t, Run([]string{"--label", "laptop", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
+	oldTok := extractToken(t, sb1.String())
+
+	var sb2 strings.Builder
+	must(t, Run([]string{"--label", "laptop", "--rotate", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2))
+	newTok := extractToken(t, sb2.String())
+
+	if oldTok == newTok {
+		t.Fatal("rotate did not issue a new token")
+	}
+	store, err := auth.NewDeviceStore(filepath.Join(cfgDir, "devices.json"))
+	must(t, err)
+	defer store.StopWatch()
+	if _, ok := store.Lookup(oldTok); ok {
+		t.Error("old token still valid after rotate (NOT revoked)")
+	}
+	if _, ok := store.Lookup(newTok); !ok {
+		t.Error("new token not valid after rotate")
+	}
+	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
+	if len(list) != 1 {
+		t.Errorf("want exactly 1 row for the label after rotate, got %d", len(list))
+	}
+}
+
+// TestRunNoRotateRejectsDuplicate 验证不带 --rotate 时同 label 仍被 AppendDevice 硬拒。
+func TestRunNoRotateRejectsDuplicate(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
+			io.WriteString(w, validSums())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
+
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+
+	var sb1 strings.Builder
+	must(t, Run([]string{"--label", "dup", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
+	var sb2 strings.Builder
+	err := Run([]string{"--label", "dup", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2)
+	if err == nil {
+		t.Fatal("expected duplicate-label error without --rotate, got nil")
+	}
+	if !strings.Contains(err.Error(), "dup") {
+		t.Errorf("error should be the duplicate-label rejection (AppendDevice), got: %v", err)
 	}
 }
 
