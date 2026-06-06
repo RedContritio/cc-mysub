@@ -9,6 +9,7 @@ docs/superpowers/
 # 编译产物
 /cc-mysub
 *.exe
+dist/
 
 # 日志
 *.log

@@ -1,0 +1,29 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write   # gh release create 需写权限; 新仓库 GITHUB_TOKEN 默认只读会 403
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.12'   # 精确 patch pin → 同 tag 同 Go 版本产出同 sha256(可复现)
+      - name: Cross-compile 4 platforms
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags="-s -w" \
+              -o "dist/cc-mysub-$os-$arch" ./cmd/cc-mysub
+          done
+      - name: Generate SHA256SUMS
+        run: cd dist && sha256sum cc-mysub-* > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/cc-mysub-* dist/SHA256SUMS
+          --title "${GITHUB_REF_NAME}" --notes "cc-mysub ${GITHUB_REF_NAME}"
