@@ -9,17 +9,11 @@ import (
 	"time"
 )
 
-// emptyTokenHash is the sha256 of the empty token. A devices.json row carrying
-// this digest can only ever be matched by an empty presented token, which is
-// itself rejected at Lookup's entry — so such a row is always inert. Reject it
-// at load so it never even occupies a map slot.
-var emptyTokenHash = HashToken("")
-
 type Device struct {
-	Label       string `json:"label"`
-	TokenSHA256 string `json:"token_sha256"`
-	RateLimit   int    `json:"rate_limit"` // 每分钟请求数; 0 = 用默认
-	Upstream    string `json:"upstream"`   // 所属 setup-token id; 空 = 使用默认 token
+	Label      string `json:"label"`
+	CertSHA256 string `json:"cert_sha256"` // 客户端证书 SHA-256(DER) 小写 hex; 设备身份
+	RateLimit  int    `json:"rate_limit"`  // 每分钟请求数; 0 = 用默认
+	Upstream   string `json:"upstream"`    // 所属 setup-token id; 空 = 使用默认 token
 }
 
 type DeviceStore struct {
@@ -58,10 +52,10 @@ func (s *DeviceStore) reload() error {
 	}
 	m := make(map[string]Device, len(list))
 	for _, d := range list {
-		if d.TokenSHA256 == "" || d.TokenSHA256 == emptyTokenHash {
-			continue
+		if !CanonicalFingerprint(d.CertSHA256) {
+			continue // 拒空/非 64-lowercase-hex 行（错误可见，永不进表）
 		}
-		m[d.TokenSHA256] = d
+		m[d.CertSHA256] = d
 	}
 	s.mu.Lock()
 	s.byHash = m
@@ -70,14 +64,15 @@ func (s *DeviceStore) reload() error {
 	return nil
 }
 
-func (s *DeviceStore) Lookup(token string) (Device, bool) {
-	if token == "" {
+// Lookup 按客户端证书指纹（SHA-256(DER) 小写 hex）直接查白名单。fp 已是 digest，
+// 不二次哈希——否则键 != cert_sha256，全量静默认证失败。
+func (s *DeviceStore) Lookup(fp string) (Device, bool) {
+	if !CanonicalFingerprint(fp) {
 		return Device{}, false
 	}
-	h := HashToken(token)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	d, ok := s.byHash[h]
+	d, ok := s.byHash[fp]
 	return d, ok
 }
 

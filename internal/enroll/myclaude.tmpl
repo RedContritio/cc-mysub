@@ -2,7 +2,7 @@
 # myclaude — Claude Code wrapper (cc-mysub client, v4 split-egress, 自举型)
 # 由 cc-mysub add-device 生成。拉这一个文件即可启动：首次运行自补 cc-mysub 二进制
 # (按 uname 下载 + sha256 校验) 并写出内联 CA 公证书；之后秒启。
-# 本机只持 per-device 占位 token + cc-mysub CA 公证书；真 setup-token 永不出 cc-mysub。
+# 本机持: 本设备私钥/证书(device-init 本地生成, 私钥不离机) + cc-mysub CA 公证书; 真 setup-token 永不出 cc-mysub。
 # 钉定版本: {{.Version}}
 set -euo pipefail
 
@@ -68,17 +68,19 @@ if [ ! -x "$CC_MYSUB_BIN" ] || ! verify_sha "$CC_MYSUB_BIN" "$SHA"; then
 fi
 # ---- end bootstrap ----
 
-# ============ 本设备配置(由 cc-mysub add-device 生成) ============
-PUBLIC_HOST="{{.PublicHost}}"   # cc-mysub 外层 TLS 身份(证书 SAN)，helper 用它验证
-PROXY_ENTRY="{{.FrpsIP}}:{{.ProxyPort}}"  # helper 直拨的 cc-mysub forward-proxy 入口
-DEVICE_TOKEN="{{.DeviceToken}}" # 代理侧为本设备签的占位 token(sha256 入 devices.json)
+# ====== 本设备配置(由 cc-mysub add-device 生成; 通用 wrapper, 无 per-device 秘密) ======
+PUBLIC_HOST="{{.PublicHost}}"   # cc-mysub 域名; helper 拨 host:443, 外层 TLS ServerName(验真 LE)
+DEV_CERT="${HOME}/.config/cc-mysub/device.crt"  # 本设备客户端证书(device-init 本地生成)
+DEV_KEY="${HOME}/.config/cc-mysub/device.key"   # 本设备私钥(0600, 永不离开本机)
 SUB_TYPE="{{.SubType}}"         # 订阅档: Max 标签 + auto mode + 1M 可用性
 # 可选小模型(是否启用/用哪个由你决定; 不设用 CC 默认):
 # export ANTHROPIC_SMALL_FAST_MODEL="<small-model-id>"
 # ===============================================================
 
 # 订阅认证 env(全是占位/声明, 无真凭据); base_url 保持默认(不导出); HTTPS_PROXY 由 helper 注入
-export CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"
+# 占位 token：claude 需非空才发 Authorization；其值非凭据(身份由 mTLS 客户端证书承载),
+# cc-mysub 忽略其值、按证书识别设备并换发真 token。全 fleet 同值。
+export CLAUDE_CODE_OAUTH_TOKEN="cco_dev_placeholder"
 export CLAUDE_CODE_OAUTH_SCOPES="user:inference"
 export CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"
 export NODE_EXTRA_CA_CERTS="$CA_CERT"   # 信任 cc-mysub CA(验证其 MITM 的 api.anthropic.com 证书)
@@ -93,5 +95,13 @@ if ! grep -qs '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$CJSON"; 
   fi
 fi
 
+# 首次入网：本地生成设备密钥+自签证书并打印指纹（私钥不离设备）；登记后再 re-run。
+if [ ! -f "$DEV_KEY" ] || [ ! -f "$DEV_CERT" ]; then
+  "$CC_MYSUB_BIN" device-init
+  echo "cc-mysub: 设备首次入网 —— 把上面的指纹在代理主机用 'cc-mysub add-device --fingerprint <fp>' 登记后, 重跑本命令。" >&2
+  exit 0
+fi
+
 # 经 cc-mysub helper 启动 claude(绝对路径, 不依赖 PATH): helper 绑本地分流器(Anthropic→cc-mysub, 其余直连)
-exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"
+# 外层走 mTLS(出示本设备客户端证书) + 系统信任验真 LE; 故不再需要 --ca/--server-name/--upstream。
+exec "$CC_MYSUB_BIN" helper --host "$PUBLIC_HOST" --client-cert "$DEV_CERT" --client-key "$DEV_KEY" -- claude "$@"

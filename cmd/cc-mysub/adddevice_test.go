@@ -32,7 +32,7 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	}
 
 	cfgDir := t.TempDir()
-	cfgJSON := `{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","proxy_port":8788,"subscription_type":"max"}}`
+	cfgJSON := `{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","subscription_type":"max"}}`
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(cfgJSON), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -47,15 +47,16 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	const deviceFP = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 	cmd := exec.Command(bin, "add-device",
-		"--config-dir", cfgDir, "--label", "phone", "--release", "v1.0.0", "--out", wrapper)
+		"--config-dir", cfgDir, "--label", "phone", "--fingerprint", deviceFP, "--release", "v1.0.0", "--out", wrapper)
 	cmd.Env = append(os.Environ(), "CC_MYSUB_RELEASE_BASE_URL="+srv.URL)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("add-device: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "cco_dev_") {
-		t.Errorf("output missing per-device token:\n%s", out)
+	if !strings.Contains(string(out), deviceFP) {
+		t.Errorf("output missing registered fingerprint:\n%s", out)
 	}
 
 	devices, err := os.ReadFile(filepath.Join(cfgDir, "devices.json"))
@@ -64,6 +65,9 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	}
 	if !strings.Contains(string(devices), `"label": "phone"`) {
 		t.Errorf("devices.json missing phone entry:\n%s", devices)
+	}
+	if !strings.Contains(string(devices), `"cert_sha256": "`+deviceFP+`"`) {
+		t.Errorf("devices.json missing cert_sha256:\n%s", devices)
 	}
 
 	// 首次 add-device 须生成 cc-mysub 自有 CA。
@@ -78,19 +82,23 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wrapper not written: %v", err)
 	}
-	// v4 helper 形态: 断言 helper exec 行 + NODE_EXTRA_CA_CERTS, 不再是 v3 的 PROXY_HOST=。
+	// mTLS 形态: 断言 helper exec 行(--host/--client-cert/--client-key) + NODE_EXTRA_CA_CERTS;
+	// 通用 wrapper 不含 per-device token/指纹。
 	if !strings.Contains(string(w), `PUBLIC_HOST="ccapi.example.com"`) {
 		t.Errorf("wrapper not filled from config:\n%s", w)
 	}
-	if !strings.Contains(string(w), `exec "$CC_MYSUB_BIN" helper --upstream`) {
-		t.Errorf("wrapper missing v4 self-bootstrap helper exec line:\n%s", w)
+	if !strings.Contains(string(w), `exec "$CC_MYSUB_BIN" helper --host "$PUBLIC_HOST" --client-cert "$DEV_CERT" --client-key "$DEV_KEY"`) {
+		t.Errorf("wrapper missing mTLS helper exec line:\n%s", w)
 	}
 	if !strings.Contains(string(w), `NODE_EXTRA_CA_CERTS="$CA_CERT"`) {
 		t.Errorf("wrapper missing NODE_EXTRA_CA_CERTS:\n%s", w)
 	}
+	if strings.Contains(string(w), "DEVICE_TOKEN") || strings.Contains(string(w), deviceFP) {
+		t.Errorf("fleet-generic wrapper must not carry per-device token/fingerprint:\n%s", w)
+	}
 
-	// wrapper 含明文 DEVICE_TOKEN：须 0o700(owner rwx，group/other 无权)。
-	// 0o700 确保 owner 可执行（放入 PATH 后可直接调用），同时 group/other 无法读取 token。
+	// 通用 wrapper 内联 CA 公证书(非私钥)，仍保持 0o700：owner 可执行（放入 PATH 直接调用），
+	// group/other 无权（沿用既有权限纪律）。
 	if fi, err := os.Stat(wrapper); err != nil {
 		t.Fatalf("stat wrapper: %v", err)
 	} else if perm := fi.Mode().Perm(); perm != 0o700 {

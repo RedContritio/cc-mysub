@@ -39,8 +39,8 @@ func renderBootstrap(t *testing.T, releaseBase, sha string) string {
 		"darwin-arm64": strings.Repeat("0", 64),
 	}
 	tbl[curPlatform(t)] = sha
-	p := Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}
-	out, err := RenderWrapper(p, "cco_dev_x", filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt"),
+	p := Params{PublicHost: "h", SubType: "max"}
+	out, err := RenderWrapper(p, filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt"),
 		"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----", tbl, "vtest", releaseBase)
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
@@ -252,8 +252,8 @@ func TestWrapperBootstrapInlineCANoInjection(t *testing.T) {
 	sentinel := filepath.Join(home, "PWNED")
 	evilPEM := "-----BEGIN CERTIFICATE-----\nLINE-$(touch " + sentinel + ")\n`touch " + sentinel + "`\n; rm -rf should-not-run\n-----END CERTIFICATE-----"
 	tbl := map[string]string{"linux-amd64": sha, "linux-arm64": sha, "darwin-amd64": sha, "darwin-arm64": sha}
-	p := Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}
-	wrapper, err := RenderWrapper(p, "cco_dev_x", filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt"), evilPEM, tbl, "vtest", srv.URL)
+	p := Params{PublicHost: "h", SubType: "max"}
+	wrapper, err := RenderWrapper(p, filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt"), evilPEM, tbl, "vtest", srv.URL)
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -409,5 +409,31 @@ func TestWrapperBootstrapMissingHashToolFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(out, "需要 sha256sum 或 shasum") {
 		t.Errorf("missing-hash-tool 失败未锚定到 verify_sha 工具缺失分支:\n%s", out)
+	}
+}
+
+// TestRenderWrapperFleetGeneric 验证通用 wrapper 无 per-device 秘密：对两个不同 label（其余输入相同）
+// 渲染, 输出必须字节相同——任何 per-device 值(旧 token/指纹)悄悄烤入都会破坏此不变量。RenderWrapper
+// 不接 Label 入参, 此测试钉死「设备身份由 mTLS 客户端证书承载、绝不进 wrapper」的契约。
+func TestRenderWrapperFleetGeneric(t *testing.T) {
+	caPEM := "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----"
+	tbl := map[string]string{
+		"linux-amd64":  strings.Repeat("a", 64),
+		"linux-arm64":  strings.Repeat("b", 64),
+		"darwin-amd64": strings.Repeat("c", 64),
+		"darwin-arm64": strings.Repeat("d", 64),
+	}
+	caPath := filepath.Join("${HOME}", ".config", "cc-mysub", "ca.crt")
+	relBase := "https://x/releases/download/v1"
+	w1, err := RenderWrapper(Params{Label: "alpha", PublicHost: "h", SubType: "max"}, caPath, caPEM, tbl, "v1", relBase)
+	if err != nil {
+		t.Fatalf("RenderWrapper(alpha): %v", err)
+	}
+	w2, err := RenderWrapper(Params{Label: "bravo", PublicHost: "h", SubType: "max"}, caPath, caPEM, tbl, "v1", relBase)
+	if err != nil {
+		t.Fatalf("RenderWrapper(bravo): %v", err)
+	}
+	if w1 != w2 {
+		t.Error("wrapper not fleet-generic: differing labels produced differing bytes (per-device secret leaked)")
 	}
 }

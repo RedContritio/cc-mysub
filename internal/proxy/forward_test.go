@@ -28,13 +28,14 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/mitm"
 )
 
-// newTestStore 写临时 devices.json，将 tokenToUpstream 映射编码进去，返回真实 store。
-func newTestStore(t *testing.T, tokenToUpstream map[string]string) *auth.DeviceStore {
+// newTestStore 写临时 devices.json，将 fpToUpstream（客户端证书指纹 → upstream id）映射编码进去，
+// 返回真实 store。设备身份现由外层 mTLS 客户端证书指纹确定，故键是 cert_sha256 而非 token hash。
+func newTestStore(t *testing.T, fpToUpstream map[string]string) *auth.DeviceStore {
 	t.Helper()
 	var devs []string
 	i := 0
-	for tok, up := range tokenToUpstream {
-		devs = append(devs, `{"label":"d`+strconv.Itoa(i)+`","token_sha256":"`+auth.HashToken(tok)+`","upstream":"`+up+`"}`)
+	for fp, up := range fpToUpstream {
+		devs = append(devs, `{"label":"d`+strconv.Itoa(i)+`","cert_sha256":"`+fp+`","upstream":"`+up+`"}`)
 		i++
 	}
 	p := filepath.Join(t.TempDir(), "devices.json")
@@ -48,6 +49,33 @@ func newTestStore(t *testing.T, tokenToUpstream map[string]string) *auth.DeviceS
 	return s
 }
 
+// newTestClientCert 自签一张 ECDSA P-256 client-leaf（IsCA=false，含私钥），供外层 mTLS 客户端出示。
+// 其指纹 = auth.CertFingerprint(cert.Certificate[0])，须登记进 store 才能通过握手白名单。
+func newTestClientCert(t *testing.T, cn string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
 func TestRewrite_Conditional(t *testing.T) {
 	var gotAuth, gotXAPIKey []string
 	var mu sync.Mutex
@@ -59,17 +87,19 @@ func TestRewrite_Conditional(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer up.Close()
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-	h := newRewriteHandler(store, cfgUp, nil)
+	h := newRewriteHandler(cfgUp, nil)
+	dev := auth.Device{Label: "laptop", Upstream: "b"}
 
-	// (1) 带命中 token → 换成该设备的 setup-token (b→REAL-B); X-Api-Key 须被恒删
+	// (1) 有入站凭据 + ctx 设备(upstream b) → 换成该设备的 setup-token (b→REAL-B); X-Api-Key 须被删
 	r1 := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
-	r1.Header.Set("Authorization", "Bearer cco_dev_x")
+	r1.Header.Set("Authorization", "Bearer placeholder")
 	r1.Header.Set("X-Api-Key", "should-be-stripped")
+	r1 = r1.WithContext(context.WithValue(r1.Context(), deviceKey, dev))
 	h.ServeHTTP(httptest.NewRecorder(), r1)
-	// (2) auth=NONE (遥测) → 透传不注入
+	// (2) 无任何入站凭据 (真匿名遥测) → 透传不注入、不碰任何头
 	r2 := httptest.NewRequest("POST", up.URL+"/api/event_logging/v2/batch", nil)
+	r2 = r2.WithContext(context.WithValue(r2.Context(), deviceKey, dev))
 	h.ServeHTTP(httptest.NewRecorder(), r2)
 
 	mu.Lock()
@@ -83,7 +113,7 @@ func TestRewrite_Conditional(t *testing.T) {
 	if gotAuth[1] != "" {
 		t.Errorf("anon injected: got %q want empty", gotAuth[1])
 	}
-	// X-Api-Key 恒删：命中路径(入站设了)与匿名路径上游都不应见到
+	// X-Api-Key：命中路径(入站设了)须被删；匿名路径上游不应见到(本就没设)
 	if gotXAPIKey[0] != "" {
 		t.Errorf("X-Api-Key not stripped on hit: got %q", gotXAPIKey[0])
 	}
@@ -92,43 +122,17 @@ func TestRewrite_Conditional(t *testing.T) {
 	}
 }
 
-func TestRewrite_UnknownTokenRejected(t *testing.T) {
-	var hits int
-	var mu sync.Mutex
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		hits++
-		mu.Unlock()
-	}))
-	defer up.Close()
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
-	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	h := newRewriteHandler(store, cfgUp, nil)
-
-	r := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
-	r.Header.Set("Authorization", "Bearer cco_unknown")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("unknown token: got %d want 401", rec.Code)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if hits != 0 {
-		t.Errorf("unknown token must not be forwarded, upstream hits=%d", hits)
-	}
-}
-
 func TestRewrite_HitButUpstreamMissing(t *testing.T) {
-	// 设备命中，但其 upstream id 不在池 → PickToken 返回 "" → 502，不转发
+	// ctx 设备命中，但其 upstream id 不在池 → PickToken 返回 "" → 502，不转发
 	var hits int
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
 	defer up.Close()
-	store := newTestStore(t, map[string]string{"cco_dev_x": "zzz"}) // 设备指向不存在的 id
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	h := newRewriteHandler(store, cfgUp, nil)
+	h := newRewriteHandler(cfgUp, nil)
+	dev := auth.Device{Label: "laptop", Upstream: "zzz"} // 指向不存在的 id
 	r := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
-	r.Header.Set("Authorization", "Bearer cco_dev_x")
+	r.Header.Set("Authorization", "Bearer placeholder")
+	r = r.WithContext(context.WithValue(r.Context(), deviceKey, dev))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 	if rec.Code != http.StatusBadGateway {
@@ -169,6 +173,73 @@ func genCA(t *testing.T) (certPEM, keyPEM []byte) {
 	return certPEM, keyPEM
 }
 
+// newMTLSProxy 装配一个 ForwardProxy：外层 TLS 身份用 ocWriteSelfSigned 产的自签证书经
+// NewOuterCertLoader 加载；内层 MITM 用 genCA 产的 CA → minter；store 由 fpToUpstream（客户端
+// 证书指纹 → upstream id）构造。返回 proxy + 内层 CA 池（client 验内层 api.anthropic.com 叶证书用）。
+func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Upstream, upstream http.RoundTripper, allow []string, maxInFlight int) (*ForwardProxy, *x509.CertPool) {
+	t.Helper()
+	caPEM, keyPEM := genCA(t)
+	ca, err := mitm.LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+	store := newTestStore(t, fpToUpstream)
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
+	fp := NewForwardProxy(minter, store, cfgUp, upstream, allow, NewOuterCertLoader(cp, kp), maxInFlight)
+	caPool := x509.NewCertPool()
+	caPool.AddCert(ca.Cert)
+	return fp, caPool
+}
+
+// serveProxy 在 127.0.0.1:0 起监听并后台 Serve，返回地址；listener 在测试结束时关闭。
+func serveProxy(t *testing.T, fp *ForwardProxy) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go fp.Serve(ln)
+	return ln.Addr().String()
+}
+
+// outerDial 拨外层 mTLS：自签外层证书故 InsecureSkipVerify，但必须出示一张已登记指纹的
+// client cert（否则 RequireAnyClientCert / VerifyPeerCertificate 令握手失败）。
+func outerDial(t *testing.T, addr string, clientCert tls.Certificate) *tls.Conn {
+	t.Helper()
+	c, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{clientCert}})
+	if err != nil {
+		t.Fatalf("outer dial: %v", err)
+	}
+	return c
+}
+
+// connect200 在已建立的外层连接上发一条 CONNECT（不带 Proxy-Authorization，身份已由 mTLS 证书确定），
+// 读到 200 状态行 + 头到空行，返回 bufio.Reader。状态非 200 即 Fatal。
+func connect200(t *testing.T, outer net.Conn, host string) *bufio.Reader {
+	t.Helper()
+	if _, err := outer.Write([]byte("CONNECT " + host + ":443 HTTP/1.1\r\nHost: " + host + "\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(outer)
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT status=%q err=%v", status, err)
+	}
+	for { // drain to blank line
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	return br
+}
+
 func TestForwardProxy_EndToEnd(t *testing.T) {
 	// 1) 假真上游 (TLS)，记录每个请求的 Authorization
 	var gotAuth []string
@@ -182,19 +253,7 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 	defer upstream.Close()
 	upstreamAddr := upstream.Listener.Addr().String()
 
-	// 2) cc-mysub CA + minter
-	caPEM, keyPEM := genCA(t)
-	ca, err := mitm.LoadCA(caPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minter := mitm.NewMinter(ca, time.Hour)
-
-	// 3) store + 池
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
-	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-
-	// 4) cc-mysub→真目标 的 transport：把 CONNECT 目标 (api.anthropic.com:443) 重定向到假上游；测试不验上游证书
+	// cc-mysub→真目标 的 transport：把 CONNECT 目标 (api.anthropic.com:443) 重定向到假上游；测试不验上游证书
 	upstreamTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, upstreamAddr)
@@ -202,44 +261,18 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
-	// 5) 起 forward-proxy（外层 TLS 身份 = serverName/public_host；仅 MITM allowlist 内的 host）
-	const serverName = "cc.example"
-	fp := NewForwardProxy(minter, store, cfgUp, upstreamTransport, []string{"api.anthropic.com", "console.anthropic.com"}, serverName, 8)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com", "console.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
 
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
-
-	// helper-style client: 外层 TLS 到 cc-mysub(验 serverName) → 内发 CONNECT → 读 200 → 内层 TLS(api.anthropic.com)
+	// helper-style client: 外层 mTLS 到 cc-mysub(出示已登记 client cert) → CONNECT(无 Proxy-Auth) → 200 → 内层 TLS
 	doReq := func(t *testing.T, authHeader, path string) {
 		t.Helper()
-		outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-		if err != nil {
-			t.Fatalf("outer dial: %v", err)
-		}
+		outer := outerDial(t, addr, clientCert)
 		defer outer.Close()
-		if _, err := outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
-			t.Fatal(err)
-		}
-		br := bufio.NewReader(outer)
-		status, err := br.ReadString('\n')
-		if err != nil || !strings.Contains(status, "200") {
-			t.Fatalf("CONNECT status=%q err=%v", status, err)
-		}
-		for { // drain to blank line
-			line, err := br.ReadString('\n')
-			if err != nil {
-				t.Fatal(err)
-			}
-			if line == "\r\n" || line == "\n" {
-				break
-			}
-		}
+		br := connect200(t, outer, "api.anthropic.com")
 		// 此处 br.Buffered() 应为 0(服务端在 200 后等内层 ClientHello)；直接在 outer 上跑内层 TLS
 		if n := br.Buffered(); n != 0 {
 			t.Fatalf("unexpected %d buffered bytes after CONNECT 200", n)
@@ -259,8 +292,8 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 		resp.Body.Close()
 	}
 
-	doReq(t, "Bearer cco_dev_x", "/v1/messages") // (1) swap
-	doReq(t, "", "/api/event_logging/v2/batch")  // (2) anon passthrough
+	doReq(t, "Bearer placeholder", "/v1/messages") // (1) swap
+	doReq(t, "", "/api/event_logging/v2/batch")    // (2) anon passthrough
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -276,30 +309,67 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 }
 
 func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
-	caPEM, keyPEM := genCA(t)
-	ca, _ := mitm.LoadCA(caPEM, keyPEM)
-	minter := mitm.NewMinter(ca, time.Hour)
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	const serverName = "cc.example"
-	fp := NewForwardProxy(minter, store, cfgUp, nil, []string{"api.anthropic.com"}, serverName, 8)
-	ln, _ := net.Listen("tcp", "127.0.0.1:0")
-	defer ln.Close()
-	go fp.Serve(ln)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
 
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
+	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
-	// channel token valid → passes the 407 gate → reaches the allowlist 403 for evil.example
-	outer.Write([]byte("CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n"))
+	// 外层 mTLS 通过(已登记证书) → CONNECT 非白名单 host → allowlist 403
+	outer.Write([]byte("CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example\r\n\r\n"))
 	status, _ := bufio.NewReader(outer).ReadString('\n')
 	if !strings.Contains(status, "403") {
 		t.Errorf("non-allowlisted host must get 403 (policy reject), got %q", status)
 	}
+}
+
+// assertOuterRejected dials the outer TLS endpoint with cfg and asserts the mTLS
+// handshake is rejected — zero application bytes get through. Under TLS 1.3 a client-
+// auth failure is not reported by tls.Dial (the client "completes" its handshake before
+// the server's alert arrives); the rejection surfaces only on the first Read. So when
+// the dial itself succeeds we write a CONNECT and read: a rejected connection yields a
+// read error with NO HTTP response, whereas an (erroneously) accepted one would reply.
+func assertOuterRejected(t *testing.T, addr string, cfg *tls.Config) {
+	t.Helper()
+	c, err := tls.Dial("tcp", addr, cfg)
+	if err != nil {
+		return // rejected during the handshake itself
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 64)
+	n, rerr := c.Read(buf)
+	if rerr == nil {
+		t.Fatalf("SECURITY: outer mTLS handshake accepted; server replied %q", buf[:n])
+	}
+}
+
+// TestForwardProxy_NoClientCertHandshakeFails：外层 dial 不出示 client cert →
+// RequireAnyClientCert 令握手失败，零应用字节。
+func TestForwardProxy_NoClientCertHandshakeFails(t *testing.T) {
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
+
+	assertOuterRejected(t, addr, &tls.Config{InsecureSkipVerify: true})
+}
+
+// TestForwardProxy_UnregisteredClientCertHandshakeFails：出示一张指纹未登记的 client cert →
+// VerifyPeerCertificate 返回 error，握手失败、零应用字节。
+func TestForwardProxy_UnregisteredClientCertHandshakeFails(t *testing.T) {
+	registered := newTestClientCert(t, "device-leaf")
+	rfp := auth.CertFingerprint(registered.Certificate[0])
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	fp, _ := newMTLSProxy(t, map[string]string{rfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
+
+	stranger := newTestClientCert(t, "stranger") // 指纹不在 store
+	assertOuterRejected(t, addr, &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{stranger}})
 }
 
 // TestPrefixConn_ReplaysPrefixThenConn 确定性验证 prefixConn 先回放 prefix 再读底层 conn，
@@ -322,9 +392,8 @@ func TestPrefixConn_ReplaysPrefixThenConn(t *testing.T) {
 }
 
 // spyMinter wraps a real *mitm.Minter, recording every CertFor host. Lets tests
-// assert the 407/400 path NEVER mints a leaf for the CONNECT host (no-cert-mint
-// contract, spec §4). The outer-identity serverName cert IS expected (the proxy
-// must complete the outer TLS handshake to read the CONNECT line at all).
+// assert the 400 path NEVER mints a leaf for the CONNECT host (no-cert-mint
+// contract, spec §4): the 400 is written before the inner leaf is minted.
 type spyMinter struct {
 	inner *mitm.Minter
 	mu    sync.Mutex
@@ -353,10 +422,10 @@ func (s *spyMinter) called(host string) bool {
 	return false
 }
 
-// newSpyProxy builds a running ForwardProxy whose minter is a spy, plus the spy
-// and the CA pool for outer-TLS dialing. inner RoundTripper is nil (no inner
-// request is expected on the 407/400/403 paths). allow lists the MITM hosts.
-func newSpyProxy(t *testing.T, tokenToUpstream map[string]string, allow []string, serverName string) (*ForwardProxy, *spyMinter, *x509.CertPool) {
+// newSpyProxy builds a running-ready ForwardProxy whose minter is a spy, plus the spy
+// and a registered client cert for outer-mTLS dialing. inner RoundTripper is nil (no
+// inner request is expected on the 400/403 paths). allow lists the MITM hosts.
+func newSpyProxy(t *testing.T, allow []string) (*ForwardProxy, *spyMinter, tls.Certificate) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -364,140 +433,26 @@ func newSpyProxy(t *testing.T, tokenToUpstream map[string]string, allow []string
 		t.Fatal(err)
 	}
 	spy := newSpyMinter(ca)
-	store := newTestStore(t, tokenToUpstream)
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
+	store := newTestStore(t, map[string]string{cfp: "b"})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, serverName, 8)
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
+	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, NewOuterCertLoader(cp, kp), 8)
 	fp.minter = spy // 覆写为 spy(both satisfy certMinter)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
-	return fp, spy, caPool
-}
-
-func TestForwardProxy_TokenGateBeforeTunnel(t *testing.T) {
-	const serverName = "cc.example"
-	const host = "api.anthropic.com"
-	cases := []struct {
-		name    string
-		connect string
-	}{
-		{"tokenless", "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n"},
-		{"bad-token", "CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer nope\r\n\r\n"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			fp, spy, caPool := newSpyProxy(t, map[string]string{"cco_dev_x": "b"}, []string{host}, serverName)
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ln.Close()
-			go fp.Serve(ln)
-			outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-			if err != nil {
-				t.Fatalf("outer dial: %v", err)
-			}
-			defer outer.Close()
-			if _, err := outer.Write([]byte(tc.connect)); err != nil {
-				t.Fatal(err)
-			}
-			// Read the WHOLE outer stream to EOF. It must contain a 407 and must
-			// NOT contain '200 Connection Established' anywhere.
-			_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
-			all, _ := io.ReadAll(outer)
-			if !strings.Contains(string(all), "407") {
-				t.Errorf("want 407 in outer stream, got %q", all)
-			}
-			if strings.Contains(string(all), "200 Connection Established") {
-				t.Errorf("SECURITY: 200 written on rejected channel auth: %q", all)
-			}
-			if spy.called(host) {
-				t.Errorf("SECURITY: minted a leaf for CONNECT host %q on a rejected tunnel", host)
-			}
-		})
-	}
-}
-
-func TestForwardProxy_BadTokenThenImmediateClientHello(t *testing.T) {
-	const serverName = "cc.example"
-	const host = "api.anthropic.com"
-	fp, spy, caPool := newSpyProxy(t, map[string]string{"cco_dev_x": "b"}, []string{host}, serverName)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
-	defer outer.Close()
-	// Bad CONNECT header + an immediate 16-byte fake TLS ClientHello record in the
-	// SAME write — an attacker racing the inner handshake before the gate runs.
-	fakeHello := []byte{0x16, 0x03, 0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x01, 0x00}
-	payload := append([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer nope\r\n\r\n"), fakeHello...)
-	if _, err := outer.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
-	all, _ := io.ReadAll(outer)
-	if !strings.Contains(string(all), "407") {
-		t.Errorf("want 407, got %q", all)
-	}
-	if strings.Contains(string(all), "200 Connection Established") {
-		t.Errorf("SECURITY: 200 written despite bad token + smuggled ClientHello: %q", all)
-	}
-	if spy.called(host) {
-		t.Errorf("SECURITY: minted leaf for %q on smuggled inner handshake", host)
-	}
-}
-
-func TestForwardProxy_NonAllowlistTokenlessIs407Not403(t *testing.T) {
-	const serverName = "cc.example"
-	// allowlist contains only api.anthropic.com; we CONNECT to evil.example tokenless.
-	fp, spy, caPool := newSpyProxy(t, map[string]string{"cco_dev_x": "b"}, []string{"api.anthropic.com"}, serverName)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
-	defer outer.Close()
-	outer.Write([]byte("CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example\r\n\r\n"))
-	status, _ := bufio.NewReader(outer).ReadString('\n')
-	if !strings.Contains(status, "407") {
-		t.Errorf("tokenless non-allowlist host must be 407 (no host oracle), got %q", status)
-	}
-	if strings.Contains(status, "403") {
-		t.Errorf("SECURITY: 403 leaks allowlist non-membership before channel auth: %q", status)
-	}
-	if spy.called("evil.example") {
-		t.Errorf("minted leaf for non-allowlist host")
-	}
+	return fp, spy, clientCert
 }
 
 func TestForwardProxy_OversizedConnectHeaderIs400(t *testing.T) {
-	const serverName = "cc.example"
 	const host = "api.anthropic.com"
-	fp, spy, caPool := newSpyProxy(t, map[string]string{"cco_dev_x": "b"}, []string{host}, serverName)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
+	fp, spy, clientCert := newSpyProxy(t, []string{host})
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
 	// CONNECT line (valid) + a single header whose value exceeds maxConnectHeaderBytes.
 	big := strings.Repeat("A", maxConnectHeaderBytes+100)
-	outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nX-Pad: " + big + "\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n"))
+	outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nX-Pad: " + big + "\r\n\r\n"))
 	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
 	all, _ := io.ReadAll(outer)
 	if !strings.Contains(string(all), "400") {
@@ -538,53 +493,26 @@ func (s *rtSpy) RoundTrip(req *http.Request) (*http.Response, error) {
 	}, nil
 }
 
-func TestForwardProxy_ChannelTokenNeverLeaksUpstream(t *testing.T) {
+// TestForwardProxy_InnerSwapNoProxyAuthBodyIntact：外层 mTLS(已登记证书) + CONNECT(无 Proxy-Auth)，
+// 内层带凭据 → 上游 Proxy-Authorization 空、Authorization 换成 Bearer 真 token、body 逐字节一致。
+func TestForwardProxy_InnerSwapNoProxyAuthBodyIntact(t *testing.T) {
 	spy := &rtSpy{}
-	caPEM, keyPEM := genCA(t)
-	ca, err := mitm.LoadCA(caPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minter := mitm.NewMinter(ca, time.Hour)
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	const serverName = "cc.example"
-	fp := NewForwardProxy(minter, store, cfgUp, spy, []string{"api.anthropic.com"}, serverName, 8)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
 
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
+	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
-	if _, err := outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
-		t.Fatal(err)
-	}
-	br := bufio.NewReader(outer)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(status, "200") {
-		t.Fatalf("CONNECT status=%q err=%v", status, err)
-	}
-	for {
-		l, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if l == "\r\n" || l == "\n" {
-			break
-		}
+	br := connect200(t, outer, "api.anthropic.com")
+	if n := br.Buffered(); n != 0 {
+		t.Fatalf("unexpected %d buffered bytes after CONNECT 200", n)
 	}
 	inner := tls.Client(outer, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
 	body := `{"model":"claude","x":1}`
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer cco_dev_x") // inner app token (per-device)
+	req.Header.Set("Authorization", "Bearer placeholder") // inner inbound credential
 	if err := req.Write(inner); err != nil {
 		t.Fatalf("inner write: %v", err)
 	}
@@ -608,60 +536,28 @@ func TestForwardProxy_ChannelTokenNeverLeaksUpstream(t *testing.T) {
 }
 
 func TestForwardProxy_ShedsWhenSaturated(t *testing.T) {
-	caPEM, keyPEM := genCA(t)
-	ca, err := mitm.LoadCA(caPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minter := mitm.NewMinter(ca, time.Hour)
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	const serverName = "cc.example"
 	// maxInFlight=1: the proxy can hold exactly one in-flight handle.
-	fp := NewForwardProxy(minter, store, cfgUp, nil, []string{"api.anthropic.com"}, serverName, 1)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 1)
+	addr := serveProxy(t, fp)
 
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
-
-	// Client A: complete outer TLS + CONNECT, then PARK (never send inner
+	// Client A: complete outer mTLS + CONNECT, then PARK (never send inner
 	// ClientHello). handle() stays inside srv.Serve waiting on the inner conn,
 	// so it never returns and never releases the semaphore.
-	connA, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("A outer dial: %v", err)
-	}
+	connA := outerDial(t, addr, clientCert)
 	defer connA.Close()
-	if _, err := connA.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
-		t.Fatalf("A connect write: %v", err)
-	}
-	brA := bufio.NewReader(connA)
-	statusA, err := brA.ReadString('\n')
-	if err != nil || !strings.Contains(statusA, "200") {
-		t.Fatalf("A CONNECT status=%q err=%v", statusA, err)
-	}
-	for { // drain A's 200 headers; then A parks (no inner ClientHello)
-		line, err := brA.ReadString('\n')
-		if err != nil {
-			t.Fatalf("A drain: %v", err)
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
+	_ = connect200(t, connA, "api.anthropic.com")
 	// A now holds the only semaphore slot (handle parked in srv.Serve).
 
 	// Client B: the proxy must shed — Serve does Accept then immediate Close
 	// WITHOUT spawning handle, so B's raw TCP conn is closed before any outer
-	// TLS handshake completes. tls.Dial must error (EOF / reset) within the
-	// deadline rather than hang.
+	// TLS handshake completes. B presents the SAME registered cert, proving the
+	// shed is the semaphore cap (not a cert rejection). tls.Dial must error
+	// within the deadline rather than hang.
 	dialer := &net.Dialer{Deadline: time.Now().Add(3 * time.Second)}
-	connB, err := tls.DialWithDialer(dialer, "tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
+	connB, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{clientCert}})
 	if err == nil {
 		connB.Close()
 		t.Fatalf("B outer TLS succeeded but proxy was saturated — shed failed")
@@ -669,48 +565,21 @@ func TestForwardProxy_ShedsWhenSaturated(t *testing.T) {
 	// err is the shed signal (closed conn during handshake). Test passes.
 }
 
-func TestForwardProxy_AnonInnerStillPassesThroughAfterChannelAuth(t *testing.T) {
+// TestForwardProxy_AnonInnerPassesThrough：外层 mTLS(已登记证书) + CONNECT(无 Proxy-Auth)，
+// 内层无凭据(匿名遥测) → 上游 Authorization 空、无 Proxy-Authorization(零注入)。
+func TestForwardProxy_AnonInnerPassesThrough(t *testing.T) {
 	spy := &rtSpy{}
-	caPEM, keyPEM := genCA(t)
-	ca, err := mitm.LoadCA(caPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minter := mitm.NewMinter(ca, time.Hour)
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	const serverName = "cc.example"
-	fp := NewForwardProxy(minter, store, cfgUp, spy, []string{"api.anthropic.com"}, serverName, 8)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
 
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
+	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
-	if _, err := outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
-		t.Fatal(err)
-	}
-	br := bufio.NewReader(outer)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(status, "200") {
-		t.Fatalf("CONNECT status=%q err=%v", status, err)
-	}
-	for {
-		l, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if l == "\r\n" || l == "\n" {
-			break
-		}
+	br := connect200(t, outer, "api.anthropic.com")
+	if n := br.Buffered(); n != 0 {
+		t.Fatalf("unexpected %d buffered bytes after CONNECT 200", n)
 	}
 	inner := tls.Client(outer, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
 	// Inner request with NO Authorization (anonymous telemetry).
@@ -730,7 +599,7 @@ func TestForwardProxy_AnonInnerStillPassesThroughAfterChannelAuth(t *testing.T) 
 		t.Errorf("anon passthrough broken: upstream Authorization=%q want empty (no real-token injection)", spy.gotAuth)
 	}
 	if spy.gotPA != "" {
-		t.Errorf("SECURITY: channel token leaked on anon inner request: %q", spy.gotPA)
+		t.Errorf("SECURITY: Proxy-Authorization present on anon inner request: %q", spy.gotPA)
 	}
 }
 
@@ -739,20 +608,18 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 	// pipelined inner ClientHello bytes were spliced byte-faithfully (a corrupted
 	// prefix would break the inner TLS handshake).
 	var gotAuth string
+	var mu sync.Mutex
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotAuth = r.Header.Get("Authorization")
+		mu.Unlock()
 		w.WriteHeader(200)
 	}))
 	defer upstream.Close()
 	upstreamAddr := upstream.Listener.Addr().String()
 
-	caPEM, keyPEM := genCA(t)
-	ca, err := mitm.LoadCA(caPEM, keyPEM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minter := mitm.NewMinter(ca, time.Hour)
-	store := newTestStore(t, map[string]string{"cco_dev_x": "b"})
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
 	upstreamTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -760,55 +627,21 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 		},
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	const serverName = "cc.example"
-	fp := NewForwardProxy(minter, store, cfgUp, upstreamTransport, []string{"api.anthropic.com"}, serverName, 8)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go fp.Serve(ln)
-	caPool := x509.NewCertPool()
-	caPool.AddCert(ca.Cert)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com"}, 8)
+	addr := serveProxy(t, fp)
 
-	outer, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: caPool, ServerName: serverName})
-	if err != nil {
-		t.Fatalf("outer dial: %v", err)
-	}
+	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
-	// Build the inner ClientHello FIRST (into a buffer), so we can pipeline the
-	// first >=64 bytes of it together with the CONNECT request in one Write —
-	// forcing handle's br.Buffered()>0 / prefixConn path.
+	// Lazily build the inner conn; if any post-200 bytes ended up buffered (pipelined
+	// inner ClientHello), splice them back via prefixConn — mirroring handle's own splice.
 	innerConn := tls.Client(outer, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
-	if _, err := outer.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com\r\nProxy-Authorization: Bearer cco_dev_x\r\n\r\n")); err != nil {
-		t.Fatal(err)
-	}
-	br := bufio.NewReader(outer)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.Contains(status, "200") {
-		t.Fatalf("CONNECT status=%q err=%v", status, err)
-	}
-	for {
-		l, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if l == "\r\n" || l == "\n" {
-			break
-		}
-	}
-	// NOTE: because tls.Client buffers and br may hold post-200 bytes, this test
-	// asserts the SUCCESS path end-to-end: a valid channel token yields 200 and the
-	// inner handshake+request completes with the app-token swapped. (The pure
-	// prefix-byte-faithfulness in isolation is already covered by
-	// TestPrefixConn_ReplaysPrefixThenConn.)
+	br := connect200(t, outer, "api.anthropic.com")
 	if br.Buffered() > 0 {
-		// reuse buffered bytes for the inner conn (mirror handle's own splice)
 		b, _ := br.Peek(br.Buffered())
 		innerConn = tls.Client(&prefixConn{Conn: outer, prefix: append([]byte(nil), b...)}, &tls.Config{RootCAs: caPool, ServerName: "api.anthropic.com"})
 	}
 	req, _ := http.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
-	req.Header.Set("Authorization", "Bearer cco_dev_x")
+	req.Header.Set("Authorization", "Bearer placeholder")
 	if err := req.Write(innerConn); err != nil {
 		t.Fatalf("inner write: %v", err)
 	}
@@ -817,6 +650,8 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 		t.Fatalf("inner read: %v", err)
 	}
 	resp.Body.Close()
+	mu.Lock()
+	defer mu.Unlock()
 	if gotAuth != "Bearer REAL-B" {
 		t.Errorf("app-token swap: upstream Authorization=%q want Bearer REAL-B", gotAuth)
 	}

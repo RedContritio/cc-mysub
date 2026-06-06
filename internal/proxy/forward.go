@@ -4,11 +4,12 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,25 +23,21 @@ type rewriteCtxKey int
 
 const realTokenKey rewriteCtxKey = 0
 
-// conditionalAuth 是前置认证中间件（凭据存在性分流，见 spec §4/§5.3）。它必须置于
-// RateLimit/AccessLog 之前：handler 经 r.WithContext 注入的 ctx 只向下游传播，注入到内层
-// 的 device/realToken 无法被外层 wrapper（RateLimit/AccessLog）看到。故把认证从转发 handler
-// 拆出作为前置层，使后续中间件能读到 device。
-//   - 入站无凭据（匿名遥测）→ 放行，不注入 device/realToken（匿名透传）
-//   - 入站 per-device token 命中 → real=up.PickToken(d.Upstream)；real==""→502；
-//     否则把 device(deviceKey) 与 realToken(realTokenKey) 注入 ctx 后放行
-//   - 入站有 token 但未命中 → 401，不放行（认证门）
-func conditionalAuth(a Authenticator, up *config.Upstream) func(http.Handler) http.Handler {
+// conditionalAuth 是前置中间件（凭据存在性分流）。设备身份来自外层 mTLS 客户端证书
+// （由 handle() 经 http.Server.BaseContext 注入 ctx 的 deviceKey），不再从内层 token 取。
+//   - 入站无凭据（匿名遥测）→ 放行，不读 device、不注入 realToken、不碰任何头（匿名零注入）
+//   - 入站有凭据 + ctx 有设备 D → real=up.PickToken(D.Upstream)；real==""→502；注入 realToken 放行
+//   - 入站有凭据但 ctx 无设备 = 编程错（BaseContext 必注入）→ 502，绝不静默用默认 token
+func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tok := auth.ExtractToken(r)
-			if tok == "" {
-				next.ServeHTTP(w, r) // 匿名透传
+			if !auth.HasInboundCredential(r) {
+				next.ServeHTTP(w, r) // 匿名透传，零注入
 				return
 			}
-			d, ok := a.Lookup(tok)
-			if !ok {
-				writeJSONError(w, http.StatusUnauthorized, "unauthorized", "invalid token")
+			d, ok := r.Context().Value(deviceKey).(auth.Device)
+			if !ok || d.Label == "" {
+				writeJSONError(w, http.StatusBadGateway, "no_device", "authenticated connection missing device identity")
 				return
 			}
 			real := up.PickToken(d.Upstream)
@@ -48,9 +45,7 @@ func conditionalAuth(a Authenticator, up *config.Upstream) func(http.Handler) ht
 				writeJSONError(w, http.StatusBadGateway, "no_upstream_token", "no upstream token for device")
 				return
 			}
-			ctx := context.WithValue(r.Context(), deviceKey, d)
-			ctx = context.WithValue(ctx, realTokenKey, real)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), realTokenKey, real)))
 		})
 	}
 }
@@ -80,9 +75,9 @@ func forwardSwap(rt http.RoundTripper) http.Handler {
 			pr.Out.URL.Scheme = scheme
 			pr.Out.URL.Host = host
 			pr.Out.Host = "" // Host 头取 URL.Host
-			pr.Out.Header.Del("X-Api-Key")
 			if real, _ := pr.In.Context().Value(realTokenKey).(string); real != "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+real)
+				pr.Out.Header.Del("X-Api-Key") // 仅非匿名分支删；匿名请求一个头都不碰（§0）
 			}
 		},
 		Transport: rt,
@@ -95,8 +90,8 @@ func forwardSwap(rt http.RoundTripper) http.Handler {
 
 // newRewriteHandler = 条件认证 + 换 token 转发（不含限流/访问日志）。保留此组合供单测
 // （TestRewrite_*）直接覆盖认证分流 + 换 token 契约。生产 serving chain 见 NewForwardProxy。
-func newRewriteHandler(a Authenticator, up *config.Upstream, rt http.RoundTripper) http.Handler {
-	return conditionalAuth(a, up)(forwardSwap(rt))
+func newRewriteHandler(up *config.Upstream, rt http.RoundTripper) http.Handler {
+	return conditionalAuth(up)(forwardSwap(rt))
 }
 
 // certMinter is the subset of *mitm.Minter that handle() needs: synthesize a
@@ -113,13 +108,13 @@ type certMinter interface {
 // 在外层 TLS 内读 CONNECT 目标、按 allowlist 拒非法 host（纵深防御），回 200 后再按 host
 // 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP 请求经 rewrite handler 转发到真目标 host。
 type ForwardProxy struct {
-	minter     certMinter      // 现签外层身份证书 + 内层 MITM 叶证书（spy 可注入）
-	handler    http.Handler    // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
-	auth       Authenticator   // 信道层准入：CONNECT 头 Proxy-Authorization 校验（spec §3.2）
-	allow      map[string]bool // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
-	serverName string          // 外层 TLS 身份（cc-mysub public_host），现签证书的 CN/SAN
-	sema       chan struct{}   // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
-	wg         sync.WaitGroup  // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
+	minter    certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
+	handler   http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
+	auth      Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
+	allow     map[string]bool                                      // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
+	outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
+	sema      chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
+	wg        sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
@@ -133,21 +128,23 @@ const maxConnectHeaderBytes = 8192
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
-// allow 为允许 MITM 的 CONNECT 目标 host 列表；serverName 为外层 TLS 呈现的 cc-mysub 身份。
+// allow 为允许 MITM 的 CONNECT 目标 host 列表；outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
 // maxInFlight 为全局并发上限（>0 强制要求，<=0 panic；饱和时 shed 新连接）。
 //
-// serving chain：conditionalAuth（前置，注入 device/realToken）→ RateLimitByDevice（按设备限流，
-// 匿名遥测/豁免路径放行）→ AccessLog（记录设备/状态/用量）→ forwardSwap（换 token 转发）。
-// 认证置于最外层，使 RateLimit/AccessLog 能读到注入的 device（ctx 仅向下游传播）。
-func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow []string, serverName string, maxInFlight int) *ForwardProxy {
+// serving chain：conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → AccessLog
+// → forwardSwap（换 token 转发）。设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入。
+func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow []string, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
 	if maxInFlight <= 0 {
 		panic("proxy: NewForwardProxy requires maxInFlight > 0")
+	}
+	if outerCert == nil {
+		panic("proxy: NewForwardProxy requires outerCert")
 	}
 	allowSet := make(map[string]bool, len(allow))
 	for _, h := range allow {
 		allowSet[h] = true
 	}
-	handler := conditionalAuth(a, up)(
+	handler := conditionalAuth(up)(
 		RateLimitByDevice(120)(
 			AccessLog(nil)(
 				forwardSwap(upstream),
@@ -155,12 +152,12 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 		),
 	)
 	return &ForwardProxy{
-		minter:     m,
-		handler:    handler,
-		auth:       a,
-		allow:      allowSet,
-		serverName: serverName,
-		sema:       make(chan struct{}, maxInFlight),
+		minter:    m,
+		handler:   handler,
+		auth:      a,
+		allow:     allowSet,
+		outerCert: outerCert,
+		sema:      make(chan struct{}, maxInFlight),
 	}
 }
 
@@ -187,19 +184,32 @@ func (fp *ForwardProxy) Serve(ln net.Listener) error {
 func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	defer fp.wg.Done()
 	defer func() { <-fp.sema }() // 释放并发槽位(与 Serve 的 fp.sema<-struct{}{} 配对)
-	// 外层 TLS：呈现 cc-mysub 自身身份证书（serverName），终结 device↔cc-mysub 跳。
+	// 外层 TLS（双向 mTLS）：呈现真 LE 身份证书；要求并按指纹白名单校验客户端证书。
 	// 此后所有读写都走 outer（Close(outer) 即 Close(rawConn)）。
+	var connDevice auth.Device // 由 VerifyPeerCertificate 在握手内捕获（消二次 Lookup 的热重载 TOCTOU）
 	outer := tls.Server(rawConn, &tls.Config{
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return fp.minter.CertFor(fp.serverName)
+		GetCertificate: fp.outerCert,
+		ClientAuth:     tls.RequireAnyClientCert,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			// no-cert 已被 RequireAnyClientCert 在此之前拒，故 rawCerts 必非空（不加死守卫）。
+			d, ok := fp.auth.Lookup(auth.CertFingerprint(rawCerts[0]))
+			if !ok {
+				return fmt.Errorf("client cert fingerprint not registered")
+			}
+			connDevice = d
+			return nil
 		},
 	})
 	// slowloris 防护：外层握手 + CONNECT 读取阶段设读 deadline；写出 200 后清除。
 	_ = outer.SetReadDeadline(time.Now().Add(handshakeReadTimeout))
+	// 显式握手：无客户端证书 / 指纹不在白名单 → 握手失败、零应用字节（连接级掐断）。
+	if err := outer.Handshake(); err != nil {
+		outer.Close()
+		return
+	}
 	br := bufio.NewReader(outer)
-	// 手动字节累加器(pre-200 cap，§3.2 第 1 点):CONNECT 行 + 每个头行的长度累加,
-	// 超 maxConnectHeaderBytes → 400 + Close。不用 io.LimitReader 包 conn——会被 bufio
-	// 预读误计并破坏 br.Buffered()/prefixConn 回放。
+	// 手动字节累加器(pre-200 cap):CONNECT 行 + 每个头行长度累加,超 maxConnectHeaderBytes → 400 + Close。
+	// 不用 io.LimitReader 包 conn——会被 bufio 预读误计并破坏 br.Buffered()/prefixConn 回放。
 	line, err := br.ReadString('\n')
 	if err != nil {
 		outer.Close()
@@ -218,15 +228,7 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
-	// 信道层准入(§3.2):读完 CONNECT 头到空行,精确计数 Proxy-Authorization。
-	//   - 行首 SP/TAB(obs-fold 续行)→ 407(拒头折叠走私)
-	//   - 每行调 connect.ParseProxyAuthorization,name 命中即计数
-	//   - count != 1(0 或 >1,禁 last-wins)→ 407
-	//   - count == 1 且 ok==false → 407
-	// 校验置于 allowlist 之前:tokenless 一律 407、不泄露 allowlist 成员(消 host oracle)。
-	var token string
-	paCount := 0
-	channelFail := false
+	// drain CONNECT 头到空行（身份已由外层 mTLS 证书确定，不再解析 Proxy-Authorization）。
 	for {
 		h, err := br.ReadString('\n')
 		if err != nil {
@@ -242,32 +244,8 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		if h == "\r\n" || h == "\n" {
 			break
 		}
-		if len(h) > 0 && (h[0] == ' ' || h[0] == '\t') {
-			channelFail = true // obs-fold 续行:拒
-			continue
-		}
-		if tok, valid := connect.ParseProxyAuthorization(h); valid {
-			paCount++
-			token = tok
-		} else if isProxyAuthName(h) {
-			// 名命中但值非法(空/控制字符/CRLF):计入但标记失败,使 count==1&&ok==false → 407
-			paCount++
-			channelFail = true
-		}
 	}
-	// 407 判定:折叠续行 / 名命中但值非法 / count != 1 / Lookup 未命中。任一不过 → 407,
-	// 绝不写 200、不签 leaf、不 echo token、日志不含 token。
-	if channelFail || paCount != 1 {
-		_, _ = outer.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
-		outer.Close()
-		return
-	}
-	if _, hit := fp.auth.Lookup(token); !hit {
-		_, _ = outer.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"))
-		outer.Close()
-		return
-	}
-	// 信道校验全部通过后才做 allowlist 纵深防御:已鉴权设备请求非白名单 host → 403。
+	// allowlist 纵深防御：已认证设备请求非白名单 host → 403。
 	if !fp.allow[host] {
 		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 		outer.Close()
@@ -296,25 +274,16 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	// notifyConn + oneConnListener 让 http.Serve 在该连接关闭后才返回（避免提前 Close 正在服务的连接）。
 	closed := make(chan struct{})
 	nc := &notifyConn{Conn: tlsConn, closed: closed}
-	srv := &http.Server{Handler: fp.handler, ReadHeaderTimeout: 30 * time.Second}
+	// BaseContext 把外层 mTLS 证书识别出的设备注入该连接所有内层请求的 ctx，
+	// 供 conditionalAuth/RateLimit/AccessLog 读取（ctx 仅向下游传播，故在连接层注入）。
+	srv := &http.Server{
+		Handler:           fp.handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return context.WithValue(context.Background(), deviceKey, connDevice)
+		},
+	}
 	_ = srv.Serve(&oneConnListener{conn: nc, closed: closed})
-}
-
-// isProxyAuthName reports whether headerLine's field-name is exactly
-// Proxy-Authorization (case-insensitive, no whitespace before ':', no prefix
-// shadow like X-Proxy-Authorization / Proxy-Authorization-Foo). Used to count a
-// name-matching header even when its VALUE is malformed (so count==1 && bad-value
-// still yields 407 rather than being silently dropped as 'unrelated header').
-func isProxyAuthName(headerLine string) bool {
-	i := strings.IndexByte(headerLine, ':')
-	if i < 0 {
-		return false
-	}
-	name := headerLine[:i]
-	if name != strings.TrimRight(name, " \t") { // 名与 ':' 间空白 → 拒
-		return false
-	}
-	return strings.EqualFold(name, "Proxy-Authorization")
 }
 
 // prefixConn 在读取底层 conn 之前先回放 prefix（被 bufio 预读的 TLS 字节）。

@@ -10,18 +10,6 @@ import (
 
 var fingerprintRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-func ExtractToken(r *http.Request) string {
-	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
-		return strings.TrimSpace(a[len("Bearer "):])
-	}
-	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
-}
-
-func HashToken(t string) string {
-	sum := sha256.Sum256([]byte(t))
-	return hex.EncodeToString(sum[:])
-}
-
 // CertFingerprint 返回客户端证书 DER 的 SHA-256，小写 hex（64 字符）。
 // 这是 devices.json 的 cert_sha256 与 VerifyPeerCertificate 现算值的唯一规范形。
 func CertFingerprint(der []byte) string {

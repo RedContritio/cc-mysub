@@ -16,35 +16,15 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/config"
 )
 
-// ---- GenerateToken ----
-
-func TestGenerateTokenFormat(t *testing.T) {
-	tok, err := GenerateToken()
-	if err != nil {
-		t.Fatalf("GenerateToken: %v", err)
-	}
-	if !strings.HasPrefix(tok, "cco_dev_") {
-		t.Errorf("token %q lacks cco_dev_ prefix", tok)
-	}
-	body := strings.TrimPrefix(tok, "cco_dev_")
-	// 24 random bytes -> 48 hex chars (matches README's `openssl rand -hex 24`).
-	if !regexp.MustCompile(`^[0-9a-f]{48}$`).MatchString(body) {
-		t.Errorf("token body %q is not 48 lowercase hex chars", body)
-	}
-}
-
-func TestGenerateTokenUnique(t *testing.T) {
-	a, _ := GenerateToken()
-	b, _ := GenerateToken()
-	if a == b {
-		t.Errorf("two GenerateToken calls returned identical token %q", a)
-	}
-}
+// fp 把单个 hex 字符重复 64 次，得一个合法的小写 hex 证书指纹（cert_sha256 规范形）。
+// 迁移后 AppendDevice/ReplaceDevice 的第三参数语义 = 证书指纹，直接写入 CertSHA256、不再哈希；
+// 不同字符 = 不同设备身份，使「换发/旁邻保留」类断言能区分。
+func fp(c string) string { return strings.Repeat(c, 64) }
 
 // ---- RenderWrapper ----
 
 func TestRenderWrapperFillsValues(t *testing.T) {
-	p := Params{PublicHost: "ccapi.example.com", FrpsIP: "203.0.113.10", ProxyPort: 8788, SubType: "max"}
+	p := Params{PublicHost: "ccapi.example.com", SubType: "max"}
 	const caPath = "${HOME}/.config/cc-mysub/ca.crt"
 	const caPEM = "-----BEGIN CERTIFICATE-----\nMIIBfakeCAcontent==\n-----END CERTIFICATE-----"
 	shaTable := map[string]string{
@@ -54,50 +34,58 @@ func TestRenderWrapperFillsValues(t *testing.T) {
 		"darwin-arm64": strings.Repeat("d", 64),
 	}
 	const relBase = "https://example.test/redcontritio/cc-mysub/releases/download/v1.2.3"
-	out, err := RenderWrapper(p, "cco_dev_deadbeef", caPath, caPEM, shaTable, "v1.2.3", relBase)
+	out, err := RenderWrapper(p, caPath, caPEM, shaTable, "v1.2.3", relBase)
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
 	for _, want := range []string{
 		`PUBLIC_HOST="ccapi.example.com"`,
-		`PROXY_ENTRY="203.0.113.10:8788"`,
-		`DEVICE_TOKEN="cco_dev_deadbeef"`,
 		`SUB_TYPE="max"`,
 		`CA_CERT="` + caPath + `"`,
 		`RELEASE_BASE="` + relBase + `"`,
-		`CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"`,
+		`CLAUDE_CODE_OAUTH_TOKEN="cco_dev_placeholder"`, // fleet-generic 固定占位, 非凭据
 		`CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"`,
 		`NODE_EXTRA_CA_CERTS="$CA_CERT"`,
+		`DEV_CERT=`,             // 本设备客户端证书路径变量
+		`DEV_KEY=`,              // 本设备私钥路径变量
+		"device-init",           // 首次入网逻辑
 		caPEM,                   // 内联 CA 逐字出现
 		"钉定版本: v1.2.3",          // version 注释
 		strings.Repeat("d", 64), // darwin-arm64 sha 烤入 case 分支
 		"verify_sha",            // bootstrap 助手
 		"trap '",                // 清理 trap
 		"sha256 校验失败（供应链）",      // fail-closed 分支
-		`exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`,
+		`exec "$CC_MYSUB_BIN" helper --host "$PUBLIC_HOST" --client-cert "$DEV_CERT" --client-key "$DEV_KEY" -- claude "$@"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered wrapper missing %q\n---\n%s", want, out)
 		}
 	}
-	// v4 收口 + 不再依赖 PATH 上的裸 cc-mysub: OLD 形态必须彻底删除。
+	// 通用 wrapper(无 per-device 秘密) + v4 收口: 旧 token/v3 形态必须彻底删除。
 	for _, banned := range []string{
-		"ANTHROPIC_BASE_URL=https://",
+		"DEVICE_TOKEN",                // 旧 per-device token 变量
+		"PROXY_ENTRY",                 // 旧 frps 入口变量
+		"PRIVATE KEY",                 // 私钥 PEM 绝不内联
+		"ANTHROPIC_BASE_URL=https://", // v3 直连形态
 		"unshare",
 		"/etc/hosts",
 		`exec cc-mysub helper`, // 旧的裸命令(无 $CC_MYSUB_BIN)形态
 	} {
 		if strings.Contains(out, banned) {
-			t.Errorf("rendered wrapper still contains obsolete token %q\n---\n%s", banned, out)
+			t.Errorf("rendered wrapper still contains obsolete/leaky token %q\n---\n%s", banned, out)
 		}
+	}
+	// 不得有任何 per-device 真 token 烤入: 只允许固定占位, 不得出现 cco_dev_<hex> 凭据形态。
+	if realTok := regexp.MustCompile(`cco_dev_[0-9a-f]{16,}`).FindString(out); realTok != "" {
+		t.Errorf("rendered wrapper embeds a real per-device token %q (must be fleet-generic)", realTok)
 	}
 }
 
 // 核心契约: 工具绝不替用户预设小模型。
 func TestRenderWrapperDoesNotDecideSmallModel(t *testing.T) {
 	out, err := RenderWrapper(
-		Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"},
-		"cco_dev_x", "/dev/null", "PEM", map[string]string{}, "v0", "https://x/releases/download/v0")
+		Params{PublicHost: "h", SubType: "max"},
+		"/dev/null", "PEM", map[string]string{}, "v0", "https://x/releases/download/v0")
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -122,8 +110,8 @@ func TestRenderWrapperIsValidBash(t *testing.T) {
 		t.Skip("bash not available")
 	}
 	out, err := RenderWrapper(
-		Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"},
-		"cco_dev_x", "/dev/null", "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
+		Params{PublicHost: "h", SubType: "max"},
+		"/dev/null", "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
 		map[string]string{"linux-amd64": strings.Repeat("a", 64), "linux-arm64": strings.Repeat("b", 64),
 			"darwin-amd64": strings.Repeat("c", 64), "darwin-arm64": strings.Repeat("d", 64)},
 		"v1", "https://x/releases/download/v1")
@@ -154,11 +142,11 @@ func readDevices(t *testing.T, path string) []auth.Device {
 	return list
 }
 
-func TestAppendDeviceCreatesFileWithCorrectHash(t *testing.T) {
+func TestAppendDeviceCreatesFileWithFingerprint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	p := Params{Label: "laptop", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max", RateLimit: 120}
-	const tok = "cco_dev_abc123"
-	if err := AppendDevice(path, p, tok); err != nil {
+	p := Params{Label: "laptop", PublicHost: "h", SubType: "max", RateLimit: 120}
+	cert := fp("a")
+	if err := AppendDevice(path, p, cert); err != nil {
 		t.Fatalf("AppendDevice: %v", err)
 	}
 	list := readDevices(t, path)
@@ -169,19 +157,16 @@ func TestAppendDeviceCreatesFileWithCorrectHash(t *testing.T) {
 	if d.Label != "laptop" || d.RateLimit != 120 {
 		t.Errorf("unexpected device %+v", d)
 	}
-	if d.TokenSHA256 != auth.HashToken(tok) {
-		t.Errorf("stored sha256 %q != HashToken(token) %q", d.TokenSHA256, auth.HashToken(tok))
-	}
-	// 明文 token 绝不入库。
-	if strings.Contains(string(mustRead(t, path)), tok) {
-		t.Errorf("plaintext token leaked into devices.json")
+	// 第三参数语义 = 证书指纹: 直接落盘到 cert_sha256, 不再哈希。
+	if d.CertSHA256 != cert {
+		t.Errorf("stored cert_sha256 %q != fingerprint %q", d.CertSHA256, cert)
 	}
 }
 
 func TestAppendDevicePreservesExisting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_a"))
-	must(t, AppendDevice(path, Params{Label: "b", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_b"))
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", SubType: "max"}, fp("a")))
+	must(t, AppendDevice(path, Params{Label: "b", PublicHost: "h", SubType: "max"}, fp("b")))
 	list := readDevices(t, path)
 	if len(list) != 2 {
 		t.Fatalf("want 2 devices, got %d", len(list))
@@ -194,8 +179,8 @@ func TestAppendDevicePreservesExisting(t *testing.T) {
 // TestAppendDeviceStoresUpstream 验证 Params.Upstream 写入设备记录（决定该设备抽哪个 setup-token）。
 func TestAppendDeviceStoresUpstream(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	p := Params{Label: "work", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max", Upstream: "team-b"}
-	must(t, AppendDevice(path, p, "cco_dev_work"))
+	p := Params{Label: "work", PublicHost: "h", SubType: "max", Upstream: "team-b"}
+	must(t, AppendDevice(path, p, fp("a")))
 	list := readDevices(t, path)
 	if len(list) != 1 || list[0].Upstream != "team-b" {
 		t.Fatalf("device upstream not persisted: %+v", list)
@@ -204,8 +189,8 @@ func TestAppendDeviceStoresUpstream(t *testing.T) {
 
 func TestAppendDeviceRejectsDuplicateLabel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	must(t, AppendDevice(path, Params{Label: "dup", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_1"))
-	err := AppendDevice(path, Params{Label: "dup", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_2")
+	must(t, AppendDevice(path, Params{Label: "dup", PublicHost: "h", SubType: "max"}, fp("1")))
+	err := AppendDevice(path, Params{Label: "dup", PublicHost: "h", SubType: "max"}, fp("2"))
 	if err == nil {
 		t.Fatalf("expected error on duplicate label, got nil")
 	}
@@ -216,8 +201,8 @@ func TestAppendDeviceRejectsDuplicateLabel(t *testing.T) {
 
 func TestReplaceDeviceErrorsWhenLabelAbsent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_a"))
-	err := ReplaceDevice(path, Params{Label: "ghost", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_x")
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", SubType: "max"}, fp("a")))
+	err := ReplaceDevice(path, Params{Label: "ghost", PublicHost: "h", SubType: "max"}, fp("9"))
 	if err == nil {
 		t.Fatal("expected error rotating an absent label, got nil")
 	}
@@ -226,34 +211,34 @@ func TestReplaceDeviceErrorsWhenLabelAbsent(t *testing.T) {
 	}
 	// 失败的 rotate 须零副作用：原设备 a 完好、未半截写入。
 	list := readDevices(t, path)
-	if len(list) != 1 || list[0].Label != "a" || list[0].TokenSHA256 != auth.HashToken("cco_dev_a") {
+	if len(list) != 1 || list[0].Label != "a" || list[0].CertSHA256 != fp("a") {
 		t.Errorf("failed rotate must be side-effect-free; devices.json mutated: %+v", list)
 	}
 }
 
-func TestReplaceDeviceSwapsToken(t *testing.T) {
+func TestReplaceDeviceSwapsFingerprint(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_old"))
-	must(t, ReplaceDevice(path, Params{Label: "a", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_new"))
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", SubType: "max"}, fp("a")))
+	must(t, ReplaceDevice(path, Params{Label: "a", PublicHost: "h", SubType: "max"}, fp("b")))
 	list := readDevices(t, path)
 	if len(list) != 1 {
 		t.Fatalf("want 1 device after rotate, got %d", len(list))
 	}
-	if list[0].TokenSHA256 != auth.HashToken("cco_dev_new") {
-		t.Errorf("token not swapped to new")
+	if list[0].CertSHA256 != fp("b") {
+		t.Errorf("fingerprint not swapped to new")
 	}
 }
 
 // TestReplaceDevicePreservesSiblings 验证 rotate 只动目标 label：换发 target 后，同库其它设备行
-// (keep) 的 token 必须原封不动、仍命中。守护「rotate 误伤旁邻设备 = 静默大规模 lockout / 凭据丢失」
+// (keep) 的指纹必须原封不动、仍命中。守护「rotate 误伤旁邻设备 = 静默大规模 lockout / 凭据丢失」
 // 这一灾难性回归——对抗 review 变异验证发现：核心契约外，sibling-preservation 此前无守护
 // (把 ReplaceDevice 改成丢弃全部行 + 追加新行的回归能通过整包测试)。
 func TestReplaceDevicePreservesSiblings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "devices.json")
-	must(t, AppendDevice(path, Params{Label: "keep", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_keep"))
-	must(t, AppendDevice(path, Params{Label: "target", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_oldtarget"))
+	must(t, AppendDevice(path, Params{Label: "keep", PublicHost: "h", SubType: "max"}, fp("c")))
+	must(t, AppendDevice(path, Params{Label: "target", PublicHost: "h", SubType: "max"}, fp("d")))
 
-	must(t, ReplaceDevice(path, Params{Label: "target", PublicHost: "h", FrpsIP: "1.2.3.4", SubType: "max"}, "cco_dev_newtarget"))
+	must(t, ReplaceDevice(path, Params{Label: "target", PublicHost: "h", SubType: "max"}, fp("e")))
 
 	list := readDevices(t, path)
 	if len(list) != 2 {
@@ -263,26 +248,26 @@ func TestReplaceDevicePreservesSiblings(t *testing.T) {
 	for _, d := range list {
 		byLabel[d.Label] = d
 	}
-	if byLabel["keep"].TokenSHA256 != auth.HashToken("cco_dev_keep") {
-		t.Errorf("sibling 'keep' token altered by rotate of 'target' (mass-revocation regression)")
+	if byLabel["keep"].CertSHA256 != fp("c") {
+		t.Errorf("sibling 'keep' fingerprint altered by rotate of 'target' (mass-revocation regression)")
 	}
-	if byLabel["target"].TokenSHA256 != auth.HashToken("cco_dev_newtarget") {
-		t.Errorf("target token not swapped to new")
+	if byLabel["target"].CertSHA256 != fp("e") {
+		t.Errorf("target fingerprint not swapped to new")
 	}
-	if byLabel["target"].TokenSHA256 == auth.HashToken("cco_dev_oldtarget") {
-		t.Errorf("target still carries old token after rotate")
+	if byLabel["target"].CertSHA256 == fp("d") {
+		t.Errorf("target still carries old fingerprint after rotate")
 	}
 }
 
 // ---- Resolve ----
 
 func TestResolveFlagOverridesConfig(t *testing.T) {
-	def := &config.ClientConfig{PublicHost: "cfg.example.com", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	def := &config.ClientConfig{PublicHost: "cfg.example.com", SubscriptionType: "max"}
 	got, err := Resolve(def, Params{Label: "x", SubType: "pro"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got.PublicHost != "cfg.example.com" || got.FrpsIP != "1.1.1.1" {
+	if got.PublicHost != "cfg.example.com" {
 		t.Errorf("config defaults not applied: %+v", got)
 	}
 	if got.SubType != "pro" {
@@ -291,48 +276,27 @@ func TestResolveFlagOverridesConfig(t *testing.T) {
 }
 
 func TestResolveUsesConfigWhenNoFlags(t *testing.T) {
-	def := &config.ClientConfig{PublicHost: "cfg.example.com", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	def := &config.ClientConfig{PublicHost: "cfg.example.com", SubscriptionType: "max"}
 	got, err := Resolve(def, Params{Label: "x"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got.PublicHost != "cfg.example.com" || got.FrpsIP != "1.1.1.1" || got.SubType != "max" {
+	if got.PublicHost != "cfg.example.com" || got.SubType != "max" {
 		t.Errorf("config not used as default: %+v", got)
 	}
 }
 
-// TestResolveProxyPortDefault 验证 ProxyPort 缺省回退 8788，配置/flag 给值则优先。
-func TestResolveProxyPortDefault(t *testing.T) {
-	// config/flag 都没给 → 默认 8788
-	got, err := Resolve(&config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}, Params{Label: "x"})
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
-	if got.ProxyPort != 8788 {
-		t.Errorf("default ProxyPort = %d, want 8788", got.ProxyPort)
-	}
-	// config 显式给值 → 用配置值
-	got2, err := Resolve(&config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max", ProxyPort: 9999}, Params{Label: "x"})
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
-	if got2.ProxyPort != 9999 {
-		t.Errorf("config ProxyPort = %d, want 9999", got2.ProxyPort)
-	}
-}
-
 func TestResolveRequiresLabel(t *testing.T) {
-	def := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	def := &config.ClientConfig{PublicHost: "h", SubscriptionType: "max"}
 	if _, err := Resolve(def, Params{}); err == nil {
 		t.Errorf("expected error when label missing")
 	}
 }
 
-func TestResolveRequiresHostFrpsSub(t *testing.T) {
+func TestResolveRequiresHostSub(t *testing.T) {
 	cases := map[string]*config.ClientConfig{
-		"no host": {FrpsIP: "1.1.1.1", SubscriptionType: "max"},
-		"no frps": {PublicHost: "h", SubscriptionType: "max"},
-		"no sub":  {PublicHost: "h", FrpsIP: "1.1.1.1"},
+		"no host": {SubscriptionType: "max"},
+		"no sub":  {PublicHost: "h"},
 		"nil cfg": nil,
 	}
 	for name, def := range cases {
@@ -344,7 +308,7 @@ func TestResolveRequiresHostFrpsSub(t *testing.T) {
 
 // TestResolveReleaseRepoDefault 验证 release_repo 缺省回退默认仓库，config/flag 给值则优先。
 func TestResolveReleaseRepoDefault(t *testing.T) {
-	def := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max"}
+	def := &config.ClientConfig{PublicHost: "h", SubscriptionType: "max"}
 	got, err := Resolve(def, Params{Label: "x"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -352,7 +316,7 @@ func TestResolveReleaseRepoDefault(t *testing.T) {
 	if got.ReleaseRepo != "redcontritio/cc-mysub" {
 		t.Errorf("default ReleaseRepo = %q, want redcontritio/cc-mysub", got.ReleaseRepo)
 	}
-	def2 := &config.ClientConfig{PublicHost: "h", FrpsIP: "1.1.1.1", SubscriptionType: "max", ReleaseRepo: "acme/cc-mysub"}
+	def2 := &config.ClientConfig{PublicHost: "h", SubscriptionType: "max", ReleaseRepo: "acme/cc-mysub"}
 	got2, err := Resolve(def2, Params{Label: "x"})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -372,36 +336,48 @@ func TestResolveReleaseRepoDefault(t *testing.T) {
 
 // ---- Run (integration) ----
 
-func TestRunEndToEnd(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// sumsServer 返回一个仅对 /SHA256SUMS 回 validSums() 的 httptest server，复用现有 manifest mock 机制。
+func sumsServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
 			io.WriteString(w, validSums())
 			return
 		}
 		http.NotFound(w, r)
 	}))
+}
+
+func TestRunEndToEnd(t *testing.T) {
+	srv := sumsServer(t)
 	defer srv.Close()
 	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
 
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
-		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","subscription_type":"max"}}`), 0o644))
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","subscription_type":"max"}}`), 0o644))
 
 	outDir := t.TempDir()
 	wrapperPath := filepath.Join(outDir, "myclaude-laptop")
+	// 真实形态的混合 hex 指纹, 刻意区别于 validSums() 的 a/b/c/d*64 平台 sha, 以使
+	// 「wrapper 不含 per-device 指纹」断言不被 sha 表巧合命中。
+	const cert = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 	var sb strings.Builder
-	err := Run([]string{"--label", "laptop", "--release", "v1.0.0", "--out", wrapperPath}, cfgDir, &sb)
+	err := Run([]string{"--label", "laptop", "--release", "v1.0.0", "--fingerprint", cert, "--out", wrapperPath}, cfgDir, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// devices.json 落了一条
+	// devices.json 落了一条, cert_sha256 = 传入的指纹（直接相等, 不哈希）。
 	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
 	if len(list) != 1 || list[0].Label != "laptop" {
 		t.Fatalf("devices.json not written correctly: %+v", list)
 	}
+	if list[0].CertSHA256 != cert {
+		t.Errorf("stored cert_sha256 %q != fingerprint %q", list[0].CertSHA256, cert)
+	}
 
-	// wrapper 文件写出（mode 由 adddevice_test.go TestAddDeviceSubcommand 覆盖）
+	// wrapper 文件写出。
 	if _, err := os.Stat(wrapperPath); err != nil {
 		t.Fatalf("wrapper not written: %v", err)
 	}
@@ -409,12 +385,19 @@ func TestRunEndToEnd(t *testing.T) {
 	if !strings.Contains(w, `PUBLIC_HOST="ccapi.example.com"`) || !strings.Contains(w, `SUB_TYPE="max"`) {
 		t.Errorf("wrapper not filled from config: \n%s", w)
 	}
-	// v4 helper 形态: 必须有 helper exec 行, 不得残留 v3 直连/隔离形态。
-	if !strings.Contains(w, `exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`) {
-		t.Errorf("wrapper missing v4 self-bootstrap helper exec line:\n%s", w)
+	// v4 mTLS helper 形态: exec 行 + fleet-generic 占位 token, 不得残留 v3 直连/隔离形态。
+	if !strings.Contains(w, `exec "$CC_MYSUB_BIN" helper --host "$PUBLIC_HOST" --client-cert "$DEV_CERT" --client-key "$DEV_KEY" -- claude "$@"`) {
+		t.Errorf("wrapper missing v4 mTLS helper exec line:\n%s", w)
+	}
+	if !strings.Contains(w, `CLAUDE_CODE_OAUTH_TOKEN="cco_dev_placeholder"`) {
+		t.Errorf("wrapper missing fleet-generic placeholder token:\n%s", w)
 	}
 	if strings.Contains(w, "ANTHROPIC_BASE_URL=https://") || strings.Contains(w, "unshare") {
 		t.Errorf("wrapper still contains obsolete v3 form:\n%s", w)
+	}
+	// fleet-generic: per-device 指纹是服务端身份, 绝不泄漏进通用 wrapper。
+	if strings.Contains(w, cert) {
+		t.Errorf("wrapper leaked the per-device fingerprint (must be fleet-generic):\n%s", w)
 	}
 	// §7 硬不变量: 私钥 ca.key 绝不内联(只内联公 ca.crt)。负向守护:误把 serverCACertPath 指向
 	// key、或多读 ca.key 内联的回归须被抓到。
@@ -437,36 +420,26 @@ func TestRunEndToEnd(t *testing.T) {
 		t.Errorf("ca.key mode = %v, want 0600", keyFI.Mode().Perm())
 	}
 
-	// 打印的明文 token 与库内 sha256 对得上，且 wrapper 里也带着它
-	printed := sb.String()
-	tok := extractToken(t, printed)
-	if list[0].TokenSHA256 != auth.HashToken(tok) {
-		t.Errorf("printed token does not match stored hash")
-	}
-	if !strings.Contains(w, tok) {
-		t.Errorf("wrapper does not embed the generated token")
+	// 打印输出登记了该设备指纹。
+	if !strings.Contains(sb.String(), cert) {
+		t.Errorf("printed output does not mention the registered fingerprint:\n%s", sb.String())
 	}
 }
 
 // TestRunAssignsUpstream 验证 --upstream 写入 devices.json 的 upstream 字段。
 func TestRunAssignsUpstream(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
-			io.WriteString(w, validSums())
-			return
-		}
-		http.NotFound(w, r)
-	}))
+	srv := sumsServer(t)
 	defer srv.Close()
 	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
 
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
-		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","subscription_type":"max"}}`), 0o644))
 
 	wrapperPath := filepath.Join(t.TempDir(), "myclaude-work")
+	cert := fp("b")
 	var sb strings.Builder
-	err := Run([]string{"--label", "work", "--upstream", "b", "--release", "v1.0.0", "--out", wrapperPath}, cfgDir, &sb)
+	err := Run([]string{"--label", "work", "--upstream", "b", "--release", "v1.0.0", "--fingerprint", cert, "--out", wrapperPath}, cfgDir, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -475,9 +448,42 @@ func TestRunAssignsUpstream(t *testing.T) {
 	if len(list) != 1 || list[0].Upstream != "b" {
 		t.Fatalf("--upstream b not written to devices.json: %+v", list)
 	}
+	if list[0].CertSHA256 != cert {
+		t.Errorf("stored cert_sha256 %q != fingerprint %q", list[0].CertSHA256, cert)
+	}
 	raw := string(mustRead(t, filepath.Join(cfgDir, "devices.json")))
 	if !strings.Contains(raw, `"upstream": "b"`) {
 		t.Errorf("devices.json missing upstream field:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"cert_sha256": "`+cert+`"`) {
+		t.Errorf("devices.json missing cert_sha256 field:\n%s", raw)
+	}
+}
+
+// TestRunNormalizesFingerprintToLower 验证 --fingerprint 传大写时, resolveFingerprint 归一为小写后落盘
+// (devices.json 的 cert_sha256 只认小写规范形; CanonicalFingerprint 拒非小写)。
+func TestRunNormalizesFingerprintToLower(t *testing.T) {
+	srv := sumsServer(t)
+	defer srv.Close()
+	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
+
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","subscription_type":"max"}}`), 0o644))
+
+	upper := strings.Repeat("A", 64)
+	var sb strings.Builder
+	err := Run([]string{"--label", "up", "--release", "v1.0.0", "--fingerprint", upper, "--out", filepath.Join(t.TempDir(), "w")}, cfgDir, &sb)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
+	if len(list) != 1 {
+		t.Fatalf("want 1 device, got %d", len(list))
+	}
+	want := strings.Repeat("a", 64)
+	if list[0].CertSHA256 != want {
+		t.Errorf("fingerprint not normalized to lowercase: stored %q, want %q", list[0].CertSHA256, want)
 	}
 }
 
@@ -487,10 +493,10 @@ func TestRunAssignsUpstream(t *testing.T) {
 func TestRunRejectsMalformedRelease(t *testing.T) {
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
-		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","subscription_type":"max"}}`), 0o644))
 
 	var sb strings.Builder
-	err := Run([]string{"--label", "x", "--release", `v1"; rm -rf ~; "`, "--out", filepath.Join(t.TempDir(), "w")}, cfgDir, &sb)
+	err := Run([]string{"--label", "x", "--release", `v1"; rm -rf ~; "`, "--fingerprint", fp("a"), "--out", filepath.Join(t.TempDir(), "w")}, cfgDir, &sb)
 	if err == nil {
 		t.Fatal("expected error for --release with shell metachars, got nil")
 	}
@@ -499,41 +505,33 @@ func TestRunRejectsMalformedRelease(t *testing.T) {
 	}
 }
 
-// TestRunRotateRevokesOldToken 验证 --rotate 原地换发: 旧 token 不再 Lookup 命中, 新 token 命中, 单行。
-func TestRunRotateRevokesOldToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
-			io.WriteString(w, validSums())
-			return
-		}
-		http.NotFound(w, r)
-	}))
+// TestRunRotateRevokesOldFingerprint 验证 --rotate 原地换发: 旧指纹不再 Lookup 命中, 新指纹命中, 单行。
+func TestRunRotateRevokesOldFingerprint(t *testing.T) {
+	srv := sumsServer(t)
 	defer srv.Close()
 	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
 
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
-		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","subscription_type":"max"}}`), 0o644))
+
+	oldFP := fp("a")
+	newFP := fp("b")
 
 	var sb1 strings.Builder
-	must(t, Run([]string{"--label", "laptop", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
-	oldTok := extractToken(t, sb1.String())
+	must(t, Run([]string{"--label", "laptop", "--release", "v1.0.0", "--fingerprint", oldFP, "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
 
 	var sb2 strings.Builder
-	must(t, Run([]string{"--label", "laptop", "--rotate", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2))
-	newTok := extractToken(t, sb2.String())
+	must(t, Run([]string{"--label", "laptop", "--rotate", "--release", "v1.0.0", "--fingerprint", newFP, "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2))
 
-	if oldTok == newTok {
-		t.Fatal("rotate did not issue a new token")
-	}
 	store, err := auth.NewDeviceStore(filepath.Join(cfgDir, "devices.json"))
 	must(t, err)
 	defer store.StopWatch()
-	if _, ok := store.Lookup(oldTok); ok {
-		t.Error("old token still valid after rotate (NOT revoked)")
+	if _, ok := store.Lookup(oldFP); ok {
+		t.Error("old fingerprint still valid after rotate (NOT revoked)")
 	}
-	if _, ok := store.Lookup(newTok); !ok {
-		t.Error("new token not valid after rotate")
+	if _, ok := store.Lookup(newFP); !ok {
+		t.Error("new fingerprint not valid after rotate")
 	}
 	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
 	if len(list) != 1 {
@@ -543,24 +541,18 @@ func TestRunRotateRevokesOldToken(t *testing.T) {
 
 // TestRunNoRotateRejectsDuplicate 验证不带 --rotate 时同 label 仍被 AppendDevice 硬拒。
 func TestRunNoRotateRejectsDuplicate(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
-			io.WriteString(w, validSums())
-			return
-		}
-		http.NotFound(w, r)
-	}))
+	srv := sumsServer(t)
 	defer srv.Close()
 	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
 
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
-		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","subscription_type":"max"}}`), 0o644))
 
 	var sb1 strings.Builder
-	must(t, Run([]string{"--label", "dup", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
+	must(t, Run([]string{"--label", "dup", "--release", "v1.0.0", "--fingerprint", fp("a"), "--out", filepath.Join(t.TempDir(), "w1")}, cfgDir, &sb1))
 	var sb2 strings.Builder
-	err := Run([]string{"--label", "dup", "--release", "v1.0.0", "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2)
+	err := Run([]string{"--label", "dup", "--release", "v1.0.0", "--fingerprint", fp("b"), "--out", filepath.Join(t.TempDir(), "w2")}, cfgDir, &sb2)
 	if err == nil {
 		t.Fatal("expected duplicate-label error without --rotate, got nil")
 	}
@@ -585,15 +577,4 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return b
-}
-
-var tokenRE = regexp.MustCompile(`cco_dev_[0-9a-f]{48}`)
-
-func extractToken(t *testing.T, s string) string {
-	t.Helper()
-	m := tokenRE.FindString(s)
-	if m == "" {
-		t.Fatalf("no cco_dev_ token found in output:\n%s", s)
-	}
-	return m
 }

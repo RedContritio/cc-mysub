@@ -2,10 +2,10 @@ package auth
 
 import (
 	"bytes"
-	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,51 +20,56 @@ func writeDevices(t *testing.T, path, content string) {
 func TestStoreLookup(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	// HashToken("dev-secret") 预先算好
-	h := HashToken("dev-secret")
-	writeDevices(t, p, `[{"label":"laptop","token_sha256":"`+h+`","rate_limit":60}]`)
+	// cert_sha256 直接就是 Lookup 入参（指纹），不再二次哈希。
+	fp := CertFingerprint([]byte("dev-a"))
+	writeDevices(t, p, `[{"label":"laptop","cert_sha256":"`+fp+`","rate_limit":60}]`)
 
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dev, ok := s.Lookup("dev-secret")
+	dev, ok := s.Lookup(fp)
 	if !ok || dev.Label != "laptop" {
 		t.Fatalf("Lookup failed: ok=%v dev=%+v", ok, dev)
 	}
+	// "wrong" 是非 64-hex 串 → CanonicalFingerprint 拒 → 天然 miss。
 	if _, ok := s.Lookup("wrong"); ok {
-		t.Error("unknown token should not match")
+		t.Error("non-canonical fingerprint should not match")
+	}
+	// 合法但不在表里的指纹也 miss。
+	if _, ok := s.Lookup(CertFingerprint([]byte("dev-b"))); ok {
+		t.Error("unknown fingerprint should not match")
 	}
 }
 
 func TestDevice_UpstreamField(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	tok := "cco_dev_x"
-	writeDevices(t, p, `[{"label":"l","token_sha256":"`+HashToken(tok)+`","upstream":"b"}]`)
+	fp := CertFingerprint([]byte("dev-x"))
+	writeDevices(t, p, `[{"label":"l","cert_sha256":"`+fp+`","upstream":"b"}]`)
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, ok := s.Lookup(tok)
+	d, ok := s.Lookup(fp)
 	if !ok || d.Upstream != "b" {
 		t.Fatalf("upstream = %q ok=%v", d.Upstream, ok)
 	}
 
 	// 哨兵值 "" = 使用默认 token：字段缺失 与 显式 "upstream":"" 两种零值路径都须解析为 ""。
-	missing, explicit := "cco_dev_missing", "cco_dev_explicit"
+	fpMissing, fpExplicit := CertFingerprint([]byte("dev-missing")), CertFingerprint([]byte("dev-explicit"))
 	writeDevices(t, p, `[`+
-		`{"label":"m","token_sha256":"`+HashToken(missing)+`"},`+
-		`{"label":"e","token_sha256":"`+HashToken(explicit)+`","upstream":""}`+
+		`{"label":"m","cert_sha256":"`+fpMissing+`"},`+
+		`{"label":"e","cert_sha256":"`+fpExplicit+`","upstream":""}`+
 		`]`)
 	s2, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tk := range []string{missing, explicit} {
-		d, ok := s2.Lookup(tk)
+	for _, want := range []string{fpMissing, fpExplicit} {
+		d, ok := s2.Lookup(want)
 		if !ok || d.Upstream != "" {
-			t.Errorf("token %q: upstream = %q ok=%v, want empty sentinel", tk, d.Upstream, ok)
+			t.Errorf("fp %q: upstream = %q ok=%v, want empty sentinel", want, d.Upstream, ok)
 		}
 	}
 }
@@ -72,7 +77,9 @@ func TestDevice_UpstreamField(t *testing.T) {
 func TestStoreHotReload(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	writeDevices(t, p, `[{"label":"a","token_sha256":"`+HashToken("t1")+`"}]`)
+	fp1 := CertFingerprint([]byte("t1"))
+	fp2 := CertFingerprint([]byte("t2"))
+	writeDevices(t, p, `[{"label":"a","cert_sha256":"`+fp1+`"}]`)
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
@@ -81,15 +88,15 @@ func TestStoreHotReload(t *testing.T) {
 	s.StartWatch()
 	defer s.StopWatch()
 
-	// 改文件: 撤销 t1, 新增 t2
+	// 改文件: 撤销 fp1, 新增 fp2
 	time.Sleep(10 * time.Millisecond)
-	writeDevices(t, p, `[{"label":"b","token_sha256":"`+HashToken("t2")+`"}]`)
+	writeDevices(t, p, `[{"label":"b","cert_sha256":"`+fp2+`"}]`)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		_, hadT1 := s.Lookup("t1")
-		_, hasT2 := s.Lookup("t2")
-		if !hadT1 && hasT2 {
+		_, had1 := s.Lookup(fp1)
+		_, has2 := s.Lookup(fp2)
+		if !had1 && has2 {
 			return // reload 生效
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -97,12 +104,12 @@ func TestStoreHotReload(t *testing.T) {
 	t.Fatal("hot reload did not take effect")
 }
 
-// TestLookupEmptyTokenMisses 契约：空 token 在 hash 之前即被拒，绝不命中。
-// 防手改 devices.json 插入 token_sha256==HashToken("") 行后用空 token 撞开。
-func TestLookupEmptyTokenMisses(t *testing.T) {
+// TestLookupEmptyMisses 契约：空串非规范指纹，在查表前即被 CanonicalFingerprint 守卫拒，
+// Lookup("") 永远 miss。防手改 devices.json 后用空指纹撞开。
+func TestLookupEmptyMisses(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	writeDevices(t, p, `[{"label":"real","token_sha256":"`+HashToken("good")+`"}]`)
+	writeDevices(t, p, `[{"label":"real","cert_sha256":"`+CertFingerprint([]byte("good"))+`"}]`)
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
@@ -112,27 +119,38 @@ func TestLookupEmptyTokenMisses(t *testing.T) {
 	}
 }
 
-// TestReloadRejectsEmptyDigestRow 契约：load 期拒任何 token_sha256==HashToken("")
-// 的行，使空哈希永不进表；用空 token 仍 miss。
-func TestReloadRejectsEmptyDigestRow(t *testing.T) {
+// TestReloadRejectsNonCanonicalRows 契约：load 期 reload 用 CanonicalFingerprint 闸门
+// 拒任何 cert_sha256 非规范的行——空串、非 64-hex 短串、以及合法十六进制但含大写的串
+// （大写虽是有效 hex 却非规范，必须被拒；否则同一指纹大小写两形可双开，破坏吊销）。
+// 直接断言内部表 byHash（同包白盒）以给 load 闸门真牙：非规范行根本不进表，
+// 而非仅被 Lookup 入参守卫遮蔽（后者无法区分"未入表"与"入表但不可查"）。
+func TestReloadRejectsNonCanonicalRows(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	emptyDigest := HashToken("") // e3b0c442...b855
+	good := CertFingerprint([]byte("good"))
+	upper := strings.ToUpper(good) // 合法 hex 但大写 → 非规范，必须被拒
 	writeDevices(t, p, `[`+
-		`{"label":"poison","token_sha256":"`+emptyDigest+`"},`+
-		`{"label":"real","token_sha256":"`+HashToken("good")+`"}`+
+		`{"label":"empty","cert_sha256":""},`+
+		`{"label":"short","cert_sha256":"abcd"},`+
+		`{"label":"upper","cert_sha256":"`+upper+`"},`+
+		`{"label":"real","cert_sha256":"`+good+`"}`+
 		`]`)
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 空 token 仍 miss（既因 Lookup 守卫，也因该行未入表）。
-	if _, ok := s.Lookup(""); ok {
-		t.Error(`empty-digest row must not be loadable via Lookup("")`)
+	// load 闸门：仅合法行进表。
+	if len(s.byHash) != 1 {
+		t.Fatalf("byHash size = %d want 1 (non-canonical rows must be dropped): %+v", len(s.byHash), s.byHash)
 	}
-	// 真行不受牵连。
-	if d, ok := s.Lookup("good"); !ok || d.Label != "real" {
-		t.Errorf("real row should still load: ok=%v d=%+v", ok, d)
+	for _, bad := range []string{"", "abcd", upper} {
+		if _, present := s.byHash[bad]; present {
+			t.Errorf("non-canonical key %q must not enter table", bad)
+		}
+	}
+	// 合法行不受牵连。
+	if d, ok := s.byHash[good]; !ok || d.Label != "real" {
+		t.Errorf("canonical row should load: ok=%v d=%+v", ok, d)
 	}
 }
 
@@ -140,7 +158,8 @@ func TestReloadRejectsEmptyDigestRow(t *testing.T) {
 func TestReloadParseFailureLogsLoud(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")
-	writeDevices(t, p, `[{"label":"a","token_sha256":"`+HashToken("t1")+`"}]`)
+	fp := CertFingerprint([]byte("t1"))
+	writeDevices(t, p, `[{"label":"a","cert_sha256":"`+fp+`"}]`)
 	s, err := NewDeviceStore(p)
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +170,6 @@ func TestReloadParseFailureLogsLoud(t *testing.T) {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	_ = context.Background() // (context import 已在文件中使用则删此行)
 
 	s.pollInterval = 20 * time.Millisecond
 	s.StartWatch()
@@ -169,8 +187,8 @@ func TestReloadParseFailureLogsLoud(t *testing.T) {
 	if !bytes.Contains(logBuf.Bytes(), []byte("reload failed")) {
 		t.Fatalf("expected loud reload-failure log, got: %q", logBuf.String())
 	}
-	// 旧表保留：t1 仍命中。
-	if _, ok := s.Lookup("t1"); !ok {
+	// 旧表保留：fp 仍命中。
+	if _, ok := s.Lookup(fp); !ok {
 		t.Error("prior table must be kept after parse failure")
 	}
 }

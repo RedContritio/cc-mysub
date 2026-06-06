@@ -13,9 +13,10 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/ratelimit"
 )
 
-// Authenticator looks up a device by its presented token.
+// Authenticator looks up a device by its presented client-cert fingerprint
+// (SHA-256(DER), lowercase hex).
 type Authenticator interface {
-	Lookup(token string) (auth.Device, bool)
+	Lookup(fingerprint string) (auth.Device, bool)
 }
 
 type ctxKey int
@@ -28,23 +29,6 @@ func DeviceLabel(ctx context.Context) string {
 		return d.Label
 	}
 	return ""
-}
-
-// AuthMiddleware validates the per-device token (Bearer or x-api-key) and
-// injects the resolved device into the request context. Unknown tokens get 401.
-func AuthMiddleware(a Authenticator) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tok := auth.ExtractToken(r)
-			dev, ok := a.Lookup(tok)
-			if tok == "" || !ok {
-				writeJSONError(w, http.StatusUnauthorized, "unauthorized", "invalid token")
-				return
-			}
-			ctx := context.WithValue(r.Context(), deviceKey, dev)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	}
 }
 
 // rateLimitExemptPrefixes 是免限流的路径前缀：匿名遥测/注册表查询走这些端点，限流它们会
@@ -60,49 +44,19 @@ func isExempt(path string) bool {
 	return false
 }
 
-// globalAnonPerMin is a coarse, device-INDEPENDENT cap on anonymous inner
-// requests (those conditionalAuth lets through with no device). It bounds the
-// blast radius of a leaked DEVICE_TOKEN, which otherwise opens an
-// un-rate-limited anonymous relay through the channel (spec §3.7). It must NOT
-// throttle authenticated requests (they take the device-keyed branch below) nor
-// exempt telemetry paths (byte-faithful passthrough).
-const globalAnonPerMin = 60
-
-// newAnonLimiter constructs a fresh Limiter for the global anonymous bucket.
-// Extracted so tests can substitute a fresh instance per test run without
-// reaching into the ratelimit package directly.
-func newAnonLimiter() *ratelimit.Limiter { return ratelimit.NewLimiter(nil) }
-
-// globalAnonLimiter is the single shared bucket for all anonymous inner
-// requests. Keyed by a fixed sentinel so every anon request draws from one
-// global quota regardless of source.
-var globalAnonLimiter = newAnonLimiter()
-
-const globalAnonKey = "" // device-independent: one global anon bucket
-
-// RateLimitByDevice limits per device using its RateLimit (or defaultPerMin
-// when the device has none). Must run after conditionalAuth. Exempt path
-// prefixes are never limited (telemetry passthrough stays byte-faithful).
-// Anonymous non-exempt requests (no authed device) are bounded by a coarse
-// device-independent global cap (globalAnonPerMin) instead — see §3.7.
+// RateLimitByDevice limits per device using its RateLimit (or defaultPerMin when
+// the device has none). Must run after conditionalAuth + BaseContext 注入设备。
+// 豁免路径前缀永不限流（遥测逐字节透传）。mTLS 下每个连接都携带已认证设备（证书握手保证），
+// 故无匿名连接分支：匿名内层请求（无入站凭据但连接已认证）归入其证书设备的桶。
 func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 	l := ratelimit.NewLimiter(nil)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if isExempt(r.URL.Path) {
-				next.ServeHTTP(w, r) // 豁免遥测：永不限流(per-device 或全局)
+				next.ServeHTTP(w, r) // 豁免遥测：永不限流
 				return
 			}
-			dev, ok := r.Context().Value(deviceKey).(auth.Device)
-			if !ok || dev.Label == "" {
-				// 匿名内层请求：受与 device 无关的粗粒度全局 cap。
-				if !globalAnonLimiter.Allow(globalAnonKey, globalAnonPerMin) {
-					writeJSONError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
+			dev, _ := r.Context().Value(deviceKey).(auth.Device)
 			perMin := defaultPerMin
 			if dev.RateLimit > 0 {
 				perMin = dev.RateLimit
@@ -115,12 +69,6 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 		})
 	}
 }
-
-// NOTE: globalAnonLimiter is package-shared across all RateLimitByDevice
-// instances (the global cap is intentionally process-wide). Tests that exercise
-// the anon non-exempt branch must save/restore globalAnonLimiter via
-// t.Cleanup so they are hermetic regardless of execution order or -count.
-// newAnonLimiter() is provided for exactly this purpose.
 
 // AccessRecord is one structured access-log entry.
 type AccessRecord struct {

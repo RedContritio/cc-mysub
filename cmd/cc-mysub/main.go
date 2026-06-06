@@ -75,17 +75,24 @@ func main() {
 	}
 	minter := mitm.NewMinter(ca, time.Hour)
 
-	// 外层 TLS 必须呈现 cc-mysub 自身身份证书（public_host 的 CN/SAN），使 CONNECT 目标
-	// host 不以明文上线。缺 public_host 无法签发该身份证书，fail-fast。
+	// 外层 TLS 身份 = 真 LE 证书，从 <config-dir>/certs/<public_host>.{crt,key} 加载（续期热重载）。
+	// 缺 public_host 无从定位证书路径，fail-fast。
 	if cfg.Client == nil || cfg.Client.PublicHost == "" {
-		slog.Error("client.public_host required for outer-TLS identity")
+		slog.Error("client.public_host required (outer-TLS identity cert path)")
+		os.Exit(1)
+	}
+	outerCertPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".crt")
+	outerKeyPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".key")
+	outerCert := proxy.NewOuterCertLoader(outerCertPath, outerKeyPath)
+	if _, err := outerCert(nil); err != nil {
+		slog.Error("load outer TLS cert", "cert", outerCertPath, "err", err)
 		os.Exit(1)
 	}
 
 	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
 	// allowlist 仅 MITM Anthropic 控制面/数据面 host（纵深防御，拒其余）。
 	fp := proxy.NewForwardProxy(minter, store, up, nil,
-		[]string{"api.anthropic.com", "console.anthropic.com"}, cfg.Client.PublicHost, 512)
+		[]string{"api.anthropic.com", "console.anthropic.com"}, outerCert, 512)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
