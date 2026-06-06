@@ -52,11 +52,9 @@ func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
 	}
 	cn := *label
 	if cn == "" {
-		if h, _ := os.Hostname(); h != "" {
-			cn = h
-		} else {
-			cn = "cc-mysub-device"
-		}
+		// 固定非 PII CN：不取主机名，避免把设备标识写进客户端证书（TLS1.2 下证书在握手中明文，
+		// frps 透传虽不解密但链路上可被旁观）。身份由指纹承载，CN 仅作占位、不参与认证。
+		cn = "cc-mysub-device"
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
