@@ -316,13 +316,12 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 		return fmt.Errorf("write wrapper %s: %w", dest, err)
 	}
 	absDest, _ := filepath.Abs(dest)
-	absCA, _ := filepath.Abs(serverCACertPath)
 
 	fmt.Fprintf(out, "✓ 已为设备 %q 签发 per-device token 并写入 %s\n", p.Label, devicesPath)
-	fmt.Fprintf(out, "\nper-device token (交给该设备, 明文仅此一次):\n  %s\n", token)
-	fmt.Fprintf(out, "\ncc-mysub CA 公证书 (拷到该设备的 %s):\n  %s\n", deviceCACertPath, absCA)
-	fmt.Fprintf(out, "\nwrapper 已生成 (拷到该设备的 PATH, 如 ~/.local/bin/myclaude):\n  %s\n", absDest)
-	fmt.Fprintf(out, "\n代理热重载会自动加载新设备, 无需重启。吊销 = 删 %s 里该条。\n", devicesPath)
+	fmt.Fprintf(out, "\nper-device token (已烤进 wrapper; 明文仅此一次, wrapper 即设备凭据, 分发渠道须鉴权):\n  %s\n", token)
+	fmt.Fprintf(out, "\n自举 wrapper 已生成 —— 只需把这一个文件拷到该设备 PATH (如 ~/.local/bin/myclaude):\n  %s\n", absDest)
+	fmt.Fprintf(out, "  首次运行自动按 uname 下载 cc-mysub 二进制(sha256 校验 fail-closed) + 写出内联 CA, 无需另拷二进制或 ca.crt。\n")
+	fmt.Fprintf(out, "\n代理热重载会自动加载新设备, 无需重启。吊销 = 删 %s 里该条; 升级换发 = add-device --rotate --label %s --release <newtag>。\n", devicesPath, p.Label)
 	return nil
 }
 

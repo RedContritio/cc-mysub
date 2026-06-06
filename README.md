@@ -97,8 +97,9 @@ cc-mysub add-device --label laptop --release v1.0.0
 写出内联 CA 公证书到 `~/.config/cc-mysub/ca.crt`，之后秒启。**无需另拷二进制或 ca.crt。**
 
 - `--release <tag>` 必填，钉定二进制版本（无默认 latest，杜绝移动目标）。
-- 升级：`add-device --rotate <label> --release <newtag>` 原地换发——吊销旧 token、
-  写新 token、覆写 wrapper；设备换上新 wrapper 即自动重新下载校验新版本。
+- 升级：`add-device --rotate --label <label> --release <newtag>` 原地换发——吊销旧 token、
+  写新 token、覆写 wrapper；设备换上新 wrapper 即自动重新下载校验新版本。（`--rotate` 是布尔
+  flag，须与 `--label` 一起给，不能写成 `--rotate <label>`。）
 - 平台：`linux/darwin × amd64/arm64`（Windows 不支持，wrapper 是 bash）。
 - 二进制托管点默认 `redcontritio/cc-mysub` 的 GitHub Releases，可经 config
   `client.release_repo` 或 `--release-repo` 覆盖。
