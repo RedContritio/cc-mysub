@@ -33,13 +33,13 @@ const deviceCACertPath = "${HOME}/.config/cc-mysub/ca.crt"
 
 // Params are the resolved values needed to enroll one device.
 type Params struct {
-	Label      string
-	PublicHost string
-	FrpsIP     string
-	ProxyPort  int
-	SubType    string
-	RateLimit  int
-	Upstream   string // 该设备所属 setup-token id; 空 = 使用默认 token
+	Label       string
+	PublicHost  string
+	FrpsIP      string
+	ProxyPort   int
+	SubType     string
+	RateLimit   int
+	Upstream    string // 该设备所属 setup-token id; 空 = 使用默认 token
 	ReleaseRepo string // 托管 release 二进制的 GitHub owner/repo override; 空走 config/默认
 }
 
@@ -66,8 +66,8 @@ func RenderWrapper(p Params, token, caCertPath string) (string, error) {
 	}
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, struct {
-		PublicHost, FrpsIP  string
-		ProxyPort           int
+		PublicHost, FrpsIP               string
+		ProxyPort                        int
 		DeviceToken, SubType, CACertPath string
 	}{p.PublicHost, p.FrpsIP, p.ProxyPort, token, p.SubType, caCertPath}); err != nil {
 		return "", fmt.Errorf("render wrapper: %w", err)

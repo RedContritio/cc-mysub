@@ -24,6 +24,7 @@ var hexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 //   - 结果须恰含全部四个受支持平台（缺任一 → error）；
 //   - 匹配行 hash 非 64-hex → error；
 //   - 同一平台重复 → error。
+//
 // foreign/未知资产行静默忽略（非 error），兼容 sha256sum 文本/二进制两种模式格式。
 func ParseManifest(text string) (map[string]string, error) {
 	out := make(map[string]string)
