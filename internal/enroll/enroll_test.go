@@ -2,6 +2,9 @@ package enroll
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,7 +46,15 @@ func TestGenerateTokenUnique(t *testing.T) {
 func TestRenderWrapperFillsValues(t *testing.T) {
 	p := Params{PublicHost: "ccapi.example.com", FrpsIP: "203.0.113.10", ProxyPort: 8788, SubType: "max"}
 	const caPath = "${HOME}/.config/cc-mysub/ca.crt"
-	out, err := RenderWrapper(p, "cco_dev_deadbeef", caPath)
+	const caPEM = "-----BEGIN CERTIFICATE-----\nMIIBfakeCAcontent==\n-----END CERTIFICATE-----"
+	shaTable := map[string]string{
+		"linux-amd64":  strings.Repeat("a", 64),
+		"linux-arm64":  strings.Repeat("b", 64),
+		"darwin-amd64": strings.Repeat("c", 64),
+		"darwin-arm64": strings.Repeat("d", 64),
+	}
+	const relBase = "https://example.test/redcontritio/cc-mysub/releases/download/v1.2.3"
+	out, err := RenderWrapper(p, "cco_dev_deadbeef", caPath, caPEM, shaTable, "v1.2.3", relBase)
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -53,30 +64,40 @@ func TestRenderWrapperFillsValues(t *testing.T) {
 		`DEVICE_TOKEN="cco_dev_deadbeef"`,
 		`SUB_TYPE="max"`,
 		`CA_CERT="` + caPath + `"`,
+		`RELEASE_BASE="` + relBase + `"`,
 		`CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"`,
 		`CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"`,
 		`NODE_EXTRA_CA_CERTS="$CA_CERT"`,
-		`exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`,
+		caPEM,                   // 内联 CA 逐字出现
+		"钉定版本: v1.2.3",          // version 注释
+		strings.Repeat("d", 64), // darwin-arm64 sha 烤入 case 分支
+		"verify_sha",            // bootstrap 助手
+		"trap '",                // 清理 trap
+		"sha256 校验失败（供应链）",      // fail-closed 分支
+		`exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered wrapper missing %q\n---\n%s", want, out)
 		}
 	}
-	// v4 收口: OLD v3 形态(base_url 直连 / unshare / hosts)必须彻底删除。
+	// v4 收口 + 不再依赖 PATH 上的裸 cc-mysub: OLD 形态必须彻底删除。
 	for _, banned := range []string{
 		"ANTHROPIC_BASE_URL=https://",
 		"unshare",
 		"/etc/hosts",
+		`exec cc-mysub helper`, // 旧的裸命令(无 $CC_MYSUB_BIN)形态
 	} {
 		if strings.Contains(out, banned) {
-			t.Errorf("rendered wrapper still contains obsolete v3 token %q\n---\n%s", banned, out)
+			t.Errorf("rendered wrapper still contains obsolete token %q\n---\n%s", banned, out)
 		}
 	}
 }
 
 // 核心契约: 工具绝不替用户预设小模型。
 func TestRenderWrapperDoesNotDecideSmallModel(t *testing.T) {
-	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}, "cco_dev_x", "/dev/null")
+	out, err := RenderWrapper(
+		Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"},
+		"cco_dev_x", "/dev/null", "PEM", map[string]string{}, "v0", "https://x/releases/download/v0")
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -100,7 +121,12 @@ func TestRenderWrapperIsValidBash(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
-	out, err := RenderWrapper(Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"}, "cco_dev_x", "/dev/null")
+	out, err := RenderWrapper(
+		Params{PublicHost: "h", FrpsIP: "1.2.3.4", ProxyPort: 8788, SubType: "max"},
+		"cco_dev_x", "/dev/null", "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
+		map[string]string{"linux-amd64": strings.Repeat("a", 64), "linux-arm64": strings.Repeat("b", 64),
+			"darwin-amd64": strings.Repeat("c", 64), "darwin-arm64": strings.Repeat("d", 64)},
+		"v1", "https://x/releases/download/v1")
 	if err != nil {
 		t.Fatalf("RenderWrapper: %v", err)
 	}
@@ -287,6 +313,16 @@ func TestResolveReleaseRepoDefault(t *testing.T) {
 // ---- Run (integration) ----
 
 func TestRunEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
+			io.WriteString(w, validSums())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
+
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
 		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","subscription_type":"max"}}`), 0o644))
@@ -294,7 +330,7 @@ func TestRunEndToEnd(t *testing.T) {
 	outDir := t.TempDir()
 	wrapperPath := filepath.Join(outDir, "myclaude-laptop")
 	var sb strings.Builder
-	err := Run([]string{"--label", "laptop", "--out", wrapperPath}, cfgDir, &sb)
+	err := Run([]string{"--label", "laptop", "--release", "v1.0.0", "--out", wrapperPath}, cfgDir, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -314,8 +350,8 @@ func TestRunEndToEnd(t *testing.T) {
 		t.Errorf("wrapper not filled from config: \n%s", w)
 	}
 	// v4 helper 形态: 必须有 helper exec 行, 不得残留 v3 直连/隔离形态。
-	if !strings.Contains(w, `exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`) {
-		t.Errorf("wrapper missing v4 helper exec line:\n%s", w)
+	if !strings.Contains(w, `exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"`) {
+		t.Errorf("wrapper missing v4 self-bootstrap helper exec line:\n%s", w)
 	}
 	if strings.Contains(w, "ANTHROPIC_BASE_URL=https://") || strings.Contains(w, "unshare") {
 		t.Errorf("wrapper still contains obsolete v3 form:\n%s", w)
@@ -346,13 +382,23 @@ func TestRunEndToEnd(t *testing.T) {
 
 // TestRunAssignsUpstream 验证 --upstream 写入 devices.json 的 upstream 字段。
 func TestRunAssignsUpstream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
+			io.WriteString(w, validSums())
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	t.Setenv("CC_MYSUB_RELEASE_BASE_URL", srv.URL)
+
 	cfgDir := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
 		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","frps_ip":"203.0.113.10","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
 
 	wrapperPath := filepath.Join(t.TempDir(), "myclaude-work")
 	var sb strings.Builder
-	err := Run([]string{"--label", "work", "--upstream", "b", "--out", wrapperPath}, cfgDir, &sb)
+	err := Run([]string{"--label", "work", "--upstream", "b", "--release", "v1.0.0", "--out", wrapperPath}, cfgDir, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -364,6 +410,24 @@ func TestRunAssignsUpstream(t *testing.T) {
 	raw := string(mustRead(t, filepath.Join(cfgDir, "devices.json")))
 	if !strings.Contains(raw, `"upstream": "b"`) {
 		t.Errorf("devices.json missing upstream field:\n%s", raw)
+	}
+}
+
+// TestRunRejectsMalformedRelease 验证含 shell 元字符的 --release tag 在落盘前被拒(错误可见)：
+// 这类值会被逐字插入生成的 wrapper、产出损坏/可注入的 bash。校验须先于 fetchManifest/落盘，
+// 故无需 httptest，且 devices.json 绝不应被创建(零 orphan 副作用)。
+func TestRunRejectsMalformedRelease(t *testing.T) {
+	cfgDir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","frps_ip":"1.2.3.4","proxy_port":8788,"subscription_type":"max"}}`), 0o644))
+
+	var sb strings.Builder
+	err := Run([]string{"--label", "x", "--release", `v1"; rm -rf ~; "`, "--out", filepath.Join(t.TempDir(), "w")}, cfgDir, &sb)
+	if err == nil {
+		t.Fatal("expected error for --release with shell metachars, got nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(cfgDir, "devices.json")); statErr == nil {
+		t.Error("devices.json written despite malformed --release (orphan side effect)")
 	}
 }
 

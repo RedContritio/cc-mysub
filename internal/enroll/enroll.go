@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"text/template"
 	"time"
@@ -57,12 +58,12 @@ func GenerateToken() (string, error) {
 	return "cco_dev_" + hex.EncodeToString(b[:]), nil
 }
 
-// RenderWrapper renders the v4 myclaude wrapper for p + token. caCertPath is the
-// device-side path to the cc-mysub CA cert (where the operator places ca.crt);
-// the wrapper references it for both --ca and NODE_EXTRA_CA_CERTS. The wrapper
-// never bakes in a small model — that choice is left to the user (commented
-// example).
-func RenderWrapper(p Params, token, caCertPath string) (string, error) {
+// RenderWrapper 渲染 v4 自举型 myclaude wrapper。除 p+token 的 per-device 值外，它内联
+// cc-mysub CA 公证书（caCertPEM，使设备无需另拷 ca.crt），并烤入 per-platform 二进制 sha256
+// 表（shaTable，恰四个受支持平台——其完整性由 ParseManifest 在网络边界保证）+ release 下载根
+// releaseBase，使 wrapper 首次运行能自取并校验 cc-mysub 二进制。caCertPath 是设备侧 wrapper
+// 写出内联 CA 的路径；version 烤为运维注释。
+func RenderWrapper(p Params, token, caCertPath, caCertPEM string, shaTable map[string]string, version, releaseBase string) (string, error) {
 	t, err := template.New("myclaude").Parse(wrapperTmpl)
 	if err != nil {
 		return "", fmt.Errorf("parse wrapper template: %w", err)
@@ -72,7 +73,15 @@ func RenderWrapper(p Params, token, caCertPath string) (string, error) {
 		PublicHost, FrpsIP               string
 		ProxyPort                        int
 		DeviceToken, SubType, CACertPath string
-	}{p.PublicHost, p.FrpsIP, p.ProxyPort, token, p.SubType, caCertPath}); err != nil {
+		CACertPEM, Version, ReleaseBase  string
+		ShaLinuxAmd64, ShaLinuxArm64     string
+		ShaDarwinAmd64, ShaDarwinArm64   string
+	}{
+		p.PublicHost, p.FrpsIP, p.ProxyPort, token, p.SubType, caCertPath,
+		caCertPEM, version, releaseBase,
+		shaTable["linux-amd64"], shaTable["linux-arm64"],
+		shaTable["darwin-amd64"], shaTable["darwin-arm64"],
+	}); err != nil {
 		return "", fmt.Errorf("render wrapper: %w", err)
 	}
 	return buf.String(), nil
@@ -157,6 +166,56 @@ func AppendDevice(path string, p Params, token string) error {
 	return nil
 }
 
+// ReplaceDevice 原子替换 path 中 label==p.Label 的设备行：删旧行（吊销旧 token）+ 追加新行
+// （新 token），单次 WriteFile。label 不存在时报错（rotate 无可替换者——新设备用不带 --rotate
+// 的 add-device）。这是 --rotate 路径，使「换 token」真正原地发生，不旁留旧凭据为有效。
+func ReplaceDevice(path string, p Params, token string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	var list []auth.Device
+	if err := json.Unmarshal(b, &list); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	out := make([]auth.Device, 0, len(list))
+	found := false
+	for _, d := range list {
+		if d.Label == p.Label {
+			found = true
+			continue // 丢弃旧行 = 吊销旧 token
+		}
+		out = append(out, d)
+	}
+	if !found {
+		return fmt.Errorf("device label %q not found in %s (nothing to rotate)", p.Label, path)
+	}
+	out = append(out, auth.Device{
+		Label:       p.Label,
+		TokenSHA256: auth.HashToken(token),
+		RateLimit:   p.RateLimit,
+		Upstream:    p.Upstream,
+	})
+	enc, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode devices: %w", err)
+	}
+	enc = append(enc, '\n')
+	if err := os.WriteFile(path, enc, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
+}
+
+// releaseTagRE / releaseRepoRE 约束 --release tag 与 release_repo 的字符集。两者都被逐字
+// 插入生成的 wrapper（RELEASE_BASE 双引号 bash 字面量 + 版本注释），含 shell 元字符的值会
+// 产出损坏/可注入的 wrapper。add-device 期 raise 使诚实 typo 立即可见（错误可见），而非静默
+// 产出坏 wrapper；owner-trusted 下这是契约校验，非反恶意防御。
+var (
+	releaseTagRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+	releaseRepoRE = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+)
+
 // Run is the `cc-mysub add-device` entrypoint: it parses args, loads the client
 // defaults from <config-dir>/config.json, resolves params, signs a token,
 // appends it to <config-dir>/devices.json, writes the filled wrapper, and prints
@@ -173,6 +232,9 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 		rate     = fs.Int("rate-limit", 0, "per-minute request cap for this device (0 = proxy default)")
 		upstream = fs.String("upstream", "", "setup-token id this device draws from (empty = default token)")
 		outPath  = fs.String("out", "", "wrapper output path (default ./myclaude-<label>)")
+		release  = fs.String("release", "", "cc-mysub 二进制 release tag, 如 v1.0.0 (必填, 无默认 latest)")
+		relRepo  = fs.String("release-repo", "", "托管 release 二进制的 GitHub owner/repo (覆盖 config client.release_repo)")
+		rotate   = fs.Bool("rotate", false, "对已存在的 label 原地换发: 吊销旧 token + 写新 token + 覆写 wrapper")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -184,13 +246,30 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	}
 
 	p, err := Resolve(cfg.Client, Params{
-		Label:      *label,
-		PublicHost: *host,
-		FrpsIP:     *frpsIP,
-		SubType:    *sub,
-		RateLimit:  *rate,
-		Upstream:   *upstream,
+		Label:       *label,
+		PublicHost:  *host,
+		FrpsIP:      *frpsIP,
+		SubType:     *sub,
+		RateLimit:   *rate,
+		Upstream:    *upstream,
+		ReleaseRepo: *relRepo,
 	})
+	if err != nil {
+		return err
+	}
+
+	if *release == "" {
+		return fmt.Errorf("--release is required (e.g. --release v1.0.0)")
+	}
+	if !releaseTagRE.MatchString(*release) {
+		return fmt.Errorf("--release %q has invalid chars (allowed: letters digits . _ / -)", *release)
+	}
+	if !releaseRepoRE.MatchString(p.ReleaseRepo) {
+		return fmt.Errorf("release repo %q must be owner/repo (letters digits . _ -)", p.ReleaseRepo)
+	}
+
+	// 先拉 manifest（网络, 可失败）——置于任何落盘副作用之前, 失败时不遗留 orphan 设备行。
+	shaTable, err := fetchManifest(nil, p.ReleaseRepo, *release)
 	if err != nil {
 		return err
 	}
@@ -201,6 +280,10 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	caPEM, err := os.ReadFile(serverCACertPath)
+	if err != nil {
+		return fmt.Errorf("read CA cert %s: %w", serverCACertPath, err)
+	}
 
 	token, err := GenerateToken()
 	if err != nil {
@@ -208,12 +291,19 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	}
 
 	devicesPath := filepath.Join(*cfgDir, "devices.json")
-	if err := AppendDevice(devicesPath, p, token); err != nil {
-		return err
+	if *rotate {
+		if err := ReplaceDevice(devicesPath, p, token); err != nil {
+			return err
+		}
+	} else {
+		if err := AppendDevice(devicesPath, p, token); err != nil {
+			return err
+		}
 	}
 
-	// wrapper 引用设备侧固定路径（运行时由设备 ${HOME} 展开），不是服务端路径。
-	wrapper, err := RenderWrapper(p, token, deviceCACertPath)
+	releaseBase := releaseDownloadBase(p.ReleaseRepo, *release)
+	// wrapper 引用设备侧固定路径（运行时由设备 ${HOME} 展开），并内联 CA + sha 表 + release 根。
+	wrapper, err := RenderWrapper(p, token, deviceCACertPath, string(caPEM), shaTable, *release, releaseBase)
 	if err != nil {
 		return err
 	}

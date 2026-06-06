@@ -1,12 +1,21 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+const fakeSha256Sums = "" +
+	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  cc-mysub-linux-amd64\n" +
+	"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  cc-mysub-linux-arm64\n" +
+	"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  cc-mysub-darwin-amd64\n" +
+	"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  cc-mysub-darwin-arm64\n"
 
 // TestAddDeviceSubcommand exercises the real CLI surface: it builds the binary
 // and runs `cc-mysub add-device`, verifying the subcommand dispatch, flag
@@ -29,8 +38,19 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	}
 	wrapper := filepath.Join(t.TempDir(), "myclaude-phone")
 
-	out, err := exec.Command(bin, "add-device",
-		"--config-dir", cfgDir, "--label", "phone", "--out", wrapper).CombinedOutput()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/SHA256SUMS") {
+			io.WriteString(w, fakeSha256Sums)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cmd := exec.Command(bin, "add-device",
+		"--config-dir", cfgDir, "--label", "phone", "--release", "v1.0.0", "--out", wrapper)
+	cmd.Env = append(os.Environ(), "CC_MYSUB_RELEASE_BASE_URL="+srv.URL)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("add-device: %v\n%s", err, out)
 	}
@@ -62,8 +82,8 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	if !strings.Contains(string(w), `PUBLIC_HOST="ccapi.example.com"`) {
 		t.Errorf("wrapper not filled from config:\n%s", w)
 	}
-	if !strings.Contains(string(w), `exec cc-mysub helper --upstream`) {
-		t.Errorf("wrapper missing v4 helper exec line:\n%s", w)
+	if !strings.Contains(string(w), `exec "$CC_MYSUB_BIN" helper --upstream`) {
+		t.Errorf("wrapper missing v4 self-bootstrap helper exec line:\n%s", w)
 	}
 	if !strings.Contains(string(w), `NODE_EXTRA_CA_CERTS="$CA_CERT"`) {
 		t.Errorf("wrapper missing NODE_EXTRA_CA_CERTS:\n%s", w)

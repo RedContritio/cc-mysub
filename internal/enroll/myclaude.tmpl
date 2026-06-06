@@ -1,36 +1,97 @@
 #!/usr/bin/env bash
-# myclaude — Claude Code wrapper (cc-mysub client, v4 split-egress)
-# 由 cc-mysub add-device 生成。本机只持 per-device 占位 token + cc-mysub CA 公证书；
-# 真 setup-token 永不出 cc-mysub。只有 Anthropic 流量经 cc-mysub(外层 TLS+MITM 换 token)，
-# 其余一切(WebFetch/MCP/更新/第三方)由本地 helper 直连、不碰 cc-mysub。
+# myclaude — Claude Code wrapper (cc-mysub client, v4 split-egress, 自举型)
+# 由 cc-mysub add-device 生成。拉这一个文件即可启动：首次运行自补 cc-mysub 二进制
+# (按 uname 下载 + sha256 校验) 并写出内联 CA 公证书；之后秒启。
+# 本机只持 per-device 占位 token + cc-mysub CA 公证书；真 setup-token 永不出 cc-mysub。
+# 钉定版本: {{.Version}}
 set -euo pipefail
+
+CC_MYSUB_BIN="${HOME}/.local/bin/cc-mysub"
+CA_CERT="{{.CACertPath}}"            # cc-mysub CA 公证书路径(wrapper 自写出内联 CA 到此)
+RELEASE_BASE="{{.ReleaseBase}}"      # …/releases/download/<tag>（无尾斜杠）
+
+# ---- bootstrap 助手（bash 自上而下解析，须定义在使用之前）----
+fetch() {  # fetch <url> <dest>; 二选一, 不把「工具缺失」与「下载失败」混为一谈
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" "$1"
+  else
+    echo "cc-mysub: 需要 curl 或 wget 才能下载二进制" >&2; return 1
+  fi
+}
+verify_sha() {  # verify_sha <file> <expected-hex>; 空哈希/工具缺失一律失败, 绝不旁路
+  [ -n "$2" ] || { echo "cc-mysub: 内部错误 — 空 sha256" >&2; return 1; }
+  local got
+  if command -v sha256sum >/dev/null 2>&1; then
+    got="$(sha256sum "$1" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    got="$(shasum -a 256 "$1" | awk '{print $1}')"
+  else
+    echo "cc-mysub: 需要 sha256sum 或 shasum 才能校验二进制" >&2; return 1
+  fi
+  [ "$got" = "$2" ]
+}
+
+tmp= ; catmp=
+trap 'rm -f "${tmp:-}" "${catmp:-}" 2>/dev/null' EXIT   # 末行 exec 替换 shell, trap 仅在 error/early-exit 触发
+
+# 1) 写出内联 CA（每进程私有临时 + 同目录原子 rename；幂等：内容一致则跳过）
+mkdir -p "$(dirname "$CA_CERT")"
+catmp="$(mktemp "${CA_CERT}.XXXXXX")"
+cat > "$catmp" <<'CC_MYSUB_CA_PEM'
+{{.CACertPEM}}
+CC_MYSUB_CA_PEM
+if cmp -s "$catmp" "$CA_CERT" 2>/dev/null; then rm -f "$catmp"; catmp= ; else mv "$catmp" "$CA_CERT"; catmp= ; fi
+
+# 2) uname → 平台，选当前平台 expected sha256
+case "$(uname -s)/$(uname -m)" in
+  Darwin/arm64)  PLAT=darwin-arm64;  SHA={{.ShaDarwinArm64}} ;;
+  Darwin/x86_64) PLAT=darwin-amd64;  SHA={{.ShaDarwinAmd64}} ;;
+  Linux/x86_64)  PLAT=linux-amd64;   SHA={{.ShaLinuxAmd64}} ;;
+  Linux/aarch64) PLAT=linux-arm64;   SHA={{.ShaLinuxArm64}} ;;
+  *) echo "cc-mysub: 不支持的平台 $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+esac
+
+# 3) 确保二进制就位（私有临时 + 校验 + 同目录原子 rename；幂等：已存在且 sha 匹配则跳过下载）
+if [ ! -x "$CC_MYSUB_BIN" ] || ! verify_sha "$CC_MYSUB_BIN" "$SHA"; then
+  mkdir -p "$(dirname "$CC_MYSUB_BIN")"
+  tmp="$(mktemp "${CC_MYSUB_BIN}.XXXXXX")"
+  fetch "$RELEASE_BASE/cc-mysub-$PLAT" "$tmp" || { echo "cc-mysub: 下载失败" >&2; exit 1; }
+  verify_sha "$tmp" "$SHA" || { echo "cc-mysub: sha256 校验失败（供应链）" >&2; exit 1; }
+  # 分三条独立语句：set -e 对 && 链中非末位命令(chmod)的失败豁免，合写会让 chmod 失败时
+  # 静默跳过 mv 又清空 tmp(漏 trap 清理 + 可能 exec 旧版本)。拆开使任一步失败即 fail-closed、
+  # 由 trap 清理临时文件、错误可见。成功后清空 tmp 避免 trap 误删已就位的二进制。
+  chmod 0755 "$tmp"
+  mv "$tmp" "$CC_MYSUB_BIN"
+  tmp=
+fi
+# ---- end bootstrap ----
 
 # ============ 本设备配置(由 cc-mysub add-device 生成) ============
 PUBLIC_HOST="{{.PublicHost}}"   # cc-mysub 外层 TLS 身份(证书 SAN)，helper 用它验证
 PROXY_ENTRY="{{.FrpsIP}}:{{.ProxyPort}}"  # helper 直拨的 cc-mysub forward-proxy 入口
 DEVICE_TOKEN="{{.DeviceToken}}" # 代理侧为本设备签的占位 token(sha256 入 devices.json)
 SUB_TYPE="{{.SubType}}"         # 订阅档: Max 标签 + auto mode + 1M 可用性
-CA_CERT="{{.CACertPath}}"       # cc-mysub CA 公证书路径(由 add-device 下发, 拷到本设备)
 # 可选小模型(是否启用/用哪个由你决定; 不设用 CC 默认):
 # export ANTHROPIC_SMALL_FAST_MODEL="<small-model-id>"
 # ===============================================================
 
-# 1) 订阅认证 env(全是占位/声明, 无真凭据); base_url 保持默认(不导出); HTTPS_PROXY 由 helper 注入
+# 订阅认证 env(全是占位/声明, 无真凭据); base_url 保持默认(不导出); HTTPS_PROXY 由 helper 注入
 export CLAUDE_CODE_OAUTH_TOKEN="$DEVICE_TOKEN"
 export CLAUDE_CODE_OAUTH_SCOPES="user:inference"
 export CLAUDE_CODE_SUBSCRIPTION_TYPE="$SUB_TYPE"
 export NODE_EXTRA_CA_CERTS="$CA_CERT"   # 信任 cc-mysub CA(验证其 MITM 的 api.anthropic.com 证书)
 
-# 2) 跳过启动预检(platform.claude.com 的 /hello 写死, 纯净设备会卡这)
+# 跳过启动预检(platform.claude.com 的 /hello 写死, 纯净设备会卡这)
 CJSON="${HOME}/.claude.json"
 if ! grep -qs '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$CJSON"; then
   if [ -s "$CJSON" ] && command -v jq >/dev/null 2>&1; then
-    tmp="$(mktemp)" && jq '.hasCompletedOnboarding = true' "$CJSON" >"$tmp" && mv "$tmp" "$CJSON"
+    cjtmp="$(mktemp)" && jq '.hasCompletedOnboarding = true' "$CJSON" >"$cjtmp" && mv "$cjtmp" "$CJSON"
   else
     printf '{"hasCompletedOnboarding": true}\n' >"$CJSON"
   fi
 fi
 
-# 3) 经 cc-mysub helper 启动 claude: helper 绑本地分流器(Anthropic→cc-mysub, 其余直连)
-#    并把 HTTPS_PROXY 注入 claude 子进程。纯用户态分流, 不改主机网络/DNS。
-exec cc-mysub helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"
+# 经 cc-mysub helper 启动 claude(绝对路径, 不依赖 PATH): helper 绑本地分流器(Anthropic→cc-mysub, 其余直连)
+exec "$CC_MYSUB_BIN" helper --upstream "$PROXY_ENTRY" --server-name "$PUBLIC_HOST" --ca "$CA_CERT" -- claude "$@"
