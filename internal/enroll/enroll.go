@@ -15,9 +15,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
+	"time"
 
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
@@ -231,4 +234,46 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	fmt.Fprintf(out, "\nwrapper 已生成 (拷到该设备的 PATH, 如 ~/.local/bin/myclaude):\n  %s\n", absDest)
 	fmt.Fprintf(out, "\n代理热重载会自动加载新设备, 无需重启。吊销 = 删 %s 里该条。\n", devicesPath)
 	return nil
+}
+
+// 以下三个常量与函数构成 release 资产寻址层。base URL 经 env override 是给「真二进制
+// out-of-process e2e」的注入缝（in-process 单测亦可经同一 env 注入 httptest URL）。
+
+const releaseBaseEnv = "CC_MYSUB_RELEASE_BASE_URL"
+const defaultReleaseBase = "https://github.com"
+
+// releaseBaseURL 返回 release 下载根，优先 env override（去尾斜杠），否则 GitHub。
+func releaseBaseURL() string {
+	if v := os.Getenv(releaseBaseEnv); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return defaultReleaseBase
+}
+
+// releaseDownloadBase 构造某 tag 的资产下载根：<base>/<repo>/releases/download/<tag>（无尾斜杠）。
+func releaseDownloadBase(repo, tag string) string {
+	return fmt.Sprintf("%s/%s/releases/download/%s", releaseBaseURL(), repo, tag)
+}
+
+// fetchManifest 下载并解析 repo@tag 的 SHA256SUMS。先显式查 StatusCode：非 200 即报清晰的
+// 「release tag 未找到」错误，避免 typo'd tag 的 404 HTML 被 ParseManifest 误报成「缺平台」
+// （治理总纲：错误可见 + 概念精度）。client 为 nil 时用带超时的默认 client。
+func fetchManifest(client *http.Client, repo, tag string) (map[string]string, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	url := releaseDownloadBase(repo, tag) + "/SHA256SUMS"
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("fetch SHA256SUMS: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("release tag %q not found or SHA256SUMS asset missing (HTTP %d)", tag, resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read SHA256SUMS: %w", err)
+	}
+	return ParseManifest(string(b))
 }
