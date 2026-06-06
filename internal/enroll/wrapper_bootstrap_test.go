@@ -338,4 +338,76 @@ func TestWrapperBootstrapDownloadFailureFailsClosed(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(home, ".local", "bin", "cc-mysub")); statErr == nil {
 		t.Error("binary cached despite download failure (not fail-closed)")
 	}
+	if !strings.Contains(out, "下载失败") {
+		t.Errorf("download failure not anchored to fetch branch:\n%s", out)
+	}
+}
+
+// TestWrapperBootstrapMissingHashToolFailsClosed 验证 §4.4 点名的 no-bypass 契约:两个 sha
+// 工具(sha256sum + shasum)皆缺时,verify_sha 走 else 分支 return 1(绝不落到 [ "" = "" ]
+// 为真的旁路),fail-closed——守护 §7 供应链不变量#1。用受限 PATH(symlink 所需工具但排除两个
+// hash 工具)模拟精简容器/CI 镜像。
+func TestWrapperBootstrapMissingHashToolFailsClosed(t *testing.T) {
+	bashPath, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available")
+	}
+	// 受限 PATH:含 bootstrap 所需工具,刻意排除 sha256sum + shasum。
+	binDir := t.TempDir()
+	const fetcherCurl, fetcherWget = "curl", "wget"
+	needed := []string{"bash", "env", "awk", "mkdir", "mktemp", "cat", "cmp", "mv", "rm", "dirname", "uname", "chmod", fetcherCurl, fetcherWget}
+	haveFetcher := false
+	for _, tool := range needed {
+		p, lookErr := exec.LookPath(tool)
+		if lookErr != nil {
+			continue // 本机无该工具(curl/wget 二选一即可)
+		}
+		if tool == fetcherCurl || tool == fetcherWget {
+			haveFetcher = true
+		}
+		if err := os.Symlink(p, filepath.Join(binDir, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, req := range []string{"bash", "mktemp", "cat", "mv", "uname", "awk", "cmp", "mkdir", "rm", "dirname", "chmod"} {
+		if _, statErr := os.Stat(filepath.Join(binDir, req)); statErr != nil {
+			t.Skipf("host 缺 %q,无法构造受限 PATH 测试", req)
+		}
+	}
+	if !haveFetcher {
+		t.Skip("host 既无 curl 也无 wget")
+	}
+	// 确认受限 PATH 里确实无 hash 工具(否则测试无意义)。
+	for _, banned := range []string{"sha256sum", "shasum"} {
+		if _, statErr := os.Stat(filepath.Join(binDir, banned)); statErr == nil {
+			t.Fatalf("restricted PATH 意外含 %s", banned)
+		}
+	}
+
+	srv, _ := mockBinaryServer(t)
+	defer srv.Close()
+	home := t.TempDir()
+	sha := sha256hex([]byte(stubBinary))
+	wrapper := renderBootstrap(t, srv.URL, sha)
+	wf := filepath.Join(t.TempDir(), "myclaude")
+	if err := os.WriteFile(wf, []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// PATH 只含 binDir(无 hash 工具);用绝对 bash 路径启动,不依赖 PATH 找 bash。
+	cmd := exec.Command(bashPath, wf)
+	cmd.Env = append(os.Environ(), "HOME="+home, "PATH="+binDir)
+	b, runErr := cmd.CombinedOutput()
+	out := string(b)
+	if runErr == nil {
+		t.Fatalf("expected non-zero exit when hash tools absent; output:\n%s", out)
+	}
+	if strings.Contains(out, stubMarker) {
+		t.Errorf("stub exec'd despite missing hash tools (NOT fail-closed):\n%s", out)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".local", "bin", "cc-mysub")); statErr == nil {
+		t.Error("binary cached despite missing hash tools (not fail-closed)")
+	}
+	if !strings.Contains(out, "需要 sha256sum 或 shasum") {
+		t.Errorf("missing-hash-tool 失败未锚定到 verify_sha 工具缺失分支:\n%s", out)
+	}
 }
