@@ -4,12 +4,21 @@ auth.method = "token"
 auth.token = "REPLACE-WITH-YOUR-FRPS-TOKEN"
 transport.tls.enable = true
 
-# v4: tcp 透传(L4)。外层 TLS 由 cc-mysub 自己终结(身份=public_host)，frp 不可在边缘终结 TLS，
-# 否则会破坏 helper↔cc-mysub 的外层 TLS。旧的 https/https2http(边缘终结 TLS)在 v4 作废。
+# mTLS 重设计: type=https SNI 透传(不带 https2http 插件)。
+# frps 读 ClientHello 的 SNI 路由、原样转发 TLS 流到 backend, 不终结——故 cc-mysub 自己终结
+# 外层 TLS + mTLS(出示真 LE 证书、按客户端证书指纹认证)。设备经 https://<public_host> 访问、
+# 与其它 https vhost 服务(如同一 frps 上的别的站)按 SNI 共用 frps 443、无专属 remotePort。
+# (核实于 frp v0.68.0: pkg/util/vhost/https.go 只窥探 ClientHello 取 SNI、回放原始流不终结;
+#  server/proxy/https.go 把 customDomains 注册进 VhostHTTPSMuxer。)
 [[proxies]]
 name = "cc-mysub"
-type = "tcp"
+type = "https"
+customDomains = ["ccapi.example.com"]   # = config.json client.public_host (DNS A 记录指向 frps)
 localIP = "127.0.0.1"
-localPort = 8788          # cc-mysub forward-proxy 监听端口
-remotePort = 8788         # frps 暴露的端口 = 客户端 helper 的 --upstream 端口(ProxyPort)
-                          # 必须与 config.json client.proxy_port 一致
+localPort = 8788                        # cc-mysub forward-proxy 监听端口(自终结外层 TLS + mTLS)
+# 无 [proxies.plugin]; 无 hostHeaderRewrite(透传不解析 HTTP);
+# 不设 transport.proxyProtocolVersion(cc-mysub 不解析 PROXY 头, 否则前缀被当 TLS 字节→握手坏)。
+# 外层 LE 证书由 cc-mysub 从 <config-dir>/certs/<public_host>.{crt,key} 加载(续期热重载)。
+#
+# 回滚: 把本块改回原 https2http 插件形态(localAddr=127.0.0.1:58788 + 现有 LE crt/key) +
+#       sudo launchctl kickstart -k system/com.fatedier.frpc(瞬断同 frpc 的其它 proxy 一下)。

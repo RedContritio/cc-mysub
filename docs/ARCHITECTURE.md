@@ -72,9 +72,12 @@ per-device token 与真 setup-token 是**两个独立随机串，无密码学关
 
 ## 认证与凭据管理（`~/.config/cc-mysub/`）
 
-- `config.json` — 监听设置 `{listen, tls?}`，可选 `client`（部署常量：`public_host` / `frps_ip` / `subscription_type`，供签发设备时填 wrapper）。
-- `upstream.json`（chmod 600）— `{oauthToken}`，你的真 setup-token。
-- `devices.json` — `[{label, token_sha256, rate_limit}]`，代理只存 token 的 sha256。
+> 注：认证已从信道 token 迁移到**外层 mTLS 客户端证书**（设备本地生成私钥、按证书指纹逐设备认证；frp 改 `type=https` SNI 透传、外层走真 LE）。下列字段以当前形态为准；本文档其余章节中「信道 token / overlay 取舍」等为历史设计 rationale，接入/部署以 README 为准。
+
+- `config.json` — 监听设置 `{listen}`，可选 `client`（部署常量：`public_host` / `subscription_type` / `release_repo`，供签发设备时填通用 wrapper）。
+- `upstream.json`（chmod 600）— `{oauthToken}` 或 `{oauthTokens:[{id,token}]}`，你的真 setup-token（池）。
+- `devices.json` — `[{label, cert_sha256, upstream, rate_limit}]`，`cert_sha256` = 设备客户端证书指纹（公开值）；代理不持设备私钥。
+- `certs/<public_host>.{crt,key}` — 外层身份真 LE 证书（续期热重载）；`ca.{crt,key}` — 仅内层 MITM 现签根。
 
 签发设备用 `cc-mysub add-device --label <设备名>`：它签发 per-device token、把 sha256 追加进 `devices.json`，并生成一份已填好的 `myclaude` wrapper（设置好客户端那几个 env、把代理域名直连 frps IP、跳过 onboarding）交给该设备。
 
