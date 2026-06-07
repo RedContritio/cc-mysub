@@ -52,7 +52,9 @@ wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA 做内层 MITM �
 
 ### 已知限制
 
-`/usage` 可能显示 "API"。它要连写死的域名 `platform.claude.com` 去拉订阅用量，恶劣网络（如 WSL）连不上时会 fallback 成 API 显示。这只是 `platform.claude.com` 的连通性问题，与 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 无关，也不影响推理本身与订阅计费归属。
+`/usage` 的**订阅用量限额条**（5 小时 / 每周那些）显示不出来。真因是 **OAuth scope**：限额数据来自 `api.anthropic.com/api/oauth/usage`，该端点要求 `user:profile` scope，而 `claude setup-token` 生成的凭据只含 `user:inference user:sessions:claude_code user:mcp_servers`、**永不含 `user:profile`**（setup-token 无选 scope 的选项），故请求恒返回 403。这是 **setup-token 鉴权的架构性限制**，不是连通性或路由问题——限额端点本就在 allowlist 里、经 cc-mysub 换真 token 路由到达。
+
+**只影响这一项显示**：订阅认证、推理、计费归属、Max 档、auto mode classifier、1M 全部正常（只需 `user:inference`）；`/usage` 的 header 仍正确显示 "using your subscription"，`Total cost: $0.0000` 对订阅也是对的（不按 token 计费）。要看到限额条须改用交互登录态 token（含 `user:profile`）+ 在代理侧实现 OAuth 刷新（登录 token 会过期），代价是放宽 scope + 扩 TCB，与本项目最小 scope / 最小 TCB 的安全姿态相悖，故不做。
 
 ## 本机配置（`~/.config/cc-mysub/`）
 
