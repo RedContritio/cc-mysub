@@ -36,6 +36,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "device-init" {
 		os.Exit(runDeviceInit(os.Args[2:], defaultConfigDir(), os.Stdout))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "gen-config" {
+		os.Exit(runGenConfig(os.Args[2:], defaultConfigDir(), os.Stdout))
+	}
 
 	cfgDir := flag.String("config-dir", defaultConfigDir(), "config directory")
 	flag.Parse()
