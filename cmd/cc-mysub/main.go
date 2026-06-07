@@ -91,8 +91,10 @@ func main() {
 
 	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
 	// allowlist 仅 MITM Anthropic 控制面/数据面 host（纵深防御，拒其余）。
+	// platform.claude.com：/usage 订阅用量端点，经此换真 token 才能拉到真实档位（恢复 egress-chokepoint
+	// 原计划的 /usage；否则设备直连带占位 token 拉不到、fallback 成 "API" 显示）。
 	fp := proxy.NewForwardProxy(minter, store, up, nil,
-		[]string{"api.anthropic.com", "console.anthropic.com"}, outerCert, 512)
+		[]string{"api.anthropic.com", "console.anthropic.com", "platform.claude.com"}, outerCert, 512)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
