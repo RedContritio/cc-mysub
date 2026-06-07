@@ -65,7 +65,7 @@ func runInstall(t *testing.T, configURL string, releaseBase string) (string, str
 	cmd.Env = append(os.Environ(),
 		"HOME="+home,
 		"CC_MYSUB_RELEASE_BASE_URL="+releaseBase,
-		"CC_MYSUB_SKIP_ENROLL=1",
+		"CC_MYSUB_SKIP_POLL=1",
 	)
 	out, err := cmd.CombinedOutput()
 	return home, string(out), err
@@ -75,8 +75,8 @@ func TestInstall_BinaryAndCA_Placed(t *testing.T) {
 	if plat() == "" {
 		t.Skip("unsupported platform")
 	}
-	// 用真 cc-mysub 二进制(当前测试进程同源构建) 当被下载物 —— 简化: 用任意非空字节即可验证 sha-pin+落盘。
-	binBytes := []byte("#!/bin/sh\necho fake-cc-mysub\n")
+	// install.sh 现在跑到 device-init，被下载物需是真 cc-mysub 二进制（同源构建）。
+	binBytes := buildRealBin(t)
 	relBase := startReleaseMock(t, "redcontritio/cc-mysub", "v0.0.0-test", binBytes, true)
 	confURL := startConfigMock(t, `{"public_host":"ccapi.example.com","subscription_type":"max","release_repo":"redcontritio/cc-mysub","release_tag":"v0.0.0-test","ca_cert_pem":"-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n"}`)
 	home, out, err := runInstall(t, confURL, relBase)
@@ -108,5 +108,55 @@ func TestInstall_BadSha_FailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(out, "sha256 校验失败") {
 		t.Errorf("expected sha failure message, got: %s", out)
+	}
+}
+
+// buildRealBin 构建当前平台真 cc-mysub 二进制字节，供 release mock 下发(device-init 需真二进制)。
+func buildRealBin(t *testing.T) []byte {
+	t.Helper()
+	repoRoot, _ := filepath.Abs("../..")
+	out := filepath.Join(t.TempDir(), "cc-mysub")
+	cmd := exec.Command("go", "build", "-o", out, "./cmd/cc-mysub")
+	cmd.Dir = repoRoot
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build cc-mysub: %v\n%s", err, b)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestInstall_DeviceInitAndWrapper(t *testing.T) {
+	if plat() == "" {
+		t.Skip("unsupported platform")
+	}
+	binBytes := buildRealBin(t)
+	relBase := startReleaseMock(t, "redcontritio/cc-mysub", "v0.0.0-test", binBytes, true)
+	confURL := startConfigMock(t, `{"public_host":"ccapi.example.com","subscription_type":"max","release_repo":"redcontritio/cc-mysub","release_tag":"v0.0.0-test","ca_cert_pem":"-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n"}`)
+	repoRoot, _ := filepath.Abs("../..")
+	home := t.TempDir()
+	cmd := exec.Command("bash", filepath.Join(repoRoot, "install.sh"), confURL, "installtest")
+	cmd.Env = append(os.Environ(), "HOME="+home, "CC_MYSUB_RELEASE_BASE_URL="+relBase, "CC_MYSUB_SKIP_POLL=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("install.sh err=%v out=%s", err, out)
+	}
+	for _, f := range []string{".config/cc-mysub/device.key", ".config/cc-mysub/device.crt", ".local/bin/myclaude"} {
+		if _, err := os.Stat(filepath.Join(home, f)); err != nil {
+			t.Errorf("missing %s: %v", f, err)
+		}
+	}
+	// device.key 0600
+	if fi, _ := os.Stat(filepath.Join(home, ".config/cc-mysub/device.key")); fi != nil && fi.Mode().Perm() != 0o600 {
+		t.Errorf("device.key perm = %o, want 600", fi.Mode().Perm())
+	}
+	// myclaude 含正确 host + 无 per-device 秘密
+	w, _ := os.ReadFile(filepath.Join(home, ".local/bin/myclaude"))
+	if !strings.Contains(string(w), "ccapi.example.com") || !strings.Contains(string(w), "helper --host") {
+		t.Errorf("myclaude wrong: %s", w)
+	}
+	if strings.Contains(string(w), "PRIVATE KEY") || strings.Contains(string(w), "sk-ant-oat") {
+		t.Errorf("myclaude leaked secret")
 	}
 }

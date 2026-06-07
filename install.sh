@@ -56,5 +56,51 @@ fi
 printf '%s\n' "$CA_PEM" > "$CFG/ca.crt"
 echo "[cc-mysub] 二进制 + CA 就位。" >&2
 
-# 测试钩子: 写完 CA 即退出, 使 Task 3 用例不依赖 device-init/轮询(Task 4 在此后追加入网逻辑)。
-[ -n "${CC_MYSUB_SKIP_ENROLL:-}" ] && exit 0
+# ⑤ device-init (幂等; 私钥不离机)
+INIT_OUT="$(XDG_CONFIG_HOME="${HOME}/.config" "$BIN" device-init -label "$LABEL")"
+FP="$(printf '%s' "$INIT_OUT" | grep -oE '[0-9a-f]{64}' | head -1)"
+[ -n "$FP" ] || { echo "cc-mysub: device-init 未产出指纹" >&2; exit 1; }
+
+echo >&2
+echo "[cc-mysub] 本设备指纹:" >&2
+echo "    $FP" >&2
+echo "[cc-mysub] 请在代理主机登记: cc-mysub add-device --fingerprint $FP --label $LABEL" >&2
+
+# ⑥ 轮询现有 mTLS 端点等批准 (零新增公网面)
+probe_ok() {  # 用设备证书试 mTLS 握手 + CONNECT; 通过(已登记)=0
+  local out
+  out=$( { printf 'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\n\r\n'; sleep 2; } | \
+    openssl s_client -quiet -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
+      -cert "$CFG/device.crt" -key "$CFG/device.key" 2>&1 )
+  printf '%s' "$out" | grep -qiE 'HTTP/1\.[01] 200'
+}
+if [ -z "${CC_MYSUB_SKIP_POLL:-}" ]; then
+  echo "[cc-mysub] 等待批准中 (登记后自动继续; Ctrl-C 可中断, 稍后重跑本命令) ..." >&2
+  DEADLINE=$(( $(date +%s) + 600 ))
+  until probe_ok; do
+    [ "$(date +%s)" -lt "$DEADLINE" ] || { echo "cc-mysub: 等待超时, 登记后重跑本命令即可。" >&2; exit 0; }
+    sleep 4
+  done
+  echo "[cc-mysub] 已批准。" >&2
+fi
+
+# ⑦ 写 myclaude daily wrapper
+cat > "$WRAP" <<WRAP
+#!/usr/bin/env bash
+D="\$HOME/.config/cc-mysub"
+exec env \\
+  NODE_EXTRA_CA_CERTS="\$D/ca.crt" \\
+  CLAUDE_CODE_OAUTH_TOKEN="cco_dev_placeholder" \\
+  CLAUDE_CODE_OAUTH_SCOPES="user:inference" \\
+  CLAUDE_CODE_SUBSCRIPTION_TYPE="${SUB_TYPE}" \\
+  "${BIN}" helper --host "${PUBLIC_HOST}" \\
+    --client-cert "\$D/device.crt" --client-key "\$D/device.key" \\
+    -- claude "\$@"
+WRAP
+chmod +x "$WRAP"
+
+case ":$PATH:" in *":$BINDIR:"*) ;; *)
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${HOME}/.bashrc"
+  echo "[cc-mysub] 已加 ~/.local/bin 到 ~/.bashrc(重开终端或 source 生效)。" >&2 ;;
+esac
+echo "[cc-mysub] 完成 ✓  用法: myclaude  /  myclaude -p \"…\"" >&2
