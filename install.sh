@@ -5,7 +5,7 @@
 set -euo pipefail
 
 CONFIG_URL="${1:-}"; LABEL="${2:-}"
-if [ -z "$CONFIG_URL" ]; then printf '部署配置 URL: ' >&2; read -r CONFIG_URL </dev/tty; fi
+if [ -z "$CONFIG_URL" ]; then printf '部署配置 URL: ' >&2; read -r CONFIG_URL </dev/tty || true; fi
 [ -n "$CONFIG_URL" ] || { echo "cc-mysub: 需要配置 URL" >&2; exit 1; }
 if [ -z "$LABEL" ]; then
   printf '设备 label [%s]: ' "$(hostname)" >&2; read -r LABEL </dev/tty || true
@@ -53,7 +53,7 @@ if [ ! -x "$BIN" ]; then
   chmod 0755 "$tmp"; mv "$tmp" "$BIN"
 fi
 
-printf '%s\n' "$CA_PEM" > "$CFG/ca.crt"
+printf '%s\n' "$CA_PEM" > "$CFG/ca.crt"; chmod 0644 "$CFG/ca.crt"  # §5 step4: 0644，不随 umask
 echo "[cc-mysub] 二进制 + CA 就位。" >&2
 
 # ⑤ device-init (幂等; 私钥不离机)
@@ -67,18 +67,44 @@ echo "    $FP" >&2
 echo "[cc-mysub] 请在代理主机登记: cc-mysub add-device --fingerprint $FP --label $LABEL" >&2
 
 # ⑥ 轮询现有 mTLS 端点等批准 (零新增公网面)
-probe_ok() {  # 用设备证书试 mTLS 握手 + CONNECT; 通过(已登记)=0
-  local out
-  out=$( { printf 'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\n\r\n'; sleep 2; } | \
+# 探针三态 (§6): approved = CONNECT 200(已登记) / unapproved = mTLS 拒未登记证书(继续等) /
+#   unreachable = 连不上/DNS/超时(非批准问题 → 快退)。区分二者才不会把不可达白等到超时。
+PROBE_OUT="" PROBE_STATE=""
+probe() {  # 设 PROBE_STATE=approved|unapproved|unreachable; PROBE_OUT=探针原始输出(供错误摘要)
+  PROBE_OUT=$( { printf 'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: x\r\n\r\n'; sleep 2; } | \
     openssl s_client -quiet -connect "$PUBLIC_HOST:443" -servername "$PUBLIC_HOST" \
-      -cert "$CFG/device.crt" -key "$CFG/device.key" 2>&1 )
-  printf '%s' "$out" | grep -qiE 'HTTP/1\.[01] 200'
+      -cert "$CFG/device.crt" -key "$CFG/device.key" 2>&1 ) || true
+  if printf '%s' "$PROBE_OUT" | grep -qiE 'HTTP/1\.[01] 200'; then
+    PROBE_STATE=approved
+  elif printf '%s' "$PROBE_OUT" | grep -qiE 'certificate required|bad certificate|alert .*certificate'; then
+    PROBE_STATE=unapproved   # 服务端 alert 42/CertificateRequired = 未登记，继续等
+  else
+    PROBE_STATE=unreachable  # connect:errno/refused/DNS/no route/空输出/超时
+  fi
+}
+probe_err_summary() {  # 从最近探针输出摘一行可读错误; 取不到回退占位
+  local s
+  s=$(printf '%s' "$PROBE_OUT" | grep -ioE 'connection refused|connect:errno=[0-9]+|name or service not known|nodename nor servname[^,]*|no route to host|operation timed out|timed out|gethostbyname[^ ]*' | head -1)
+  [ -n "$s" ] || s='无响应/超时'
+  printf '%s' "$s"
 }
 if [ -z "${CC_MYSUB_SKIP_POLL:-}" ]; then
   echo "[cc-mysub] 等待批准中 (登记后自动继续; Ctrl-C 可中断, 稍后重跑本命令) ..." >&2
   DEADLINE=$(( $(date +%s) + 600 ))
-  until probe_ok; do
-    [ "$(date +%s)" -lt "$DEADLINE" ] || { echo "cc-mysub: 等待超时, 登记后重跑本命令即可。" >&2; exit 0; }
+  miss=0   # 连续 unreachable 计数: 容忍瞬断, 连续 3 次才判定不可达(避免一次抖动就退)
+  while :; do
+    probe
+    case "$PROBE_STATE" in
+      approved) break ;;
+      unapproved) miss=0 ;;
+      unreachable)
+        miss=$((miss + 1))
+        if [ "$miss" -ge 3 ]; then
+          echo "cc-mysub: 无法连接 $PUBLIC_HOST:443（$(probe_err_summary)）——检查 host/DNS/frps" >&2
+          exit 1
+        fi ;;
+    esac
+    [ "$(date +%s)" -lt "$DEADLINE" ] || { echo "cc-mysub: 等待超时, 登记后重跑本命令即可。" >&2; exit 1; }
     sleep 4
   done
   echo "[cc-mysub] 已批准。" >&2
@@ -99,8 +125,22 @@ exec env \\
 WRAP
 chmod +x "$WRAP"
 
-case ":$PATH:" in *":$BINDIR:"*) ;; *)
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "${HOME}/.bashrc"
-  echo "[cc-mysub] 已加 ~/.local/bin 到 ~/.bashrc(重开终端或 source 生效)。" >&2 ;;
+# 确保 ~/.local/bin 进 PATH。macOS 默认 zsh 不读 ~/.bashrc，故同时写 bash 与 zsh 的 rc(幂等)。
+ensure_path_in() {  # ensure_path_in <rcfile>: 幂等追加 PATH 导出 + 提示 source
+  local rc="$1" line='export PATH="$HOME/.local/bin:$PATH"'
+  if [ -f "$rc" ] && grep -qF "$line" "$rc" 2>/dev/null; then return 0; fi
+  printf '%s\n' "$line" >> "$rc"
+  echo "[cc-mysub] 已加 ~/.local/bin 到 $rc(source $rc 或重开终端生效)。" >&2
+}
+case ":$PATH:" in
+  *":$BINDIR:"*) ;;  # 已在 PATH，无需改 rc
+  *)
+    ensure_path_in "${HOME}/.bashrc"
+    # zsh rc: 优先已存在的 ~/.zshrc，否则 ~/.zprofile；都无则按 $SHELL=zsh 建 ~/.zshrc
+    if [ -f "${HOME}/.zshrc" ]; then ZRC="${HOME}/.zshrc"
+    elif [ -f "${HOME}/.zprofile" ]; then ZRC="${HOME}/.zprofile"
+    elif [ "${SHELL##*/}" = zsh ]; then ZRC="${HOME}/.zshrc"
+    else ZRC=""; fi
+    if [ -n "$ZRC" ]; then ensure_path_in "$ZRC"; fi ;;
 esac
 echo "[cc-mysub] 完成 ✓  用法: myclaude  /  myclaude -p \"…\"" >&2

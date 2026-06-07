@@ -65,6 +65,32 @@ func TestAddDeviceSubcommand(t *testing.T) {
 	}
 }
 
+// TestAddDeviceRejectsReleaseFlag 锁定收口：onboarding 分发已移交 install.sh，
+// add-device 不再有 --release（连同 RenderWrapper/fetchManifest 整套删除）。
+// 误带 --release 必须报「未知 flag」并非零退出，而非被静默忽略。
+func TestAddDeviceRejectsReleaseFlag(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+	bin := filepath.Join(t.TempDir(), "cc-mysub")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	cfgDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"),
+		[]byte(`{"client":{"public_host":"h","subscription_type":"max"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(bin, "add-device", "--config-dir", cfgDir,
+		"--label", "phone", "--fingerprint", strings.Repeat("a", 64), "--release", "v1").CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit for removed --release flag, out=%s", out)
+	}
+	if !strings.Contains(string(out), "not defined") || !strings.Contains(string(out), "release") {
+		t.Errorf("expected unknown-flag error mentioning release, got:\n%s", out)
+	}
+}
+
 // TestAddDeviceRequiresLabel verifies the contract surfaces as a non-zero exit.
 func TestAddDeviceRequiresLabel(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
