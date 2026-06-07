@@ -22,7 +22,7 @@ func runHelper(args []string) int {
 		host       = fs.String("host", "", "cc-mysub 域名 host（拨 host:443 + 外层 TLS ServerName，必填）")
 		clientCert = fs.String("client-cert", "", "本设备客户端证书路径（device-init 生成，必填）")
 		clientKey  = fs.String("client-key", "", "本设备私钥路径（device-init 生成，必填）")
-		allowCSV   = fs.String("allow", "api.anthropic.com,console.anthropic.com,platform.claude.com", "链到 cc-mysub 的 host（逗号分隔）")
+		allowCSV   = fs.String("allow", "api.anthropic.com,console.anthropic.com", "链到 cc-mysub 的 host（逗号分隔）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
