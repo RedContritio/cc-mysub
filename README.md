@@ -23,17 +23,21 @@ frp 入口层用 **`type=https` SNI 透传**（不带 `https2http` 插件）—�
 
 ## 客户端工作方式（mTLS 形态）
 
-`add-device` 生成的 `myclaude` wrapper 是**自举型 + 通用型**（无 per-device 秘密，全 fleet 可复用同一文件）：首次运行自动按 `uname` 下载对应平台的 `cc-mysub` 二进制（sha256 校验 fail-closed）、写出内联 CA 公证书、并跑一次 `cc-mysub device-init` 在设备本地生成密钥/证书并打印指纹。末行核心形如：
+设备日常用的 `myclaude` wrapper 由 `install.sh` 在自助入网时写到 `~/.local/bin/myclaude`（见下「签发一台设备」）——它是个薄封装，只设环境并 `exec cc-mysub helper`。下载二进制（按 `uname`、`SHA256SUMS` 校验 fail-closed）、写出内层 CA、跑 `device-init` 在设备本地生成密钥/证书并打印指纹这些自举步骤由 `install.sh` 完成，不在 wrapper 运行时。wrapper 末行核心形如：
 
 ```bash
-exec "$CC_MYSUB_BIN" helper \
-  --host <public_host> \
-  --client-cert ~/.config/cc-mysub/device.crt \
-  --client-key  ~/.config/cc-mysub/device.key \
-  -- claude "$@"
+exec env \
+  NODE_EXTRA_CA_CERTS=~/.config/cc-mysub/ca.crt \
+  CLAUDE_CODE_OAUTH_TOKEN=cco_dev_placeholder \
+  CLAUDE_CODE_OAUTH_SCOPES=user:inference \
+  CLAUDE_CODE_SUBSCRIPTION_TYPE=<tier> \
+  ~/.local/bin/cc-mysub helper --host <public_host> \
+    --client-cert ~/.config/cc-mysub/device.crt \
+    --client-key  ~/.config/cc-mysub/device.key \
+    -- claude "$@"
 ```
 
-wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA 做内层 MITM 验证）、固定占位 `CLAUDE_CODE_OAUTH_TOKEN`、`CLAUDE_CODE_OAUTH_SCOPES=user:inference`、`CLAUDE_CODE_SUBSCRIPTION_TYPE`。`HTTPS_PROXY` 由 helper 在运行时注入（指向本地临时端口），**不在 wrapper 中硬编码**。占位 token 的值非凭据——身份由客户端证书承载，cc-mysub 忽略其值、按证书指纹识别设备并换发真 token。
+`NODE_EXTRA_CA_CERTS` 让 CC 信任 cc-mysub CA 做内层 MITM 验证；`CLAUDE_CODE_OAUTH_TOKEN` 是固定占位（`cco_dev_placeholder`），`CLAUDE_CODE_OAUTH_SCOPES=user:inference`、`CLAUDE_CODE_SUBSCRIPTION_TYPE` 为档位声明。`HTTPS_PROXY` 由 helper 在运行时注入（指向本地临时端口），**不在 wrapper 中硬编码**。占位 token 的值非凭据——身份由客户端证书承载，cc-mysub 忽略其值、按证书指纹识别设备并换发真 token。
 
 设备**无需设置 `ANTHROPIC_BASE_URL`**——`base_url` 保持默认 `api.anthropic.com`，helper 的分流逻辑负责把 Anthropic 流量路由到 cc-mysub。
 
@@ -64,14 +68,14 @@ wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA 做内层 MITM �
 | `upstream.json` | token 池：`{"oauthTokens":[{"id":"a","token":"sk-ant-oat01-..."}]}`（chmod 600；旧式 `{"oauthToken":"..."}` 单 token 仍可用）| chmod 600 |
 | `devices.json` | `[{"label":"laptop","cert_sha256":"<64 lowercase hex>","upstream":"a","rate_limit":120}]`，由 `add-device` 维护；`cert_sha256` = 设备客户端证书指纹，`upstream` 指向使用哪个池中 token | — |
 | `certs/<public_host>.{crt,key}` | 外层身份用的真 LE 证书+私钥；cc-mysub 自终结外层 TLS 时加载（续期热重载）| key 0600 |
-| `ca.crt` | cc-mysub 自有 CA 公证书（仅内层 MITM 用），由 `add-device` 首次生成（幂等）；已内联进 wrapper，设备首次运行时自动写出 | 0644 |
+| `ca.crt` | cc-mysub 自有 CA 公证书（仅内层 MITM 用），由 `add-device` 首次生成（幂等）；经 `gen-config` 内联进部署配置（`ca_cert_pem`）下发，`install.sh` 在设备侧写出 | 0644 |
 | `ca.key` | 内层 MITM CA 私钥，由 `add-device` 首次生成，**永不入 git、永不离开本机** | 0600 |
 
 代理只存 per-device 证书的指纹（公开值），从不持有设备私钥。文件改动通过 mtime polling 热重载，无需重启。
 
-### 签发一台设备：`device-init`（设备）+ `add-device`（代理主机）
+### 签发一台设备：`gen-config`（发布）+ `install.sh`（设备自助）+ `add-device`（批准）
 
-把面向客户端的部署常量一次性写进 `config.json` 的 `client` 段（对一套部署固定不变；通用 wrapper 无 per-device 秘密）：
+把面向客户端的部署常量一次性写进 `config.json` 的 `client` 段（对一套部署固定不变；无 per-device 秘密）：
 
 ```json
 {
@@ -83,32 +87,50 @@ wrapper 本身设置 `NODE_EXTRA_CA_CERTS`（信任 cc-mysub CA 做内层 MITM �
 }
 ```
 
-通用 wrapper 一次生成、全 fleet 复用：
+入网分三步（私钥不离设备 + 逐设备认证的必然一次往返）：
+
+**① operator 发布部署配置（每个 release 一次）**
 
 ```bash
-cc-mysub add-device --label laptop --fingerprint <设备指纹> --release v1.0.0
-# 入网是一次往返(私钥不离设备 + 逐设备认证的必然):
-#  1) 把通用 wrapper 拷到设备 PATH, 首次运行 → 下载二进制 + 写 CA + device-init 打印本设备指纹后退出
-#  2) 在代理主机: add-device --label <X> --fingerprint <上一步的指纹>  → 写 devices.json(cert_sha256)
-#  3) 设备 re-run → mTLS 握手通过, 正常工作
-# (本命令同时: 从 GitHub Releases 下载 SHA256SUMS 烤入 wrapper; 首次生成 ca.crt/ca.key)
+cc-mysub gen-config --release v1.0.0 > deploy.json
+# 把 deploy.json 发布到一个 HTTPS URL（如 GitHub gist 的 raw 链接），
+# 带外（私信/IM）把该 URL 给设备用户。
 ```
 
-### 设备接入（通用 wrapper + 一次登记往返）
-
-把生成的通用 wrapper（如 `myclaude-laptop`，与任何设备同字节）拷到设备 PATH（如 `~/.local/bin/myclaude`）。首次运行自动按 `uname` 从 GitHub Releases 下载对应平台的 `cc-mysub` 二进制（sha256 校验 fail-closed）、写出内联 CA 到 `~/.config/cc-mysub/ca.crt`、跑 `device-init` 在本地生成 `device.key`(0600)/`device.crt` 并**打印本设备证书指纹**后退出，提示你去代理主机登记。登记（`add-device --fingerprint`）后 re-run 即正常。
+`gen-config` 读 `config.json` 的 `client` 段 + `ca.crt`，产出部署配置 JSON（`public_host` / `subscription_type` / `release_repo` / `release_tag` / `ca_cert_pem`，全是公开常量、无密钥）。
 
 - `--release <tag>` 必填，钉定二进制版本（无默认 latest，杜绝移动目标）。
+- `--release-repo <owner/repo>` 可覆盖二进制托管点（默认 config `client.release_repo`，再退到 `redcontritio/cc-mysub`）。
+- `ca.crt` 须已存在（首次跑一次 `add-device` 即幂等生成 CA）。
+
+**② 设备自助安装（设备用户跑）**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/redcontritio/cc-mysub/main/install.sh | sh -s -- <配置URL> [label]
+# 无参时交互式提示「配置 URL」+「label」（label 默认主机名）。幂等可重跑。
+```
+
+`install.sh` 拉取配置 → 按 `uname` 下载对应平台二进制（`SHA256SUMS` 校验 fail-closed）→ 写出内层 CA 到 `~/.config/cc-mysub/ca.crt` → 跑 `device-init` 在本地生成 `device.key`(0600)/`device.crt`（**私钥永不离开设备**）→ **打印本设备证书指纹**并提示去代理主机登记 → 轮询现有 mTLS 端点等批准（登记后自动继续；Ctrl-C 可中断、稍后重跑本命令）→ 写好 `~/.local/bin/myclaude` daily wrapper。
+
+- 支持平台：`linux/darwin × amd64/arm64`（Windows 不支持，install.sh 是 bash）。
+- 依赖：`curl` + (`jq` 或 `python3`) + `openssl` + `sha256sum`/`shasum`。
+- 配置交付走 **TOFU**（trust-on-first-use）：HTTPS 传输 + operator 带外给的可信 URL。设备据此写出并信任内层 CA——**配置源被篡改即可让设备信任伪造 CA**，此残余风险见 [`SECURITY.md`](SECURITY.md) 与上文「已知限制」。
+
+**③ operator 批准（代理主机）**
+
+```bash
+cc-mysub add-device --fingerprint <设备打印的指纹> --label <X>
+# 仅登记: 把该指纹写进 devices.json(cert_sha256)。add-device 不再生成/分发 wrapper。
+```
+
+设备 ② 的轮询见到批准后自动装好 `myclaude` 并提示完成；之后在该设备上用 `myclaude` 代替 `claude` 即可。
+
 - `--fingerprint <64hex>` 必填（或 `--client-cert <file>` 自动算指纹）= 设备 `device-init` 打印的指纹。
-- 换证书：设备重跑 `device-init` 得新指纹 → `add-device --rotate --label <label> --fingerprint <newfp>` 原地换发（删旧指纹行=吊销旧证书、写新指纹、覆写 wrapper）。（`--rotate` 是布尔 flag，须与 `--label` 一起给。）
-- 平台：`linux/darwin × amd64/arm64`（Windows 不支持，wrapper 是 bash）。
-- 二进制托管点默认 `redcontritio/cc-mysub` 的 GitHub Releases，可经 config `client.release_repo` 或 `--release-repo` 覆盖。
+- 部署常量可用 flag 覆盖（`--host` / `--sub` / `--rate-limit` / `--upstream`(池 id) / `--config-dir`）。`--release` 不在此命令——它属于 `gen-config`。
+- 换证书：设备重跑 `install.sh`（或 `device-init`）得新指纹 → `add-device --rotate --label <label> --fingerprint <newfp>` 原地换发（删旧指纹行=吊销旧证书、写新指纹）。（`--rotate` 是布尔 flag，须与 `--label` 一起给。）
+- 如需 classifier 小模型，自行在 `~/.local/bin/myclaude` 里加 `ANTHROPIC_SMALL_FAST_MODEL` 环境变量。
 
-之后在该设备上用 `myclaude` 代替 `claude` 即可。helper 拨 `<public_host>:443`（DNS 解析到 frps），外层 mTLS 出示本设备客户端证书 + 系统信任验真 LE；non-Anthropic 流量 helper 本地直连，不经 cc-mysub。
-
-部署常量可用 flag 覆盖（`--host` / `--sub` / `--rate-limit` / `--upstream`(池 id) / `--release-repo` / `--out` / `--config-dir`）。生成的 wrapper **不会**替你预设 classifier 小模型（`ANTHROPIC_SMALL_FAST_MODEL`）；需要时取消 wrapper 里那行注释、自行填入即可。
-
-代理热重载会自动加载新设备，无需重启。
+helper 拨 `<public_host>:443`（DNS 解析到 frps），外层 mTLS 出示本设备客户端证书 + 系统信任验真 LE；non-Anthropic 流量 helper 本地直连，不经 cc-mysub。代理热重载会自动加载新设备，无需重启。
 
 **吊销**：删掉 `devices.json` 里对应那一行（该设备指纹）即可，热重载后该设备立即失效，其他设备无感。
 
