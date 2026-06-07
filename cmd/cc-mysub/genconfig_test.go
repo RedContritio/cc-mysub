@@ -45,6 +45,28 @@ func TestGenConfig_OutputsAllFields(t *testing.T) {
 	}
 }
 
+// TestGenConfig_ConfigDirFlag 验证 -config-dir flag 覆盖 main 分发的默认 cfgDir：
+// 把一个不存在的目录作为默认 cfgDir 传入，再用 -config-dir 指向真实 tempdir，
+// gen-config 仍能从 -config-dir 读到 config.json + ca.crt 并产出配置。
+func TestGenConfig_ConfigDirFlag(t *testing.T) {
+	d := writeGenCfgDir(t)
+	bogusDefault := filepath.Join(t.TempDir(), "nonexistent")
+	var out bytes.Buffer
+	if rc := runGenConfig([]string{"-config-dir", d, "-release", "v9.9.9"}, bogusDefault, &out); rc != 0 {
+		t.Fatalf("rc=%d out=%s", rc, out.String())
+	}
+	var dc DeployConfig
+	if err := json.Unmarshal(out.Bytes(), &dc); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, out.String())
+	}
+	if dc.PublicHost != "ccapi.example.com" || dc.ReleaseTag != "v9.9.9" {
+		t.Errorf("config from -config-dir wrong: %+v", dc)
+	}
+	if !bytes.Contains([]byte(dc.CACertPEM), []byte("BEGIN CERTIFICATE")) {
+		t.Errorf("CA not inlined from -config-dir: %q", dc.CACertPEM)
+	}
+}
+
 func TestGenConfig_FailsWithoutRelease(t *testing.T) {
 	d := writeGenCfgDir(t)
 	var out bytes.Buffer

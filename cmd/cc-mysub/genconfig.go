@@ -22,14 +22,18 @@ type DeployConfig struct {
 }
 
 // runGenConfig 读 <cfgDir>/config.json 的 client 段 + <cfgDir>/ca.crt，产出部署配置 JSON 到 out。
+// cfgDir 为默认配置目录（main 分发 defaultConfigDir()）；-config-dir flag 可覆盖之，
+// 与 add-device 的 -config-dir 一致，使 e2e/测试可指向任意目录。
 func runGenConfig(args []string, cfgDir string, out io.Writer) int {
 	fs := flag.NewFlagSet("gen-config", flag.ContinueOnError)
 	fs.SetOutput(out)
+	configDir := fs.String("config-dir", cfgDir, "config directory (默认 = 默认配置目录)")
 	release := fs.String("release", "", "cc-mysub release tag (必填, 如 v1.0.0)")
 	repo := fs.String("release-repo", "", "release 托管 owner/repo (覆盖 config client.release_repo)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+	cfgDir = *configDir
 	cfg, err := config.LoadConfig(filepath.Join(cfgDir, "config.json"))
 	if err != nil {
 		fmt.Fprintln(out, "load config:", err)
