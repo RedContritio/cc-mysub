@@ -1,0 +1,33 @@
+name: egress-audit
+# 非 hermetic：跑真 claude latest（npm latest）。不挂 PR 阻塞，手动 / 周跑。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # 周一 06:00 UTC
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: install system deps
+        run: |
+          sudo apt-get update -qq
+          # openssl: audit CA + api.anthropic.com/evil.example leaves (stage_split).
+          # ca-certificates: provides update-ca-certificates to install the audit CA
+          # into the system trust store so cc-mysub's default transport trusts the
+          # mock's api.anthropic.com cert (v4 audit wrinkle).
+          sudo apt-get install -y -qq dnsmasq dnsutils iproute2 iptables openssl ca-certificates curl
+          sudo systemctl stop dnsmasq 2>/dev/null || true   # 释放宿主 :53（沙箱内自起实例）
+      - name: install claude (latest)
+        run: npm i -g @anthropic-ai/claude-code
+      - name: unit tests
+        run: go test ./ci/egress/...
+      - name: run egress audit (v4 split-egress coverage guard)
+        run: sudo -E "$(command -v bash)" ci/egress/run.sh --split

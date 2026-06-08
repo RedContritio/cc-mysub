@@ -1,0 +1,25 @@
+# 本地开发工作流产物（superpowers spec/plan）—— 不属于开源仓库
+docs/superpowers/
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+
+# 编译产物
+/cc-mysub
+*.exe
+dist/
+
+# 日志
+*.log
+
+# 本地真实配置与凭据 —— 绝不提交（用 config.example.json 作模板）
+config.json
+upstream.json
+devices.json
+certs/
+
+# per-device wrapper(嵌明文 DEVICE_TOKEN)与私钥(防 --config-dir=. 落进 work tree)
+myclaude-*
+*.key
