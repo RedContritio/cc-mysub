@@ -14,7 +14,7 @@
 
 ### 网络层
 
-- **TLS 指纹(JA3/JA4)、HTTP/2 指纹**:由 CC 的网络栈(Node.js / undici)决定,**不是中转能选择的**。跑真 CC → 指纹落在「真 CC」的分布内。注意它随 Node 版本变(本机 v24、审计容器 v20 即不同),所以"同出口普通登录设备"本身也不是单一指纹,而是一族真 CC 指纹;中转设备只要也跑真 CC,就在同一族内。**前提是中转不重构请求、内层 TLS 由真 CC 自己发起**(见 §2)。
+- **TLS 指纹(JA3/JA4)、HTTP/2 指纹**:由 CC 的网络栈(Node.js / undici)决定,**不是中转能选择的**。跑真 CC → 指纹落在「真 CC」的分布内。注意它随 Node 版本变(本机 v24、审计容器 v20 即不同),所以"同出口普通登录设备"本身也不是单一指纹,而是一族真 CC 指纹;中转设备只要也跑真 CC,就在同一族内。**前提是中转不重构请求、内层 TLS 由真 CC 自己发起**(见 §3)。
 - **出口 IP**:中转后 = 出口服务器的 IP。在「同出口」基线下,这正是预期——基线就是多设备共用这一个出口。
 
 ### 认证层
@@ -23,7 +23,7 @@
 - **OAuth scopes**:`claude setup-token` 产出的凭据含 `user:inference` / `user:sessions:claude_code` / `user:mcp_servers`,**不含 `user:profile`**(setup-token 没有选 scope 的入口)。
 - **beta header `anthropic-beta: oauth-2025-04-20`**:订阅认证模式的标志,由 CC 在检测到 OAuth token 时自动带上。
 
-这些头**由 CC 根据环境(`CLAUDE_CODE_OAUTH_TOKEN` 等)自行构造**。中转要处理的只有 token 的**值**(见 §2),头的**格式、scope 声明、beta 标志都是 CC 发的**,天然等效。
+这些头**由 CC 根据环境(`CLAUDE_CODE_OAUTH_TOKEN` 等)自行构造**。中转要处理的只有 token 的**值**(见 §3),头的**格式、scope 声明、beta 标志都是 CC 发的**,天然等效。
 
 ### client metadata
 
@@ -44,7 +44,25 @@
 
 ---
 
-## 2. 中转如何处理使其等效
+## 2. CC 访问哪些端点 / 转发哪些
+
+CC 运行时会触及多个端点(下表据 Claude Code 官方 `network-config` / `data-usage` 文档,版本 2.1.x;可选项可由 env 关闭)。等效转发的原则:**只收口需要真订阅凭据的那一个端点,其余全部本地直连**——这既把 MITM 面缩到最小,也与「普通登录设备」的网络行为一致(普通设备这些同样是直连)。
+
+| 端点 | 用途 | 处理 |
+|---|---|---|
+| `api.anthropic.com` | 推理(`/v1/messages`)、OAuth token 使用、WebFetch 域名预检(`/api/web/domain_info`)、`/feedback` | **转发**(经中转换发真 token) |
+| `claude.ai` / `platform.claude.com` | 交互式登录认证 | 不参与——中转用 `setup-token` 预生成凭据,运行时不交互登录 |
+| Anthropic 内部遥测(域名未公开) / `sentry.io` | 操作指标 / 错误报告 | 直连(或 `DISABLE_TELEMETRY` / `DISABLE_ERROR_REPORTING` 关) |
+| `downloads.claude.ai`(2.1.116+;旧版 `storage.googleapis.com`) / `raw.githubusercontent.com` / npm registry | 自动更新 / 版本说明 / 包安装 | 直连(或 `DISABLE_AUTOUPDATER`) |
+| WebFetch 用户 URL / MCP server / 工具里的包管理器 | 用户内容 / 工具执行 | 直连(任意外部主机,与订阅无关) |
+
+**为什么只转发 `api.anthropic.com`**:订阅凭据(真 token)只在这个端点上被使用——它是唯一需要中转换发真 token 的流量。其余端点要么与订阅凭据无关(遥测 / 更新 / WebFetch),要么在 `setup-token` 场景根本不触发(登录端点)。把它们也拉进中转只会扩大 MITM 面、增加可被区分于「普通登录」的处理痕迹,违背等效与最小 TCB。
+
+> 控制面登录域名官方文档现用 `platform.claude.com`(早期为 `console.anthropic.com`);无论哪个都属交互登录端点,`setup-token` 预生成凭据的中转场景运行时不依赖它。
+
+---
+
+## 3. 中转如何处理使其等效
 
 原则:**只搬运、不重构、不注入**。CC 发什么就转发什么,中转只在凭据与出口两处做最小必要处理。
 
@@ -65,14 +83,14 @@
 
 ---
 
-## 3. 环境搭建(最小要件)
+## 4. 环境搭建(最小要件)
 
 抽象出与具体实现无关的四个要件:
 
 - **统一出口 / 转发点**:一个稳定的公网出口,所有中转设备的 Anthropic 流量经它出网,以满足「同出口」基线。出口同时是真 token 的持有处。
 - **TLS 终结与重加密**:出口处终结来自设备的外层 TLS(用于认证设备身份),再对 `api.anthropic.com` 建立 TLS 转发。重加密仅为读取目标 host 与换发 token;**内层请求由设备上的真 CC 发起**,出口不重构它。
 - **token 管理**:真订阅 token **只**集中在出口,按设备换发;**真 token 永不下发到设备**——设备只持一个非凭据的占位值。这样不可信设备拿不到真凭据,而官方收到的请求带的是真 token,与登录设备等效。
-- **设备接入**:设备跑**官方 CC 二进制**,经一个本地代理只把 `api.anthropic.com` / `console.anthropic.com` 导向出口,其余流量本地直连(不让无关流量经过出口、也不引入额外可观测痕迹)。
+- **设备接入**:设备跑**官方 CC 二进制**,经一个本地代理把**需真凭据的 Anthropic 端点**(`api.anthropic.com`,见 §2 表)导向出口,其余流量(遥测 / 更新 / WebFetch / MCP 等)本地直连——不让无关流量经过出口、也不引入额外可观测痕迹。
 
 ---
 
