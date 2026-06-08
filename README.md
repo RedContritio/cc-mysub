@@ -1,6 +1,8 @@
 # CC MySub
 
-让你**一份 Claude 订阅**被多台设备上的真·Claude Code 复用。每台设备跑的是真正的 Claude Code CLI(**不是** web 终端);订阅凭据只留在你的服务器、永不下发到设备。
+> 还是用我自己的订阅吧……
+
+在任意不可信设备上使用自己的 Claude Code 订阅额度，Anthropic 只能看到流量来自你自己的服务端，不可信设备永远拿不到真实订阅 token。
 
 原理:设备只把 `api.anthropic.com` 流量经 **mTLS** 转发到你的 cc-mysub 服务端换发真 token,其余一切(WebFetch、MCP、更新、包管理器…)本地直连。深入细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、安全与合规见 [`SECURITY.md`](SECURITY.md)、部署运维见 [`docs/OPERATING.md`](docs/OPERATING.md)。
 
@@ -11,7 +13,7 @@
 - 一台**公网服务器**(知道它的公网 IP)
 - 一个 **Claude 订阅**(能跑 `claude setup-token` 拿到 token)
 
-> 没有域名也行:下面用 `<IP>.sslip.io` 这类免费 DNS(自动解析到你的 IP)当主机名,即可签正常的 Let's Encrypt 证书。Let's Encrypt 不签纯 IP,所以需要这一层。
+> 没有域名：下面用 `<IP>.sslip.io` 这类免费 DNS(自动解析到你的 IP)当主机名,即可签正常的 Let's Encrypt 证书。Let's Encrypt 不签纯 IP,所以需要这一层。
 
 ### 一、搭服务端(公网服务器上,做一次)
 
