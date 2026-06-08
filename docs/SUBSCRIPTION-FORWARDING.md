@@ -46,17 +46,23 @@
 
 ## 2. CC 访问哪些端点 / 转发哪些
 
-CC 运行时会触及多个端点(下表据 Claude Code 官方 `network-config` / `data-usage` 文档,版本 2.1.x;可选项可由 env 关闭)。等效转发的原则:**只收口需要真订阅凭据的那一个端点,其余全部本地直连**——这既把 MITM 面缩到最小,也与「普通登录设备」的网络行为一致(普通设备这些同样是直连)。
+CC 运行时会触及多个端点(下表据 Claude Code 官方 `network-config` / `data-usage` / `env-vars` 文档,版本 2.1.x)。处理分三档——**转发 / 禁用 / 直连**。关键判据:**凡发往 Anthropic 基础设施的流量,绝不能从设备直连**(会暴露设备真实 IP + 携带设备本地凭据)——要么经出口,要么禁用。
 
 | 端点 | 用途 | 处理 |
 |---|---|---|
-| `api.anthropic.com` | 推理(`/v1/messages`)、OAuth token 使用、WebFetch 域名预检(`/api/web/domain_info`)、`/feedback` | **转发**(经中转换发真 token) |
-| `claude.ai` / `platform.claude.com` | 交互式登录认证 | 不参与——中转用 `setup-token` 预生成凭据,运行时不交互登录 |
-| Anthropic 内部遥测(域名未公开) / `sentry.io` | 操作指标 / 错误报告 | 直连(或 `DISABLE_TELEMETRY` / `DISABLE_ERROR_REPORTING` 关) |
-| `downloads.claude.ai`(2.1.116+;旧版 `storage.googleapis.com`) / `raw.githubusercontent.com` / npm registry | 自动更新 / 版本说明 / 包安装 | 直连(或 `DISABLE_AUTOUPDATER`) |
-| WebFetch 用户 URL / MCP server / 工具里的包管理器 | 用户内容 / 工具执行 | 直连(任意外部主机,与订阅无关) |
+| `api.anthropic.com` | 推理(`/v1/messages`)、OAuth token 使用、WebFetch 域名预检(`/api/web/domain_info`) | **转发**——经出口换发真 token(唯一需要真凭据的流量) |
+| Anthropic 遥测(域名未公开) / `sentry.io` 错误报告 / `downloads.claude.ai` 自动更新 / `/feedback` bug 上报 | 操作指标 / 错误 / 更新 / 反馈 | **禁用**——`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`(一次性 = `DISABLE_TELEMETRY`+`DISABLE_ERROR_REPORTING`+`DISABLE_AUTOUPDATER`+`DISABLE_BUG_COMMAND`) |
+| `claude.ai` / `platform.claude.com`(早期 `console.anthropic.com`) | 交互式登录认证 | 不触发——中转用 `setup-token` 预生成凭据,运行时不登录 |
+| WebFetch 用户 URL / MCP server / `raw.githubusercontent.com`(版本说明)/ npm registry / 工具里的包管理器 | 用户内容 / 工具执行 / 非 Anthropic 资源 | 直连——与订阅、与 Anthropic 基础设施无关,Anthropic 观测不到 |
 
-**为什么只转发 `api.anthropic.com`**:订阅凭据(真 token)只在这个端点上被使用——它是唯一需要中转换发真 token 的流量。其余端点要么与订阅凭据无关(遥测 / 更新 / WebFetch),要么在 `setup-token` 场景根本不触发(登录端点)。把它们也拉进中转只会扩大 MITM 面、增加可被区分于「普通登录」的处理痕迹,违背等效与最小 TCB。
+**为什么遥测 / 更新 / 错误报告必须禁用、而不能直连**:这些都发往 Anthropic(或其错误报告服务)。若从设备直连:
+
+- **暴露设备真实 IP**:它们从设备本地出网,IP ≠ 统一出口。于是「推理来自出口、遥测来自设备」IP 不一致 → 直接破坏「同出口普通登录设备」等效。
+- **携带设备本地凭据**:中转场景设备 CC 只持**占位 token**(真 token 不下发、只在经出口的 `api.anthropic.com` 流量上换发)。直连遥测若带 `Authorization`,上报的是 Anthropic 不认的占位 token——与「普通设备遥测带真 token」不一致,本身就是异常标识。
+
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` 一次性关掉这一整类,最干净;且普通用户禁用遥测 / 更新本就是合法常见配置,仍落在「普通设备」行为分布内。(也可改为把它们一并经出口转发,但端点域名未公开 + 占位 token 问题 → 禁用更可靠。)
+
+**真正能直连的只有与 Anthropic 无关的流量**:WebFetch 用户给的 URL、MCP server、`raw.githubusercontent.com` / npm 等发往第三方主机——Anthropic 的服务器观测不到,不构成感知面;且普通登录设备这些同样直连。
 
 > 控制面登录域名官方文档现用 `platform.claude.com`(早期为 `console.anthropic.com`);无论哪个都属交互登录端点,`setup-token` 预生成凭据的中转场景运行时不依赖它。
 
@@ -90,7 +96,7 @@ CC 运行时会触及多个端点(下表据 Claude Code 官方 `network-config` 
 - **统一出口 / 转发点**:一个稳定的公网出口,所有中转设备的 Anthropic 流量经它出网,以满足「同出口」基线。出口同时是真 token 的持有处。
 - **TLS 终结与重加密**:出口处终结来自设备的外层 TLS(用于认证设备身份),再对 `api.anthropic.com` 建立 TLS 转发。重加密仅为读取目标 host 与换发 token;**内层请求由设备上的真 CC 发起**,出口不重构它。
 - **token 管理**:真订阅 token **只**集中在出口,按设备换发;**真 token 永不下发到设备**——设备只持一个非凭据的占位值。这样不可信设备拿不到真凭据,而官方收到的请求带的是真 token,与登录设备等效。
-- **设备接入**:设备跑**官方 CC 二进制**,经一个本地代理把**需真凭据的 Anthropic 端点**(`api.anthropic.com`,见 §2 表)导向出口,其余流量(遥测 / 更新 / WebFetch / MCP 等)本地直连——不让无关流量经过出口、也不引入额外可观测痕迹。
+- **设备接入**:设备跑**官方 CC 二进制**,经一个本地代理把 `api.anthropic.com`(见 §2 表)导向出口;遥测 / 更新 / 错误报告用 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 禁用(否则从设备直连会暴露设备真实 IP、破坏同出口等效);只有与 Anthropic 无关的流量(WebFetch 用户 URL / MCP / `raw.githubusercontent.com` / npm)本地直连。
 
 ---
 
