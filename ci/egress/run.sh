@@ -86,12 +86,20 @@ JSON
 # =============================================================================
 #  v4 SPLIT-EGRESS COVERAGE GUARD  (stage_split)
 # -----------------------------------------------------------------------------
-#  This is the v4 split-egress coverage guard. It proves the two v4 invariants:
-#    (A) Anthropic 收口: real `claude`, launched via `cc-mysub helper`, reaches
-#        upstream carrying the SWAPPED real setup-token — the fixed placeholder
-#        token never leaves cc-mysub.
+#  This is the v4 split-egress coverage guard, two-hop B model: claude → splitter →
+#  A(cc-mysub) → B(统一出口 @127.0.0.2, records every SNI it receives). DNS sends only the
+#  in-scope hosts to B; everything else → 直连 sink @127.0.0.3. It proves four invariants:
+#    (A) Anthropic 收口: real `claude`, launched via `cc-mysub helper`, reaches B
+#        carrying the SWAPPED real setup-token — the fixed placeholder token never
+#        leaves cc-mysub.
+#    (C) 透传转发经 A: in-scope passthrough hosts (datadog telemetry, downloads.claude.ai)
+#        are chained to cc-mysub (logged as passthrough) and tunneled to B — not direct,
+#        not 403'd.
+#    (SCOPE) B 只收 in-scope: no out-of-scope host appears at B (DNS sends them to the sink;
+#        a leak would mean cc-mysub over-forwarded).
 #    (B) 非 Anthropic 直连: non-allowlisted hosts are dialed DIRECT by the helper,
-#        bypassing cc-mysub entirely (cc-mysub's allowlist would 403 them).
+#        bypassing cc-mysub entirely (cc-mysub's allowlist would 403 them), landing on
+#        the sink — never on B.
 #
 #  RUN: needs a privileged container (root netns + iptables), a real `claude`
 #  install, and the audit CA in the container system trust store. Run locally via
@@ -198,16 +206,20 @@ gen_ccmysub_ca_and_enroll() {
 }
 
 start_dns_split() {
-  # catch-all → 127.0.0.2 (api.anthropic.com lands here = mock); evil.example →
-  # 127.0.0.3 (third-party sink); PROXY_HOST → 127.0.0.1 (cc-mysub). dnsmasq's more
-  # specific address=/host/ entries override the catch-all address=/#/.
+  # 两跳 B 模型的 DNS（v4）:只有 in-scope host → 127.0.0.2 (B=统一出口); 其余一切 → 127.0.0.3
+  # (直连 sink)。这是「B 只收 A 的转发」可证的前提——范围外 host 在 DNS 上就到不了 B,
+  # 故 B 即便被直连污染也不可能。in-scope = MITM 类 api.anthropic.com + 透传类 datadog/downloads
+  # (须与 internal/hosts 一致)。PROXY_HOST → 127.0.0.1 (cc-mysub)。dnsmasq 的具体 address=/host/
+  # 覆盖 catch-all address=/#/。
   cat > "$WORK/dnsmasq-split.conf" <<EOF
 no-resolv
 no-hosts
 bind-interfaces
 listen-address=127.0.0.1
-address=/#/127.0.0.2
-address=/evil.example/127.0.0.3
+address=/#/127.0.0.3
+address=/api.anthropic.com/127.0.0.2
+address=/http-intake.logs.us5.datadoghq.com/127.0.0.2
+address=/downloads.claude.ai/127.0.0.2
 address=/$PROXY_HOST/127.0.0.1
 EOF
   in_ns dnsmasq --conf-file="$WORK/dnsmasq-split.conf" --pid-file="$WORK/dnsmasq.pid"
@@ -215,10 +227,12 @@ EOF
 }
 
 start_services_split() {
-  # mock @127.0.0.2:443 presenting the api.anthropic.com leaf (TLS, system-trusted CA)
+  # B = 统一出口 @127.0.0.2:443:mock(TLS)。GetCertificate 回调枚举每个到达连接的 SNI
+  # (= B 收到哪些 host);SNI=api.anthropic.com 时呈现 audit-CA 签的 api 叶(cc-mysub MITM
+  # 换 token 后的转发须见系统信任叶才走得通),其余 SNI(datadog/downloads 透传)现签自签叶。
   in_ns bash -c "MOCK_ADDR=127.0.0.2:443 MOCK_TLS_CERT='$AUDIT_CA/api.anthropic.com.crt' MOCK_TLS_KEY='$AUDIT_CA/api.anthropic.com.key' exec '$WORK/bin/mock' > '$WORK/mock.out' 2>'$WORK/mock.err'" &
-  # third-party sink @127.0.0.3:443 — collector reads the ClientHello SNI and records
-  # it (it does not terminate TLS; the curl handshake will fail but the SNI is logged).
+  # 直连 sink @127.0.0.3:443(= catch-all 落点)— collector 读 ClientHello SNI 记录范围外
+  # 直连的 host(不终结 TLS;握手会失败但 SNI 已记)。范围外流量到这里、绝不到 B。
   in_ns bash -c "COLLECTOR_ADDR=127.0.0.3:443 exec '$WORK/bin/collector' > '$WORK/sink.out' 2>'$WORK/sink.err'" &
   # cc-mysub forward-proxy @127.0.0.1:443 (mTLS: 外层 certs/<host>, 内层 own CA, 按指纹认证设备)
   in_ns bash -c "exec '$WORK/bin/cc-mysub' --config-dir '$WORK/cfg' > '$WORK/cc.out' 2>'$WORK/cc.err'" &
@@ -270,27 +284,61 @@ stage_split() {
     > "$WORK/curlB.out" 2>&1 || true
   sleep 1
 
-  # Drain recorders (SIGINT flushes mock auths + sink inventory to stdout).
+  # Probe C — 透传转发: curl via helper to the in-scope passthrough hosts. These ARE in
+  # the splitter allow (hosts.All()) → chained to cc-mysub → cc-mysub classifies them
+  # passthrough → blind-tunnels to the real host → DNS maps it to B@127.0.0.2. curl -k
+  # accepts B's self-signed leaf for the host; we only need B to record the SNI and
+  # cc-mysub to log the passthrough. If cc-mysub wrongly 403'd them, B would never see
+  # them; if the splitter wrongly direct-dialed them, cc-mysub would never log them.
+  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai; do
+    log "Probe C: curl via cc-mysub helper to $ph (passthrough forward) ..."
+    in_ns "$WORK/bin/cc-mysub" helper \
+      --host "$PROXY_HOST" --client-cert "$DEV_CRT" --client-key "$DEV_KEY" \
+      -- curl -sk --max-time 10 "https://$ph/probe" > "$WORK/curlC_$ph.out" 2>&1 || true
+  done
+  sleep 1
+
+  # Drain recorders (SIGINT flushes mock auths + B SNI inventory + sink inventory to stdout).
   $SUDO pkill -INT -f "$WORK/bin/mock" 2>/dev/null || true
   $SUDO pkill -INT -f "$WORK/bin/collector" 2>/dev/null || true
   sleep 1
-  echo "===== MOCK AUTHS (经 cc-mysub 换 token 后) ====="; cat "$WORK/mock.out" 2>/dev/null
-  echo "===== THIRD-PARTY SINK INVENTORY (direct-dial 落点) ====="; cat "$WORK/sink.out" 2>/dev/null
+  echo "===== B (统一出口) OUTPUT: auths + SNI inventory ====="; cat "$WORK/mock.out" 2>/dev/null
+  echo "===== 直连 SINK INVENTORY (catch-all 落点) ====="; cat "$WORK/sink.out" 2>/dev/null
+  echo "===== cc-mysub passthrough 日志 (cc.err 摘录) ====="; grep -F "passthrough" "$WORK/cc.err" 2>/dev/null || echo "(无 passthrough 日志)"
 
   # ---- Assertions ----
-  # (A) Anthropic 收口: mock recorded the swapped REAL token.
+  # (A) Anthropic 收口: B recorded the swapped REAL token (api.anthropic.com MITM via cc-mysub).
   grep -q "Bearer $MOCKTEST" "$WORK/mock.out" 2>/dev/null \
-    || fail "ASSERT-A: mock never saw Bearer $MOCKTEST (token-swap/route broken)"
-  # 无占位泄漏: the fixed placeholder token must never reach the mock.
+    || fail "ASSERT-A: B never saw Bearer $MOCKTEST (token-swap/route broken)"
+  # 无占位泄漏: the fixed placeholder token must never reach B.
   if grep -q "$PLACEHOLDER" "$WORK/mock.out" 2>/dev/null; then
-    fail "ASSERT-A: placeholder token leaked to mock (swap bypassed)"
+    fail "ASSERT-A: placeholder token leaked to B (swap bypassed)"
   fi
-  log "ASSERT-A ok: mock saw swapped MOCKTEST, no placeholder leak"
+  log "ASSERT-A ok: B saw swapped MOCKTEST, no placeholder leak"
 
-  # (B) 非 Anthropic 直连: the sink recorded the evil.example connection.
+  # (C) 透传转发经 A: each passthrough host must (1) be logged by cc-mysub as a passthrough
+  # tunnel — proves the splitter chained it to cc-mysub (not direct-dialed) — AND (2) appear
+  # in B's SNI inventory — proves it reached the unified egress (cc-mysub didn't 403 it).
+  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai; do
+    grep -F "passthrough" "$WORK/cc.err" 2>/dev/null | grep -qF "$ph" \
+      || fail "ASSERT-C: cc-mysub never logged passthrough for $ph (splitter direct-dialed it? not chained)"
+    grep -qF "$ph" "$WORK/mock.out" 2>/dev/null \
+      || fail "ASSERT-C: B SNI inventory missing $ph (cc-mysub 403'd it? not forwarded to egress)"
+  done
+  log "ASSERT-C ok: datadog + downloads passthrough-forwarded via cc-mysub and reached B"
+
+  # (SCOPE) B 只收 in-scope: no out-of-scope host may appear at B. evil.example was probed
+  # (Probe B) and must land on the direct sink, never on B — DNS sends catch-all to .3, so a
+  # leak here would mean cc-mysub forwarded something it shouldn't.
+  if grep -q "evil.example" "$WORK/mock.out" 2>/dev/null; then
+    fail "ASSERT-SCOPE: out-of-scope evil.example reached B (over-forwarding leak)"
+  fi
+  log "ASSERT-SCOPE ok: B inventory free of out-of-scope hosts (evil.example absent)"
+
+  # (B) 非 Anthropic 直连: the sink recorded the evil.example connection (bypassed A, not at B).
   grep -q "evil.example" "$WORK/sink.out" 2>/dev/null \
     || fail "ASSERT-B: sink empty — helper did not direct-dial evil.example (routed via cc-mysub?)"
-  log "ASSERT-B ok: helper direct-dialed evil.example (sink recorded it)"
+  log "ASSERT-B ok: helper direct-dialed evil.example (sink recorded it, never reached B)"
 
   # claude rc (non-fatal log; ASSERT-A above is the real proof inference reached upstream).
   log "Probe A claude rc=$claude_rc (non-fatal; ASSERT-A proves inference reached upstream)"
