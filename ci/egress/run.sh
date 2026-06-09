@@ -94,9 +94,15 @@ JSON
 #        leaves cc-mysub.
 #    (C) 透传转发经 A: in-scope passthrough hosts (datadog telemetry, downloads.claude.ai)
 #        are chained to cc-mysub (logged as passthrough) and tunneled to B — not direct,
-#        not 403'd.
-#    (SCOPE) B 只收 in-scope: no out-of-scope host appears at B (DNS sends them to the sink;
-#        a leak would mean cc-mysub over-forwarded).
+#        not 403'd. NOTE: this proves the ROUTING/MECHANISM. The security PREMISE that these
+#        hosts carry no user OAuth token (datadog uses DD-API-KEY, downloads is unauthenticated)
+#        is established empirically (binary string-extraction + capture; see
+#        docs/SUBSCRIPTION-FORWARDING.md §2), NOT by this test — Probe C uses curl with no creds.
+#    (SCOPE) cc-mysub 收口 = its allowlist (not a DNS artifact): Probe D force-chains a deny
+#        host (rogue.example) THROUGH cc-mysub via `helper --allow`, with rogue.example's DNS
+#        pointed at B — so an over-forward bug would surface at B. cc-mysub must 403 it; it
+#        never reaches B. (Asserting evil.example∉B alone would be a DNS tautology — Probe D
+#        forces the traffic through cc-mysub so the assertion tests cc-mysub's policy.)
 #    (B) 非 Anthropic 直连: non-allowlisted hosts are dialed DIRECT by the helper,
 #        bypassing cc-mysub entirely (cc-mysub's allowlist would 403 them), landing on
 #        the sink — never on B.
@@ -206,11 +212,12 @@ gen_ccmysub_ca_and_enroll() {
 }
 
 start_dns_split() {
-  # 两跳 B 模型的 DNS（v4）:只有 in-scope host → 127.0.0.2 (B=统一出口); 其余一切 → 127.0.0.3
-  # (直连 sink)。这是「B 只收 A 的转发」可证的前提——范围外 host 在 DNS 上就到不了 B,
-  # 故 B 即便被直连污染也不可能。in-scope = MITM 类 api.anthropic.com + 透传类 datadog/downloads
-  # (须与 internal/hosts 一致)。PROXY_HOST → 127.0.0.1 (cc-mysub)。dnsmasq 的具体 address=/host/
-  # 覆盖 catch-all address=/#/。
+  # 两跳 B 模型的 DNS（v4）:in-scope host → 127.0.0.2 (B=统一出口); 其余一切 → 127.0.0.3
+  # (直连 sink)。in-scope = MITM 类 api.anthropic.com + 透传类 datadog/downloads(此处硬编码,
+  # 须与 internal/hosts 的 MITMHosts/PassthroughHosts 手动同步)。PROXY_HOST → 127.0.0.1 (cc-mysub)。
+  # rogue.example → 127.0.0.2 (B):它**不在** cc-mysub 任何 allowlist,但映到 B,使「cc-mysub
+  # 若过度转发」会在 B 现形(Probe D 的 over-forward 探针;详见 ASSERT-SCOPE)。dnsmasq 的具体
+  # address=/host/ 覆盖 catch-all address=/#/。
   cat > "$WORK/dnsmasq-split.conf" <<EOF
 no-resolv
 no-hosts
@@ -220,6 +227,7 @@ address=/#/127.0.0.3
 address=/api.anthropic.com/127.0.0.2
 address=/http-intake.logs.us5.datadoghq.com/127.0.0.2
 address=/downloads.claude.ai/127.0.0.2
+address=/rogue.example/127.0.0.2
 address=/$PROXY_HOST/127.0.0.1
 EOF
   in_ns dnsmasq --conf-file="$WORK/dnsmasq-split.conf" --pid-file="$WORK/dnsmasq.pid"
@@ -298,6 +306,17 @@ stage_split() {
   done
   sleep 1
 
+  # Probe D — over-forward 探针(让 ASSERT-SCOPE 真正可证伪): 用 helper --allow 强迫 splitter
+  # 把 rogue.example(cc-mysub 既不 MITM 也不 passthrough)chain 到 cc-mysub。DNS 把 rogue.example
+  # 映到 B@127.0.0.2,所以若 cc-mysub 过度转发(误放行),它会落在 B;正确行为是 cc-mysub allowlist
+  # 403 它、它绝不到 B。这区别于 Probe B(evil 经直连落 sink):rogue **确实流经 cc-mysub** 并被其
+  # 收口策略拒绝,故 ASSERT-SCOPE 检验的是 cc-mysub 的 allowlist、而非 DNS 拓扑的副产物。
+  log "Probe D: curl via helper --allow rogue.example (force-chain a deny host, over-forward probe) ..."
+  in_ns "$WORK/bin/cc-mysub" helper \
+    --host "$PROXY_HOST" --client-cert "$DEV_CRT" --client-key "$DEV_KEY" --allow rogue.example \
+    -- curl -sk --max-time 10 https://rogue.example/probe > "$WORK/curlD.out" 2>&1 || true
+  sleep 1
+
   # Drain recorders (SIGINT flushes mock auths + B SNI inventory + sink inventory to stdout).
   $SUDO pkill -INT -f "$WORK/bin/mock" 2>/dev/null || true
   $SUDO pkill -INT -f "$WORK/bin/collector" 2>/dev/null || true
@@ -327,17 +346,21 @@ stage_split() {
   done
   log "ASSERT-C ok: datadog + downloads passthrough-forwarded via cc-mysub and reached B"
 
-  # (SCOPE) B 只收 in-scope: no out-of-scope host may appear at B. evil.example was probed
-  # (Probe B) and must land on the direct sink, never on B — DNS sends catch-all to .3, so a
-  # leak here would mean cc-mysub forwarded something it shouldn't.
-  if grep -q "evil.example" "$WORK/mock.out" 2>/dev/null; then
-    fail "ASSERT-SCOPE: out-of-scope evil.example reached B (over-forwarding leak)"
+  # (SCOPE) cc-mysub 收口=allowlist,不是 DNS 副产物: Probe D force-chained rogue.example THROUGH
+  # cc-mysub (helper --allow), and rogue.example's DNS points at B@127.0.0.2 — so an over-forward
+  # bug WOULD surface here. cc-mysub must 403 it (not in MITM/passthrough), so it never reaches B.
+  # 这条对任意 cc-mysub 过度转发 bug 可证伪(区别于只看 evil:那是 DNS 把直连引去 sink 的副产物)。
+  if grep -qF "rogue.example" "$WORK/mock.out" 2>/dev/null; then
+    fail "ASSERT-SCOPE: force-chained rogue.example reached B — cc-mysub over-forwarded a deny host"
   fi
-  log "ASSERT-SCOPE ok: B inventory free of out-of-scope hosts (evil.example absent)"
+  log "ASSERT-SCOPE ok: cc-mysub 403'd force-chained rogue.example (never reached B)"
 
-  # (B) 非 Anthropic 直连: the sink recorded the evil.example connection (bypassed A, not at B).
-  grep -q "evil.example" "$WORK/sink.out" 2>/dev/null \
+  # (B) 非 Anthropic 直连: helper direct-dialed evil.example (not allowlisted) → sink, not B.
+  grep -qF "evil.example" "$WORK/sink.out" 2>/dev/null \
     || fail "ASSERT-B: sink empty — helper did not direct-dial evil.example (routed via cc-mysub?)"
+  if grep -qF "evil.example" "$WORK/mock.out" 2>/dev/null; then
+    fail "ASSERT-B: evil.example reached B (should have been direct-dialed to sink)"
+  fi
   log "ASSERT-B ok: helper direct-dialed evil.example (sink recorded it, never reached B)"
 
   # claude rc (non-fatal log; ASSERT-A above is the real proof inference reached upstream).
