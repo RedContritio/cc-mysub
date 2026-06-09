@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -337,6 +338,9 @@ func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host, port stri
 	}
 	// 隧道已建立：清除握手 deadline，否则长连接 relay 会被 15s 读超时打断。
 	_ = outer.SetReadDeadline(time.Time{})
+	// 可观测性：记录经出口透传的 host（不解密 body，仅目标 host——已知于 allowlist，非用户内容）。
+	// 与 MITM 路径的 AccessLog 对称，亦供 egress 审计断言 cc-mysub 确实经此转发遥测/更新。
+	slog.Info("passthrough", "host", host)
 	relayBlind(outer, outerR, up)
 }
 
