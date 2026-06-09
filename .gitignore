@@ -8,6 +8,8 @@ docs/superpowers/
 
 # 编译产物
 /cc-mysub
+/mock
+/collector
 *.exe
 dist/
 

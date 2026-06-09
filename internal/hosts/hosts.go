@@ -1,24 +1,14 @@
-// Package hosts 是 cc-mysub 转发主机的权威分类:单一事实源,供 cc-mysub forward-proxy
-// (决定 MITM 换 token vs 纯透传)与设备 helper/splitter（决定哪些 host 链到 cc-mysub）共用，
-// 避免两侧 allowlist 漂移。精确匹配——不做后缀/通配放宽，使新增 host 必须显式登记。
+// Package hosts 是 cc-mysub 转发主机的权威清单:单一事实源,供 cc-mysub forward-proxy
+// （NewForwardProxy 的 MITM allow + 透传 allow）与设备 helper/splitter（默认链到 cc-mysub
+// 的 host）共用,避免两端各写一份而漂移。精确匹配——不做后缀/通配放宽,使新增 host 必须显式登记。
+//
+// 两类必须互斥(一个 host 不能既换 token 又透传);NewForwardProxy 在装配时强制此契约。
 package hosts
 
-import "slices"
-
-// Mode 是一个 CONNECT 目标 host 的处理类别。
-type Mode int
-
-const (
-	// ModeDeny: 不在任何 allowlist。cc-mysub 侧 403（纵深防御），设备 splitter 侧本地直连。
-	ModeDeny Mode = iota
-	// ModeMITM: 解密 + 换发真订阅 token。仅 Anthropic 控制面/数据面——唯一需要真凭据的流量。
-	ModeMITM
-	// ModePassthrough: 盲隧道转发（经统一出口、不解密、不碰 token）。CC 的非必要 Anthropic
-	// 产品流量（遥测/更新），若从设备直连会泄漏设备真实 IP、破坏「同出口普通登录设备」等效。
-	ModePassthrough
-)
-
 // MITMHosts 是需解密换 token 的 host（唯一携带订阅凭据的流量）。
+//   - api.anthropic.com: 推理 + OAuth token 使用 + WebFetch 域名预检。
+//   - console.anthropic.com: 沿袭原始 allowlist 的防御性保留。setup-token 中转场景运行时不
+//     触发控制面登录,故此条休眠;保留它使「若出现则经出口换 token」而非从设备直连(纵深防御)。
 var MITMHosts = []string{
 	"api.anthropic.com",
 	"console.anthropic.com",
@@ -34,17 +24,6 @@ var MITMHosts = []string{
 var PassthroughHosts = []string{
 	"http-intake.logs.us5.datadoghq.com",
 	"downloads.claude.ai",
-}
-
-// Classify 返回 host 的处理类别（精确匹配；未登记 → ModeDeny）。
-func Classify(host string) Mode {
-	if slices.Contains(MITMHosts, host) {
-		return ModeMITM
-	}
-	if slices.Contains(PassthroughHosts, host) {
-		return ModePassthrough
-	}
-	return ModeDeny
 }
 
 // All 返回 MITMHosts ∪ PassthroughHosts 的并集（新切片，调用方可安全改动）。

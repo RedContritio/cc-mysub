@@ -160,6 +160,11 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 	}
 	passSet := make(map[string]bool, len(passthrough))
 	for _, h := range passthrough {
+		// 契约：一个 host 不能既 MITM 又透传——否则 handle() 的分类有歧义（会静默把本应换 token
+		// 的 host 降级成盲隧道，占位 token 直达上游）。两表必须互斥，相交即编程错，fail-fast。
+		if allowSet[h] {
+			panic("proxy: host " + h + " in both allow(MITM) and passthrough sets")
+		}
 		passSet[h] = true
 	}
 	handler := conditionalAuth(up)(
@@ -276,11 +281,18 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		return
 	}
 	if passHost {
-		// 透传类：拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
-		// 按 CONNECT 原端口拨上游（ParseConnect 已校验 host:port 合法，故 SplitHostPort 必成功）。
+		// 透传类盲隧道。allowlist 是 host-only，但透传仅放行标准 HTTPS :443——与 MITM 路径恒拨
+		// :443 对称，且防止借盲隧道把 cc-mysub 出口当任意端口 port-forward（最小权限）。CONNECT
+		// 端口非 443 = 越权,显式 403（不静默改写）。ParseConnect 已校验 host:port 合法。
 		target := strings.Fields(line)[1]
-		_, port, _ := net.SplitHostPort(target)
-		fp.tunnel(outer, br, host, port)
+		_, port, err := net.SplitHostPort(target)
+		if err != nil || port != "443" {
+			_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+			outer.Close()
+			return
+		}
+		// 拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
+		fp.tunnel(outer, br, host)
 		return
 	}
 	// MITM 类：回 200 后跑内层嵌套 TLS。
@@ -323,8 +335,12 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 // 不现签叶证书、不解密、不碰任何头——claude 与真上游端到端做 TLS（cc-mysub 只搬 TCP 字节），
 // 故不扩解密面、不破坏 cert pinning，仅把出口 IP 收敛到统一出口。outerR 为 outer 的 bufio 读端
 // （可能已缓冲 claude 流水线发来的内层 ClientHello，必须从它读以免丢字节）。
-func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host, port string) {
-	up, err := fp.passDial(context.Background(), "tcp", net.JoinHostPort(host, port))
+func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host string) {
+	// 拨号设超时：上游黑洞时不让 handle goroutine + 并发槽位无限期挂住（outer 的握手 deadline
+	// 此刻不读 outer、管不到拨号）。透传仅放行 :443（见 handle 的端口校验）。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	up, err := fp.passDial(ctx, "tcp", net.JoinHostPort(host, "443"))
 	if err != nil {
 		// 拨上游失败：CONNECT 尚未回 200，可如实回 502（区别于 MITM 路径 200 后才连上游）。
 		_, _ = outer.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))

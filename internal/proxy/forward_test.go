@@ -407,6 +407,42 @@ func TestForwardProxy_PassthroughDialFailureIs502(t *testing.T) {
 	}
 }
 
+// TestNewForwardProxy_PanicsOnOverlap：装配契约——一个 host 同时在 allow(MITM) 与 passthrough
+// 两表 → 分类歧义,NewForwardProxy fail-fast panic(与 maxInFlight<=0 同级)。
+func TestNewForwardProxy_PanicsOnOverlap(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("NewForwardProxy 须在 host 同属 allow 与 passthrough 时 panic")
+		}
+	}()
+	oc := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }
+	NewForwardProxy(nil, nil, nil, nil, []string{"dup.example"}, []string{"dup.example"}, oc, 8)
+}
+
+// TestForwardProxy_PassthroughNon443Rejected：透传只放行 :443。非 443 端口 → 403(在拨号前拒),
+// 不现签叶证书。passDial 设为返回 io.EOF：若端口校验误放行,tunnel 会拨号并回 502——故拿到 403
+// (而非 502)即证明在拨号前就被端口校验拒掉,堵住「借盲隧道把出口当任意端口 port-forward」。
+func TestForwardProxy_PassthroughNon443Rejected(t *testing.T) {
+	const passHost = "telemetry.example"
+	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) { return nil, io.EOF }
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	outer.Write([]byte("CONNECT " + passHost + ":8080 HTTP/1.1\r\nHost: " + passHost + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "403") {
+		t.Errorf("非 443 透传须 403(拨号前拒), got %q", status)
+	}
+	if strings.Contains(status, "502") {
+		t.Errorf("不应进到拨号(502 说明端口校验漏放行): %q", status)
+	}
+	if spy.called(passHost) {
+		t.Error("非 443 透传被拒路径不应现签叶证书")
+	}
+}
+
 // assertOuterRejected dials the outer TLS endpoint with cfg and asserts the mTLS
 // handshake is rejected — zero application bytes get through. Under TLS 1.3 a client-
 // auth failure is not reported by tls.Dial (the client "completes" its handshake before
