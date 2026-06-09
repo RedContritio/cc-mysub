@@ -2,8 +2,6 @@
   "listen": "127.0.0.1:8788",
   "client": {
     "public_host": "ccapi.example.com",
-    "frps_ip": "203.0.113.10",
-    "proxy_port": 8788,
     "subscription_type": "max"
   }
 }
