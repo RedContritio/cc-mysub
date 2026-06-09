@@ -4,7 +4,7 @@
 
 在任意不可信设备上使用自己的 Claude Code 订阅额度，Anthropic 只能看到流量来自你自己的服务端，不可信设备永远拿不到真实订阅 token。
 
-原理:设备只把 `api.anthropic.com` 流量经 **mTLS** 转发到你的 cc-mysub 服务端换发真 token,其余一切(WebFetch、MCP、更新、包管理器…)本地直连。深入细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、安全与合规见 [`SECURITY.md`](SECURITY.md)、部署运维见 [`docs/OPERATING.md`](docs/OPERATING.md)。
+原理:设备把 `api.anthropic.com` 流量经 **mTLS** 转发到你的 cc-mysub 服务端换发真 token,遥测/更新也经 cc-mysub 纯透传(不解密,仅收口出口 IP),其余一切(WebFetch、MCP、包管理器…)本地直连。深入细节见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、安全与合规见 [`SECURITY.md`](SECURITY.md)、部署运维见 [`docs/OPERATING.md`](docs/OPERATING.md)。
 
 ## 快速开始
 

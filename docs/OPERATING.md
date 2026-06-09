@@ -10,7 +10,7 @@
 - **外层客户端身份** = per-device 自签客户端证书,设备本地 `device-init` 生成(**私钥永不离开设备**);cc-mysub 在 TLS 握手时按其 **SHA-256(DER) 指纹白名单**(`devices.json`)认证,无证书/未登记指纹 → **握手即断、零应用字节**。
 - **内层 MITM** = cc-mysub 自有 CA 现签 `api.anthropic.com` 叶证书;设备经 `NODE_EXTRA_CA_CERTS` 信任该 CA。该 CA 仅用于内层,不参与外层。
 
-设备只把 `api.anthropic.com`/`console.anthropic.com` 经外层 mTLS 转发到 cc-mysub;**其余一切**(WebFetch 目标、MCP、更新、第三方遥测、包管理器)helper 本地直连真主机,永不接触 cc-mysub。`base_url` 保持默认 `api.anthropic.com`,不改。
+设备把 `api.anthropic.com`/`console.anthropic.com` 经外层 mTLS 转发到 cc-mysub(内层 MITM 换 token);遥测/更新(`http-intake.logs.us5.datadoghq.com`/`downloads.claude.ai`)也经 mTLS 链到 cc-mysub,但走**纯透传盲隧道**(不解密、不换 token,仅收口出口 IP);**其余一切**(WebFetch 目标、MCP、`raw.githubusercontent.com`、包管理器)helper 本地直连真主机,永不接触 cc-mysub。`base_url` 保持默认 `api.anthropic.com`,不改。
 
 订阅凭据集中服务器、永不下发;每台设备持有一份 per-device 客户端证书,按指纹独立吊销。
 

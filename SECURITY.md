@@ -59,15 +59,16 @@ Claude Code 会对**请求 body** 算一个非加密 xxHash64(`x-anthropic-billi
 
 ## v4 收口架构与加密边界
 
-设备只设 `HTTPS_PROXY` 指向**本地** `cc-mysub helper`(用户态、无系统改动)。helper 分流:
-- **仅 `api.anthropic.com`/`console.anthropic.com`** 经**外层 TLS** 链到 cc-mysub(cc-mysub 出示 public_host 身份证书, helper 用已下发 CA 公证书验证) → cc-mysub 内层按 host 现签 MITM 终结、换 token;
-- **其余一切**(WebFetch 目标/MCP/更新/第三方遥测/包管理器) helper **本地直连**真主机, **永不接触 cc-mysub、不被 MITM**(cert-pinning 主机不破)。
+设备只设 `HTTPS_PROXY` 指向**本地** `cc-mysub helper`(用户态、无系统改动)。helper 分流(三类):
+- **`api.anthropic.com`/`console.anthropic.com`** 经**外层 TLS** 链到 cc-mysub(cc-mysub 出示 public_host 身份证书, helper 用已下发 CA 公证书验证) → cc-mysub 内层按 host 现签 MITM 终结、换 token;
+- **遥测/更新**(`http-intake.logs.us5.datadoghq.com` / `downloads.claude.ai`)同样经外层 TLS 链到 cc-mysub,但 cc-mysub 做**纯透传盲隧道**——不解密、不换 token,仅把出口 IP 收敛到统一出口(否则从设备直连会泄漏设备真实 IP、破坏同出口等效)。二者不带订阅 token(datadog 用 DD-API-KEY、downloads 无认证),故透传不泄露凭据;
+- **其余一切**(WebFetch 目标/MCP/`raw.githubusercontent.com`/包管理器) helper **本地直连**真主机, **永不接触 cc-mysub、不被 MITM**(cert-pinning 主机不破)。
 
 **双层 TLS**: 外层 = cc-mysub 身份(防 CONNECT 目标 host 在 helper↔cc-mysub 跳明文); 内层 = api.anthropic.com MITM(设备经 `NODE_EXTRA_CA_CERTS` 信任 cc-mysub CA)。
 
 **helper 无密钥面**: 不终结内层 TLS、不持 setup-token、不持 CA 私钥(只持 CA 公证书做外层身份验证)。
 
-**隐私改善(相对 v3 blanket 代理)**: 非 Anthropic 流量留在设备本地, cc-mysub 不再有能力接触它们。
+**隐私改善(相对 v3 blanket 代理)**: 与 Anthropic 无关的第三方流量(WebFetch/MCP/`raw.githubusercontent.com`/包管理器)留在设备本地, cc-mysub 不接触。遥测/更新虽经 cc-mysub 收口出口 IP, 但走盲隧道**不解密**, cc-mysub 同样读不到其内容。
 
 ## CA 私钥管理
 
