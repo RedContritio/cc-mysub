@@ -187,7 +187,7 @@ func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Up
 	store := newTestStore(t, fpToUpstream)
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(minter, store, cfgUp, upstream, allow, NewOuterCertLoader(cp, kp), maxInFlight)
+	fp := NewForwardProxy(minter, store, cfgUp, upstream, allow, nil, NewOuterCertLoader(cp, kp), maxInFlight)
 	caPool := x509.NewCertPool()
 	caPool.AddCert(ca.Cert)
 	return fp, caPool
@@ -325,6 +325,88 @@ func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
 	}
 }
 
+// TestForwardProxy_PassthroughTunnelsWithoutMITM：透传类 host → cc-mysub 盲隧道转发到真上游，
+// device 与真上游端到端做 TLS（cc-mysub 不解密、绝不现签叶证书）。证明：① 字节端到端通到上游；
+// ② 透传 host 不触发 CertFor（不 MITM）。
+func TestForwardProxy_PassthroughTunnelsWithoutMITM(t *testing.T) {
+	const passHost = "telemetry.example" // 透传类（测试用任意 host，经 passthrough 列表登记）
+
+	// 假上游（真 TLS 服务端）：device 经盲隧道与它端到端做 TLS；记录收到请求数证明字节通。
+	var hits int
+	var mu sync.Mutex
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	// spy minter 断言透传 host 绝不现签叶证书；allow 空、passthrough=[passHost]。
+	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	// 注入 passDial：把透传上游重定向到假上游（替代真 DNS）。
+	fp.passDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddr)
+	}
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	br := connect200(t, outer, passHost) // 透传路径：先拨上游成功才回 200
+	if n := br.Buffered(); n != 0 {
+		t.Fatalf("unexpected %d buffered bytes after CONNECT 200", n)
+	}
+	// device 在盲隧道内与假上游端到端做 TLS（InsecureSkipVerify 跳过自签校验；cc-mysub 不参与）。
+	inner := tls.Client(outer, &tls.Config{InsecureSkipVerify: true, ServerName: passHost})
+	req, _ := http.NewRequest("POST", "https://"+passHost+"/api/v2/logs", nil)
+	if err := req.Write(inner); err != nil {
+		t.Fatalf("inner write through tunnel: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(inner), req)
+	if err != nil {
+		t.Fatalf("inner read through tunnel: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("tunnel upstream status=%d want 204", resp.StatusCode)
+	}
+	mu.Lock()
+	got := hits
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("upstream hits=%d want 1 (blind tunnel must deliver bytes end-to-end)", got)
+	}
+	if spy.called(passHost) {
+		t.Errorf("SECURITY: minted leaf for passthrough host %q (must NOT MITM/decrypt)", passHost)
+	}
+}
+
+// TestForwardProxy_PassthroughDialFailureIs502：透传上游拨号失败 → 502（CONNECT 尚未回 200，
+// 故可如实回错），且不现签叶证书。
+func TestForwardProxy_PassthroughDialFailureIs502(t *testing.T) {
+	const passHost = "telemetry.example"
+	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, io.EOF // 模拟拨号失败
+	}
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	outer.Write([]byte("CONNECT " + passHost + ":443 HTTP/1.1\r\nHost: " + passHost + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "502") {
+		t.Errorf("passthrough dial failure must be 502, got %q", status)
+	}
+	if strings.Contains(status, "200") {
+		t.Errorf("must not 200 when upstream dial fails: %q", status)
+	}
+	if spy.called(passHost) {
+		t.Errorf("minted leaf on dial-failure path (must NOT)")
+	}
+}
+
 // assertOuterRejected dials the outer TLS endpoint with cfg and asserts the mTLS
 // handshake is rejected — zero application bytes get through. Under TLS 1.3 a client-
 // auth failure is not reported by tls.Dial (the client "completes" its handshake before
@@ -425,7 +507,7 @@ func (s *spyMinter) called(host string) bool {
 // newSpyProxy builds a running-ready ForwardProxy whose minter is a spy, plus the spy
 // and a registered client cert for outer-mTLS dialing. inner RoundTripper is nil (no
 // inner request is expected on the 400/403 paths). allow lists the MITM hosts.
-func newSpyProxy(t *testing.T, allow []string) (*ForwardProxy, *spyMinter, tls.Certificate) {
+func newSpyProxy(t *testing.T, allow, passthrough []string) (*ForwardProxy, *spyMinter, tls.Certificate) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -439,14 +521,14 @@ func newSpyProxy(t *testing.T, allow []string) (*ForwardProxy, *spyMinter, tls.C
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, NewOuterCertLoader(cp, kp), 8)
+	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, passthrough, NewOuterCertLoader(cp, kp), 8)
 	fp.minter = spy // 覆写为 spy(both satisfy certMinter)
 	return fp, spy, clientCert
 }
 
 func TestForwardProxy_OversizedConnectHeaderIs400(t *testing.T) {
 	const host = "api.anthropic.com"
-	fp, spy, clientCert := newSpyProxy(t, []string{host})
+	fp, spy, clientCert := newSpyProxy(t, []string{host}, nil)
 	addr := serveProxy(t, fp)
 	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()

@@ -13,6 +13,7 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
 	"github.com/redcontritio/cc-mysub/internal/enroll"
+	"github.com/redcontritio/cc-mysub/internal/hosts"
 	"github.com/redcontritio/cc-mysub/internal/mitm"
 	"github.com/redcontritio/cc-mysub/internal/proxy"
 )
@@ -93,9 +94,10 @@ func main() {
 	}
 
 	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
-	// allowlist 仅 MITM Anthropic 控制面/数据面 host（纵深防御，拒其余）。
+	// 主机分类的权威清单在 internal/hosts：MITM 类（Anthropic 控制面/数据面，换 token）+ 透传类
+	// （CC 遥测/更新，盲隧道经出口）；其余 403（纵深防御）。设备 splitter 默认 allow 取自同一清单。
 	fp := proxy.NewForwardProxy(minter, store, up, nil,
-		[]string{"api.anthropic.com", "console.anthropic.com"}, outerCert, 512)
+		hosts.MITMHosts, hosts.PassthroughHosts, outerCert, 512)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

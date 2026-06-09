@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,18 +104,28 @@ type certMinter interface {
 	CertFor(host string) (*tls.Certificate, error)
 }
 
+// dialFunc 拨号一个原始 TCP 连接（透传隧道用）；nil → 默认 net.Dialer。测试注入以把透传上游
+// 重定向到假服务端（与 MITM 路径的 upstream http.RoundTripper 注入对应）。
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // ForwardProxy 是 CONNECT forward-proxy。整个 device↔cc-mysub 跳被外层 TLS 包裹
 // （外层呈现 cc-mysub 自身身份证书 serverName，使 CONNECT 目标 host 不以明文上线）；
-// 在外层 TLS 内读 CONNECT 目标、按 allowlist 拒非法 host（纵深防御），回 200 后再按 host
-// 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP 请求经 rewrite handler 转发到真目标 host。
+// 在外层 TLS 内读 CONNECT 目标，按 host 分类（§2 中转表）:
+//   - MITM 类（allow）: 回 200 后按 host 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP
+//     请求经 rewrite handler 换 token 转发到真目标 host。
+//   - 透传类（passthrough）: 先拨真上游、成功才回 200，再盲转发原始字节（不解密、不碰 token）——
+//     CC 的遥测/更新经统一出口出网，避免设备直连泄漏真实 IP；不扩解密面、不破坏 cert pinning。
+//   - 均不在 → 403（纵深防御）。
 type ForwardProxy struct {
-	minter    certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
-	handler   http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
-	auth      Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
-	allow     map[string]bool                                      // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
-	outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
-	sema      chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
-	wg        sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
+	minter      certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
+	handler     http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
+	auth        Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
+	allow       map[string]bool                                      // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
+	passthrough map[string]bool                                      // 允许纯透传（盲隧道、不 MITM）的 CONNECT 目标 host（遥测/更新）
+	passDial    dialFunc                                             // 透传隧道拨真上游（nil→默认 net.Dialer；测试注入重定向）
+	outerCert   func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
+	sema        chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
+	wg          sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
@@ -128,12 +139,14 @@ const maxConnectHeaderBytes = 8192
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
-// allow 为允许 MITM 的 CONNECT 目标 host 列表；outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
+// allow 为允许 MITM（解密换 token）的 CONNECT 目标 host 列表；passthrough 为允许纯透传（盲隧道、
+// 不解密、不碰 token）的 host 列表（CC 遥测/更新）——两类经统一出口，其余 403。
+// outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
 // maxInFlight 为全局并发上限（>0 强制要求，<=0 panic；饱和时 shed 新连接）。
 //
 // serving chain：conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → AccessLog
 // → forwardSwap（换 token 转发）。设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入。
-func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow []string, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
+func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow, passthrough []string, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
 	if maxInFlight <= 0 {
 		panic("proxy: NewForwardProxy requires maxInFlight > 0")
 	}
@@ -144,6 +157,10 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 	for _, h := range allow {
 		allowSet[h] = true
 	}
+	passSet := make(map[string]bool, len(passthrough))
+	for _, h := range passthrough {
+		passSet[h] = true
+	}
 	handler := conditionalAuth(up)(
 		RateLimitByDevice(120)(
 			AccessLog(nil)(
@@ -152,10 +169,14 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 		),
 	)
 	return &ForwardProxy{
-		minter:    m,
-		handler:   handler,
-		auth:      a,
-		allow:     allowSet,
+		minter:      m,
+		handler:     handler,
+		auth:        a,
+		allow:       allowSet,
+		passthrough: passSet,
+		passDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
 		outerCert: outerCert,
 		sema:      make(chan struct{}, maxInFlight),
 	}
@@ -245,12 +266,23 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 			break
 		}
 	}
-	// allowlist 纵深防御：已认证设备请求非白名单 host → 403。
-	if !fp.allow[host] {
+	// host 分类（§2 中转表）：MITM 类（解密换 token）/ 透传类（盲隧道）/ 其余 403（纵深防御）。
+	mitmHost := fp.allow[host]
+	passHost := fp.passthrough[host]
+	if !mitmHost && !passHost {
 		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 		outer.Close()
 		return
 	}
+	if passHost {
+		// 透传类：拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
+		// 按 CONNECT 原端口拨上游（ParseConnect 已校验 host:port 合法，故 SplitHostPort 必成功）。
+		target := strings.Fields(line)[1]
+		_, port, _ := net.SplitHostPort(target)
+		fp.tunnel(outer, br, host, port)
+		return
+	}
+	// MITM 类：回 200 后跑内层嵌套 TLS。
 	if _, err := outer.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		outer.Close()
 		return
@@ -284,6 +316,40 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		},
 	}
 	_ = srv.Serve(&oneConnListener{conn: nc, closed: closed})
+}
+
+// tunnel 处理透传类 host：拨真上游（passDial）→ 成功才回 200 → 盲双向转发原始字节。
+// 不现签叶证书、不解密、不碰任何头——claude 与真上游端到端做 TLS（cc-mysub 只搬 TCP 字节），
+// 故不扩解密面、不破坏 cert pinning，仅把出口 IP 收敛到统一出口。outerR 为 outer 的 bufio 读端
+// （可能已缓冲 claude 流水线发来的内层 ClientHello，必须从它读以免丢字节）。
+func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host, port string) {
+	up, err := fp.passDial(context.Background(), "tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		// 拨上游失败：CONNECT 尚未回 200，可如实回 502（区别于 MITM 路径 200 后才连上游）。
+		_, _ = outer.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		outer.Close()
+		return
+	}
+	defer up.Close()
+	if _, err := outer.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		outer.Close()
+		return
+	}
+	// 隧道已建立：清除握手 deadline，否则长连接 relay 会被 15s 读超时打断。
+	_ = outer.SetReadDeadline(time.Time{})
+	relayBlind(outer, outerR, up)
+}
+
+// relayBlind 双向盲拷贝 outer<->up，任一方向结束即收尾（关闭两端解除另一方向阻塞）。
+// outerR 为 outer 的读端（可能已缓冲），写仍用裸 outer。镜像 splitter.relay。
+func relayBlind(outer net.Conn, outerR io.Reader, up net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(up, outerR); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(outer, up); done <- struct{}{} }()
+	<-done
+	outer.Close()
+	up.Close()
+	<-done
 }
 
 // prefixConn 在读取底层 conn 之前先回放 prefix（被 bufio 预读的 TLS 字节）。
