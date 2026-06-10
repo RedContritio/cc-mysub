@@ -13,7 +13,7 @@
 
 cc-mysub forward-proxy 经 frp 暴露在**公网**端口；frp 的 `auth.token` 只鉴权隧道注册、**不**鉴权客户端访问。准入由**外层双向 TLS**承载:cc-mysub 用 `tls.RequireAnyClientCert` 要求客户端证书,并在 `VerifyPeerCertificate` 里按 **SHA-256(DER) 指纹**查 `devices.json` 的 `cert_sha256`——**未登记即握手失败**(连接级掐断、零应用字节、不写 `200 Connection Established`、不签 leaf 证书、不返回任何 HTTP 响应)。CONNECT 头不再带任何信道 token / `Proxy-Authorization`,身份由证书承载。
 
-**设备凭据 = 客户端证书 + 私钥（device-init 本地生成）。** 私钥在设备本地生成、**永不离开设备**;`add-device --fingerprint <SHA-256>` 把该证书指纹登记进 `devices.json`(逐设备显式授权)。相较旧的「复用 token 作信道凭据」,私钥不离设备、强于 bearer token。吊销 = 删 `devices.json` 里对应那一行,mtime 热重载即时生效。
+**设备凭据 = 客户端证书 + 私钥（device-init 本地生成）。** 私钥在设备本地生成、**永不离开设备**;`add-device --fingerprint <SHA-256>` 把该证书指纹登记进 `devices.json`(逐设备显式授权)。相较旧的「复用 token 作信道凭据」,私钥不离设备、强于 bearer token。吊销 = `cc-mysub remove-device --fingerprint <fp>`(或 `--label`),mtime 热重载即时生效。
 
 **握手失败先于 allowlist（消除 host oracle）。** 无证书 / 指纹未登记的客户端在 **TLS 握手阶段**即被拒,拿不到任何 HTTP 响应,故无从用响应差异探测 allowlist;`403 Forbidden` 只在「**已认证设备**请求非 allowlist host」时出现(纵深防御)。认证在传输层、早于任何 host 处理,这条 oracle 被结构性消除。
 
@@ -34,7 +34,7 @@ cc-mysub 按**外层 mTLS 客户端证书的指纹**核身（不靠内层 token�
 2. **泄露隔离**——偷到一台设备的证书 + 私钥也摸不到主钥匙，且影响不外溢到其他设备（删该指纹一行即吊销）。
 3. **防残留**——删入站 `X-Api-Key`，杜绝凭据旁路泄漏。
 
-**吊销**：删 `devices.json` 里对应那一行（`cert_sha256` 条目）即可。文件改动通过 mtime polling 热重载，无需重启；被删设备立即失效，其他设备无感。
+**吊销**：`cc-mysub remove-device --fingerprint <fp>`（或 `--label <name>`）——cli 按指纹/标签删条目并原子写回，全程走 cli、不手动编辑 `devices.json`。文件改动通过 mtime polling 热重载，无需重启；被删设备立即失效（既有连接也被主动断开），其他设备无感。
 
 ## 3. 合规定位
 
