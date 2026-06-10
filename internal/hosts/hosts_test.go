@@ -79,6 +79,63 @@ func TestIsFirstParty(t *testing.T) {
 	}
 }
 
+// Classify/IsFirstParty 的前置契约是「host 已 DNS 规范化(全小写、无尾点)」。非规范输入必须
+// loud-fail(panic),不得静默 miss 成 Direct(自家域名静默降级为直连泄漏 IP)——这是「单一事实源」
+// 的收口保证不再悄悄依赖每个调用方先规范化的关键回归守卫。契约是格式而非类别,故第三方/混淆域名的
+// 非规范形态同样 panic。
+func TestClassify_PanicsOnNonNormalizedHost(t *testing.T) {
+	cases := []string{
+		"API.ANTHROPIC.COM",  // 全大写
+		"Api.Anthropic.Com",  // 混合大小写
+		"api.anthropic.com.", // 尾点 FQDN
+		"GitHub.com",         // 非自家也须 panic(契约是格式不是类别)
+		"github.com.",        // 尾点(非自家)
+	}
+	for _, h := range cases {
+		t.Run(h, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("Classify(%q) 未 panic;非规范 host 必须 loud-fail", h)
+				}
+			}()
+			Classify(h)
+		})
+	}
+}
+
+func TestIsFirstParty_PanicsOnNonNormalizedHost(t *testing.T) {
+	cases := []string{
+		"API.ANTHROPIC.COM",
+		"api.anthropic.com.",
+		"GitHub.com",
+	}
+	for _, h := range cases {
+		t.Run(h, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("IsFirstParty(%q) 未 panic;非规范 host 必须 loud-fail", h)
+				}
+			}()
+			IsFirstParty(h)
+		})
+	}
+}
+
+// 规范化的合法输入绝不 panic——契约只拒非规范形态,正常收口判定不受影响。
+func TestClassify_NormalizedHostDoesNotPanic(t *testing.T) {
+	for _, h := range []string{"api.anthropic.com", "anthropic.com", "github.com", "x.y.claude.ai"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Classify(%q) 不应 panic(已规范化): %v", h, r)
+				}
+			}()
+			Classify(h)
+			IsFirstParty(h)
+		}()
+	}
+}
+
 func TestMatchSuffix(t *testing.T) {
 	cases := []struct {
 		host, suffix string

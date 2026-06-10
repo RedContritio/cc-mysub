@@ -73,9 +73,26 @@ func matchSuffix(host, suffix string) bool {
 	return host == suffix || strings.HasSuffix(host, "."+suffix)
 }
 
+// assertNormalized 强制 host 已 DNS 规范化(全小写、无尾点),否则 panic。这是 Classify/IsFirstParty
+// 的前置契约:本包精确集(MITMHosts/PassthroughExact)与后缀(FirstPartySuffixes)均为小写无尾点
+// 常量,非规范 host(API.ANTHROPIC.COM / api.anthropic.com.)会静默 miss 成 Direct——使自家域名降级
+// 为设备直连(泄漏 IP)或上游 403。所有生产调用方都已规范化:forward/splitter 经 connect.ParseConnect
+// (lowercase + TrimRight("."))、hostscan 经 ScanHosts,故此 panic 只会被「漏规范化的新调用方」这一
+// 编程错触发——正是要 loud-fail 的时机(严格契约、错误可见),而非静默纠正违约(防御式掩码)或静默
+// 返回默认类别。
+func assertNormalized(host string) {
+	if host != strings.ToLower(strings.TrimRight(host, ".")) {
+		panic("hosts: host not DNS-normalized (want lowercase, no trailing dot; normalize via connect.ParseConnect): " + host)
+	}
+}
+
 // Classify 按 precedence 给 host 定类:精确 MITM > passthrough(精确 ∪ 自家后缀) > Direct。
 // 精确 MITM 永远先判,故 api.anthropic.com 走换 token、不被 .anthropic.com 后缀降级成盲隧道。
+//
+// 前置契约:host 必须已 DNS 规范化(全小写、无尾点),即 connect.ParseConnect 的输出形态;违约
+// loud-fail(panic,见 assertNormalized),不静默纠正也不静默返回默认类别。
 func Classify(host string) Class {
+	assertNormalized(host)
 	if slices.Contains(MITMHosts, host) {
 		return MITM
 	}
@@ -93,7 +110,10 @@ func Classify(host string) Class {
 // IsFirstParty 报告 host 是否命中任一 Anthropic/Claude 自家域名后缀(FirstPartySuffixes)。
 // 自家域名经 Classify 自动 passthrough 收口、无需逐个登记或漂移监控,故 egress-audit 的漂移
 // 守卫(ci/egress/hostscan)用它把自家域名从基线 diff 中排除——只留需精确决策的第三方收口域名。
+//
+// 前置契约同 Classify:host 必须已 DNS 规范化(全小写、无尾点);违约 loud-fail(见 assertNormalized)。
 func IsFirstParty(host string) bool {
+	assertNormalized(host)
 	for _, s := range FirstPartySuffixes {
 		if matchSuffix(host, s) {
 			return true
