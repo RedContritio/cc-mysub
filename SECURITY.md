@@ -17,7 +17,7 @@ cc-mysub forward-proxy 经 frp 暴露在**公网**端口；frp 的 `auth.token` 
 
 **握手失败先于 allowlist（消除 host oracle）。** 无证书 / 指纹未登记的客户端在 **TLS 握手阶段**即被拒,拿不到任何 HTTP 响应,故无从用响应差异探测 allowlist;`403 Forbidden` 只在「**已认证设备**请求非 allowlist host」时出现(纵深防御)。认证在传输层、早于任何 host 处理,这条 oracle 被结构性消除。
 
-**应用层匿名透传不降级。** mTLS 只在传输层认证设备,不把设备身份注入内层请求;内层匿名照旧（无 app token → 透传不注入、字节级不可区分于直连）。真正的 Claude Code 有合法无 OAuth token 请求（registry/遥测），匿名透传从「全公网开放」收紧为「已认证可信设备」，不再是洞，故保留、不砍。
+**应用层匿名透传不降级。** mTLS 只在传输层认证设备,不把设备身份注入内层请求;内层匿名照旧（无 app token → 透传不注入、**应用语义层**不可区分于直连）。真正的 Claude Code 有合法无 OAuth token 请求（registry/遥测），匿名透传从「全公网开放」收紧为「已认证可信设备」，不再是洞，故保留、不砍。
 
 ## 2. 设备凭据与真 setup-token 分离
 
@@ -38,7 +38,7 @@ cc-mysub 按**外层 mTLS 客户端证书的指纹**核身（不靠内层 token�
 
 ## 3. 合规定位
 
-CC MySub 属于 **B 类**方案：每台设备运行**真正的 Claude Code 二进制**，用 `claude setup-token` 生成的订阅凭据——这正是该命令的预期用途（给 CC 做无交互订阅认证）。中间的代理是**纯传输层**（性质同 frp / 路由器 / ISP），不做推理、不冒充 CC；上游收到的请求与设备直连逐字节不可区分。这与「第三方工具 / SDK 拿订阅 OAuth token 自己调 API」（A 类）有本质区别。
+CC MySub 属于 **B 类**方案：每台设备运行**真正的 Claude Code 二进制**，用 `claude setup-token` 生成的订阅凭据——这正是该命令的预期用途（给 CC 做无交互订阅认证）。中间的代理是**纯传输层**（性质同 frp / 路由器 / ISP），不做推理、不冒充 CC；上游收到请求的 **HTTP 应用语义层（头值 / body / query / cch）与设备直连保真一致**（`api.anthropic.com` 因 MITM 换 token，其外联 TLS/HTTP2 transport 指纹是 cc-mysub 的 Go 栈、非 undici，见下文「诚实降级」节）。这与「第三方工具 / SDK 拿订阅 OAuth token 自己调 API」（A 类）有本质区别。
 
 为守住这个定位，实现遵守三条工程边界：
 
@@ -66,7 +66,7 @@ Claude Code 会对**请求 body** 算一个非加密 xxHash64(`x-anthropic-billi
 
 **双层 TLS**: 外层 = 双向 mTLS(cc-mysub 真 LE 身份 + 设备客户端证书指纹认证;防 CONNECT 目标 host 在 helper↔cc-mysub 跳明文); 内层 = api.anthropic.com MITM(设备经 `NODE_EXTRA_CA_CERTS` 信任 cc-mysub 自有 CA)。
 
-**helper 无密钥面**: 不终结内层 TLS、不持 setup-token、不持 CA 私钥(只持 CA 公证书做外层身份验证)。
+**helper 的密钥面 = 仅设备私钥**: helper 不终结内层 TLS、不持 setup-token、不持 CA 私钥。设备侧的 CA **公**证书供**内层 MITM** 验证(由 claude 经 `NODE_EXTRA_CA_CERTS` 信任、非 helper 使用);**外层服务端身份走系统信任**验真真 LE、**不依赖该 CA**。helper 唯一持有的密钥是设备私钥 `device.key`(以 `--client-key` 读取、做外层 mTLS 客户端认证)——它是该设备本地凭据,归入下文**边界 #1**。
 
 **隐私改善(相对 v3 blanket 代理)**: 非自家第三方流量(WebFetch/用户自配 MCP/`raw.githubusercontent.com`/包管理器)留在设备本地, cc-mysub 不接触。自家域名与第三方遥测/MCP 虽经 cc-mysub 收口出口 IP, 但(除 `api.anthropic.com` 内层 MITM 外)走盲隧道**不解密**, cc-mysub 读不到其内容。
 
@@ -76,13 +76,18 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 
 ## 诚实降级: 不可区分性
 
-每条请求**字节级**与「某台设备直连」不可区分(不碰遥测/性能/用量、匿名零注入、cch 透传); 但**多设备汇聚到本机单一出口 IP** 是直连不存在的关联信号。多 setup-token 池缓解「共用单一凭据」一维, **源 IP 收敛仍在**——定位为承担风险, 非隐私增强。
+每条请求的 **HTTP 应用语义层(头值 / body / query / cch)** 与「某台设备直连」保真一致(不碰遥测/性能/用量、匿名零注入、cch 透传)。但有**两项**直连不存在、无法消除的关联信号,如实并列披露:
+
+- **源 IP 收敛**: 多设备汇聚到本机单一出口 IP,是直连不存在的关联信号。多 setup-token 池缓解「共用单一凭据」一维, **源 IP 收敛仍在**。
+- **MITM host 的 transport 指纹**: `api.anthropic.com` / `console.anthropic.com` 走内层 MITM 换 token——cc-mysub 在出口**终结**设备上真 CC 的内层 TLS、再由 **Go 网络栈重新发起**对上游的 TLS/HTTP(ClientHello 的 JA3/JA4 是 Go `crypto/tls` 的、出站默认协商 HTTP/2 并经 h1→h2 重序列化),故这两个端点上观测到的 **transport 指纹是 cc-mysub(Go) 的、非真 CC(Node/undici) 的**;请求的应用语义层逐字节保真**不受影响**。这是「MITM 换 token」的**固有代价**——盲隧道无法换 token,故唯独需要真凭据的推理端点无法保留原生 transport 指纹;**纯透传 host**(datadog / downloads 等盲隧道)是端到端 TLS,transport 指纹仍是真 CC 的。
+
+二者均**定位为承担风险, 非隐私增强**。
 
 ## 诚实边界：设备私钥暴露面 与 限流豁免
 
 **边界 #1（设备私钥是设备本地凭据，按文件权限保护）。** 设备凭据是 `device-init` 在本地生成的私钥文件 `device.key`(chmod 0600);helper 以 `--client-key` 读取它做外层 mTLS,**不**放进任何 env、也**不**继承给 `claude` 子进程。故旧版「信道 token 经 env 继承给 claude 后代(MCP / npm / Bash 工具)可读」的向量在 mTLS 下**消失**:设备内层仍持的 `CLAUDE_CODE_OAUTH_TOKEN` 已是**占位串(非凭据)**,后代读到也无用。残留暴露 = `device.key` 是该设备本地文件,**同 uid 进程 / root / 备份**可读即可冒充该设备连 cc-mysub——这是「设备本地凭据对该设备用户可读」的固有事实,作为 **deliberate accepted exposure** 如实记录,由 0600 + 删指纹吊销收敛。
 
-**边界 #2（限流豁免路径）。** mTLS 下**每个连接都已认证设备**(证书握手保证),故匿名内层请求(无 app token、但连接已认证)归入**其证书设备的限流桶**——旧版「匿名走透传且不受 per-device 限流」的 un-rate-limited relay 面**不再存在**。残留:`/api/`、`/mcp-registry` 前缀**豁免限流**(`rateLimitExemptPrefixes`,使遥测 / 注册表查询逐字节不动、不引入与直连可区分的行为)——一个被盗的设备私钥可借豁免路径不受限地发请求、消耗 cc-mysub 资源(但匿名请求被 Anthropic 401、拿不到订阅)。由 **`cc-mysub remove-device`**(吊销该证书指纹)的路径收敛。这是被接受的残留风险,非零暴露。
+**边界 #2（限流豁免路径）。** mTLS 下**每个连接都已认证设备**(证书握手保证),故匿名内层请求(无 app token、但连接已认证)归入**其证书设备的限流桶**——旧版「匿名走透传且不受 per-device 限流」的 un-rate-limited relay 面**不再存在**。残留:**仅匿名(无入站凭据)的** `/api/`、`/mcp-registry` 前缀请求豁免限流(代码 `isExempt(path) && !HasInboundCredential(r)`,使遥测 / 注册表查询逐字节不动、不引入与直连可区分的行为);**带凭据的同路径请求一律走该证书设备的 per-device 桶**(P3-7,堵借豁免前缀绕过 per-device 限流),且 dot-segment 等非规范路径不豁免(`path.Clean` fail-closed)。被豁免的匿名请求本就被 Anthropic 401、拿不到订阅,仅耗 cc-mysub 资源,由 **`cc-mysub remove-device`**(吊销该证书指纹)收敛。这是被接受的残留风险,非零暴露。
 
 ## 订阅档位声明（subscriptionType）的诚实边界
 
@@ -90,7 +95,7 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 
 - **这是客户端本地 env 声明，CC 不验真。** 在占位 token（OAUTH_TOKEN 路径）下，真 CC 直接读取本机 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 来决定 tier 自我认知，不对其真伪做任何校验。它只影响客户端自己的界面与门控，不是一道服务端授权。
 - **客户端 tier 自我认知 ≠ 服务端鉴权。** 上游真 Anthropic 是否接受这套档位，取决于代理后面挂的**真 setup-token 的真实权限**，而非客户端声明的 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。二进制层面无法断言服务端如何处理占位 subscriptionType——不要据此声称"服务端必然接受"。
-- **它不改变 B 类定位。** 整链仍是真 CC + 纯透传、与设备直连逐字节不可区分；`CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env，由客户端自行声明其持有的档位。
+- **它不改变 B 类定位。** 整链仍是真 CC + 纯透传、应用语义层与设备直连保真一致（MITM host 的 transport 指纹边界见「诚实降级」节）；`CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env，由客户端自行声明其持有的档位。
 - **不要据此"凭空获得"未持有的订阅权益。** 该 env 只让客户端按声明的档位呈现界面与功能门控；真正的订阅权益与计费归属，始终落在代理后那份真 setup-token 对应的账户上。请按你实际持有的档位填写。
 
 ## 4. 报告漏洞
@@ -104,7 +109,7 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 设备入网由通用 `install.sh` 驱动:拉部署配置(`public_host` / `subscription_type` / `release_tag` / `ca_cert_pem`,**无密钥**)→ 下二进制并按 release 的 `SHA256SUMS` 校验 → `device-init` 本地生成私钥 + 客户端证书 → 轮询现有 mTLS 端点等 operator 批准 → 写 daily `myclaude` wrapper。
 
 - **二进制完整性 fail-closed**：install.sh 从 release 拉 `SHA256SUMS`、按本平台条目校验下载的二进制,不匹配则绝不安装（`mktemp` 私有临时 + 同目录原子 `mv`,被 rename 的对象必已校验）。信任根 = GitHub 平台 + 发布该 release 的 operator(与 CI 在 GitHub 构建同属已纳入 TCB);此为**安装期传输信任**,非离线锚。reproducible build（pin-Go + `-trimpath`）是可选的独立审计 hedge。
-- **设备凭据 = 本地私钥,不经分发**：`device-init` 在设备本地生成 `device.key`(私钥**永不离开设备**);入网**不分发任何密钥**——部署配置只含公开的 host / CA 公证书 / release。daily wrapper 只含**占位 token** + 指向本地 `device.{crt,key}` 的路径,本身非凭据。`.gitignore` 已覆盖 `myclaude-*` / `*.key`。
+- **设备凭据 = 本地私钥,不经分发**：`device-init` 在设备本地生成 `device.key`(私钥**永不离开设备**);入网**不分发任何密钥**——部署配置只含公开的 host / CA 公证书 / release。daily wrapper 写在 `~/.local/bin/myclaude`(设备 HOME 下、不在仓库 work tree),只含**占位 token** + 指向本地 `device.{crt,key}` 的路径,本身非凭据。`.gitignore` 的 `*.key` 兜底防 `--config-dir=.` 时 `device.key`/`ca.key` 误入 work tree(`config.json`/`upstream.json`/`devices.json`/`certs/` 亦在忽略列表)。
 - **CA 公证书 TOFU**：部署配置内嵌 cc-mysub CA **公**证书(`ca_cert_pem`),首次拉配置时信任(TOFU);它只用于内层 MITM 验证、非密钥。
 - **逐设备显式授权**:每台新设备的证书指纹须由 operator 经 `add-device --fingerprint` 批准才登记进 `devices.json`;install.sh **轮询现有 mTLS 端点**等批准(三态探针:approved / unapproved / unreachable),**零新增公网面**。
 - **首次下载 trace 不经 cc-mysub MITM**：install.sh 在 helper 起本地分流器之前运行,且 GitHub release CDN 不在 helper allowlist;像普通开发机的 release 下载,deliberate accepted。

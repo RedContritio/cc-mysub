@@ -22,6 +22,7 @@ upstream.json
 devices.json
 certs/
 
-# per-device wrapper(嵌明文 DEVICE_TOKEN)与私钥(防 --config-dir=. 落进 work tree)
-myclaude-*
+# daily myclaude wrapper(install.sh 写到 ~/.local/bin、含占位 token 非凭据)与私钥
+# (防 --config-dir=. 时 device.key/ca.key 落进 work tree)
+myclaude
 *.key

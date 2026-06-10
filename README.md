@@ -45,14 +45,18 @@ cc-mysub gen-config --release v1.0.0 > deploy.json
 #   把 deploy.json 放到一个 HTTPS URL(如 GitHub gist 的 raw 链接),带外(私信/IM)把该 URL 给设备
 
 # 6) 启动(监听公网 443 需 root 或 setcap;后台常驻见 docs/OPERATING.md)
-sudo cc-mysub
+#    sudo 会把 HOME 重置为 root,故显式传 --config-dir 指回上面写配置的目录
+#    (~ 由当前普通用户 shell 展开,不受 sudo 影响):
+sudo cc-mysub --config-dir ~/.config/cc-mysub
+#    或免 sudo:给二进制授权绑定低端口后直接以普通用户运行(读你的 HOME、无需 --config-dir):
+#    sudo setcap cap_net_bind_service=+ep /usr/local/bin/cc-mysub && cc-mysub
 ```
 
 ### 二、接入一台设备(每台要用的设备)
 
 ```bash
 # 1) 设备上自助安装(用上面发布的配置 URL;label 默认主机名)
-curl -fsSL https://raw.githubusercontent.com/redcontritio/cc-mysub/main/install.sh | sh -s -- <配置URL> [label]
+curl -fsSL https://raw.githubusercontent.com/redcontritio/cc-mysub/main/install.sh | bash -s -- <配置URL> [label]
 
 # 2) 安装脚本会打印本设备指纹后停下等批准。在服务器上批准这台设备:
 cc-mysub add-device --fingerprint <设备打印的指纹> --label my-laptop
@@ -61,7 +65,7 @@ cc-mysub add-device --fingerprint <设备打印的指纹> --label my-laptop
 myclaude            # 就是真 claude,但走你的订阅
 ```
 
-依赖:设备需 `curl` + (`jq` 或 `python3`) + `openssl` + `sha256sum`/`shasum`;支持 linux/macOS × amd64/arm64(不支持 Windows,install.sh 是 bash)。
+依赖:设备需 `curl` + (`jq` 或 `python3`) + `openssl` + `sha256sum`/`shasum`,以及 **`claude`(Claude Code CLI)本体**(`myclaude` 是它的薄封装,缺它首跑会报 `executable file not found`;装序可后于入网);支持 linux/macOS × amd64/arm64(不支持 Windows,install.sh 是 bash,故上面用 `| bash` 调用)。
 
 ## 进阶 / 排查
 

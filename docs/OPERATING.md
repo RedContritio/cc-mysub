@@ -10,7 +10,7 @@
 - **外层客户端身份** = per-device 自签客户端证书,设备本地 `device-init` 生成(**私钥永不离开设备**);cc-mysub 在 TLS 握手时按其 **SHA-256(DER) 指纹白名单**(`devices.json`)认证,无证书/未登记指纹 → **握手即断、零应用字节**。
 - **内层 MITM** = cc-mysub 自有 CA 现签 `api.anthropic.com` 叶证书;设备经 `NODE_EXTRA_CA_CERTS` 信任该 CA。该 CA 仅用于内层,不参与外层。
 
-设备按 **fail-closed 后缀通配(档位 C)** 分流:`api.anthropic.com`/`console.anthropic.com` 经外层 mTLS 转发到 cc-mysub(内层 MITM 换 token);其余自家域名(`*.anthropic.com`/`*.claude.ai`/`*.claude.com`/`*.claudeusercontent.com`/`*.ant.dev`)与第三方遥测/MCP(`http-intake.logs.us5.datadoghq.com`/`api.datadoghq.com`/`mcp.sentry.dev`/`claude*.fedstart.com`)经 mTLS 链到 cc-mysub 走**纯透传盲隧道**(不解密、不换 token,仅收口出口 IP);只有**非自家第三方**(WebFetch 目标、用户自配 MCP、`raw.githubusercontent.com`、包管理器)helper 本地直连真主机,永不接触 cc-mysub。`base_url` 保持默认 `api.anthropic.com`,不改。分流判据权威在 `internal/hosts.Classify`,与 cc-mysub 侧同源。
+设备按 **fail-closed 后缀通配(档位 C)** 分流:`api.anthropic.com`/`console.anthropic.com` 经外层 mTLS 转发到 cc-mysub(内层 MITM 换 token);其余自家域名(`*.anthropic.com`/`*.claude.ai`/`*.claude.com`/`*.claudeusercontent.com`/`*.ant.dev`)与第三方遥测/MCP(`http-intake.logs.us5.datadoghq.com`/`api.datadoghq.com`/`mcp.sentry.dev`/`claude*.fedstart.com`)经 mTLS 链到 cc-mysub 走**纯透传盲隧道**(不解密、不换 token,仅收口出口 IP);只有**非自家第三方**(WebFetch 目标、用户自配 MCP、`raw.githubusercontent.com`、包管理器)helper 本地直连真主机,永不接触 cc-mysub。`base_url` 保持默认 `api.anthropic.com`,不改。分流判据权威在 `internal/hosts.Classify`,与 cc-mysub 侧同源。`Classify`/`IsFirstParty` 有一条**前置契约**:传入的 host 必须已 DNS 规范化(全小写、无尾点,即 `connect.ParseConnect` 的输出形态);非规范输入(`API.ANTHROPIC.COM`/`api.anthropic.com.`)会 **loud-fail panic** 而非静默 miss 成直连——该「单一事实源」的 fail-closed 保证由代码 `assertNormalized` 强制,不依赖每个调用方自觉规范化(见 `internal/hosts/hosts.go`)。
 
 订阅凭据集中服务器、永不下发;每台设备持有一份 per-device 客户端证书,按指纹独立吊销。
 
@@ -65,7 +65,9 @@ env 里有两个相互独立、输入不同的判定:
 | `ca.crt` | cc-mysub 自有 CA 公证书(仅内层 MITM 用),由 `add-device` 首次生成(幂等);经 `gen-config` 内联进部署配置(`ca_cert_pem`)下发,`install.sh` 在设备侧写出 | 0644 |
 | `ca.key` | 内层 MITM CA 私钥,由 `add-device` 首次生成,**永不入 git、永不离开本机** | 0600 |
 
-代理只存 per-device 证书的指纹(公开值),从不持有设备私钥。文件改动通过 mtime polling 热重载,无需重启。
+代理只存 per-device 证书的指纹(公开值),从不持有设备私钥。
+
+**热重载范围(诚实标注)**:mtime polling 热重载**仅覆盖 `devices.json` 与 `certs/<public_host>.{crt,key}`**(设备增删/吊销即时生效、LE 续期免重启);`config.json` / `upstream.json` / `ca.{crt,key}` 在启动时一次性加载,**改动需重启 cc-mysub 才生效**(改 token 池 / 监听地址 / CA 都属此类)。
 
 ## 设备生命周期
 
@@ -88,14 +90,16 @@ cc-mysub gen-config --release v1.0.0 > deploy.json
 ### ② 设备自助安装(`install.sh`,设备用户跑)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/redcontritio/cc-mysub/main/install.sh | sh -s -- <配置URL> [label]
+curl -fsSL https://raw.githubusercontent.com/redcontritio/cc-mysub/main/install.sh | bash -s -- <配置URL> [label]
+# install.sh 是 bash 脚本(用 set -euo pipefail),须用 `| bash` 而非 `| sh`——
+# /bin/sh=dash(<0.5.12) 不识别 set -o pipefail,会在任何输出前直接退出。
 # 无参时交互式提示「配置 URL」+「label」(label 默认主机名)。幂等可重跑。
 ```
 
 `install.sh` 拉取配置 → 按 `uname` 下载对应平台二进制(`SHA256SUMS` 校验 fail-closed)→ 写出内层 CA 到 `~/.config/cc-mysub/ca.crt` → 跑 `device-init` 在本地生成 `device.key`(0600)/`device.crt`(**私钥永不离开设备**)→ **打印本设备证书指纹**并提示去服务器登记 → 轮询现有 mTLS 端点等批准(登记后自动继续;Ctrl-C 可中断、稍后重跑)→ 写好 `~/.local/bin/myclaude` daily wrapper。
 
 - 支持平台:`linux/darwin × amd64/arm64`(Windows 不支持,install.sh 是 bash)。
-- 依赖:`curl` + (`jq` 或 `python3`) + `openssl` + `sha256sum`/`shasum`。
+- 依赖:`curl` + (`jq` 或 `python3`) + `openssl` + `sha256sum`/`shasum`,以及 **`claude`(Claude Code CLI)本体**——`myclaude` 是它的薄封装,缺它 install.sh 仍会成功打印「完成 ✓」,但首跑 `myclaude` 才报 `启动 claude: exec: "claude": executable file not found`(装序可后于入网)。
 
 ### ③ operator 批准(`add-device`,服务器)
 

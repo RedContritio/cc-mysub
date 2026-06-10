@@ -39,7 +39,7 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 **1M 是可选变体而非默认**：`CLAUDE_CODE_SUBSCRIPTION_TYPE=max` 解锁的是「1M 变体可被选择」，默认仍是 200k；需在 CC 里 `/model` 选「Opus 4.8 (1M context)」才切到 1M，切后 `/status` 才显示 1M。
 
-**诚实标注**：`CLAUDE_CODE_SUBSCRIPTION_TYPE` 是客户端**本地 env 声明、CC 不验真**——在 `CLAUDE_CODE_OAUTH_TOKEN` 路径下，客户端 CC 直读此 env、不做真伪校验。因此客户端的 tier 自我认知 ≠ 服务端鉴权：上游真 Anthropic 是否接受这套，取决于代理后面挂的真 setup-token 的真实权限，二进制层面无法断言服务端如何处理占位的 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。这不改变本方案「真 CC + 纯透传、逐字节不可区分」的合规定位，而 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env；但绝不可由此声称「服务端必然接受」或「凭空获得 Max 权益」。
+**诚实标注**：`CLAUDE_CODE_SUBSCRIPTION_TYPE` 是客户端**本地 env 声明、CC 不验真**——在 `CLAUDE_CODE_OAUTH_TOKEN` 路径下，客户端 CC 直读此 env、不做真伪校验。因此客户端的 tier 自我认知 ≠ 服务端鉴权：上游真 Anthropic 是否接受这套，取决于代理后面挂的真 setup-token 的真实权限，二进制层面无法断言服务端如何处理占位的 `CLAUDE_CODE_SUBSCRIPTION_TYPE`。这不改变本方案「真 CC + 纯透传、应用语义层保真」的合规定位，而 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 本就是给订阅用户使用的 env；但绝不可由此声称「服务端必然接受」或「凭空获得 Max 权益」。
 
 **代理对这些 env 全程无感**：`CLAUDE_CODE_OAUTH_SCOPES` 与 `CLAUDE_CODE_SUBSCRIPTION_TYPE` 都在客户端 CC 侧设置、由客户端 CC 自行消费，代理既不读取也不注入，只做透传——这正呼应下文「代理不实现任何认证逻辑」。
 
@@ -49,12 +49,12 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 | 处理 | 头 |
 |---|---|
-| 替换 | `Authorization` → `Bearer <真 setup-token>` |
-| 重设 | `Host` → `api.anthropic.com` |
-| 清理 | `X-Api-Key`（删除，防占位 / 设备凭据旁路泄漏）|
+| 替换 | `Authorization` → `Bearer <真 setup-token>`（仅带凭据分支）|
+| 绑定出站目标 | `Host` := **已验证的 CONNECT host**（`api`/`console.anthropic.com`），绝不取内层请求 Host（不可信设备控制 → 真 token 旁路，P0）|
+| 清理 | `X-Api-Key`（**仅带凭据分支**删除，防占位 / 设备凭据旁路泄漏；X-Api-Key 非空即凭据，携带者必经此分支）|
 | 透传 | 其余全部（`anthropic-version`/`anthropic-beta`/`x-stainless-*`/`user-agent`/body/query），逐字节 |
 
-代理**不补任何头**——OAuth 模式下 CC 自带 `anthropic-beta: oauth-2025-04-20`，透传即可。所有 `/v1/*` 路径透传，无白名单。
+上表的**替换 / 清理仅作用于带凭据的 MITM 请求**；匿名分支（无入站凭据）**零注入、不碰任何头**（见 `SECURITY.md`「应用层匿名透传不降级」）。代理**不补任何头**——OAuth 模式下 CC 自带 `anthropic-beta: oauth-2025-04-20`，透传即可。所有 `/v1/*` 路径透传，无白名单。
 
 ## token 替换与安全模型
 
@@ -98,8 +98,8 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 ## 防护、日志与基线告警
 
-- **限速**：per-device（按证书设备）token bucket；`/api/`、`/mcp-registry` 前缀豁免（遥测/注册表逐字节透传）。
-- **访问日志**：结构化（设备/路径/状态/用量），日志即诊断面。
+- **限速**：per-device（按证书设备）token bucket；**仅匿名（无入站凭据）的** `/api/`、`/mcp-registry` 前缀请求豁免（遥测/注册表逐字节透传），**带凭据的同路径走 per-device 桶**（P3-7）。
+- **访问日志**：结构化（设备/路径/状态/用量），日志即诊断面。已知近似：usage 嗅探缓冲上限 1 MiB，超过此体量的流式响应（最长的生成）在流尾才到的 `output_tokens` 帧被截断而嗅探不到，访问日志对这类最贵请求记 `output_tokens=0`（仅观测面，逐字节转发与计费归因不受影响）。
 - **基线偏离告警**：被动观测真实流量，**只告警不拦截**——入站缺 `oauth-2025-04-20`、`Authorization` 结构异常、凭据落在 `x-api-key`，或上游 401/403 时记一条 WARN。用于在 CC 升级改变认证行为时尽早显形，而不牺牲透传鲁棒性。
 
 ## 鲁棒性：为什么对 CC 升级免疫
@@ -110,7 +110,7 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 ## 合规定位
 
-CC MySub 在每台设备运行**真正的 Claude Code 二进制**，用 `claude setup-token` 生成的订阅凭据——这正是该命令的预期用途（给 CC 做无交互订阅认证）。中间的代理是**纯传输层**（性质同 frp / 路由器 / ISP），不做推理、不冒充 CC；上游收到的请求与设备直连逐字节不可区分。这与「第三方工具 / SDK 拿订阅 OAuth token 自己调 API」有本质区别。
+CC MySub 在每台设备运行**真正的 Claude Code 二进制**，用 `claude setup-token` 生成的订阅凭据——这正是该命令的预期用途（给 CC 做无交互订阅认证）。中间的代理是**纯传输层**（性质同 frp / 路由器 / ISP），不做推理、不冒充 CC；上游收到请求的 **HTTP 应用语义层（头值/body/query/cch）与设备直连保真一致**（`api.anthropic.com` 因 MITM 换 token，其外联 TLS/HTTP2 transport 指纹是 cc-mysub 的 Go 栈、非 undici，见 `SECURITY.md`「诚实降级」节）。这与「第三方工具 / SDK 拿订阅 OAuth token 自己调 API」有本质区别。
 
 **注意**：使用消费级 OAuth 凭据须遵守 Anthropic 的服务条款；多设备共享单份订阅应控制在合理个人使用范围内。详见 `SECURITY.md`。
 
