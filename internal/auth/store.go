@@ -55,7 +55,24 @@ func (s *DeviceStore) reload() error {
 	m := make(map[string]Device, len(list))
 	for _, d := range list {
 		if !CanonicalFingerprint(d.CertSHA256) {
-			continue // 拒空/非 64-lowercase-hex 行（错误可见，永不进表）
+			// 非规范行（空 / 非 64-lowercase-hex，多来自手编或损坏）永不进表；大声 surface，
+			// 不静默吞——否则被丢行的设备只表现为外层握手失败、两端皆无日志，「错误可见」成空话。
+			slog.Warn("devices: dropping row with non-canonical cert_sha256",
+				"label", d.Label, "cert_sha256", d.CertSHA256)
+			continue
+		}
+		if prev, dup := m[d.CertSHA256]; dup {
+			// 同一指纹多行 = 同一设备多别名：拒载整个文件（不做 last-wins），保留旧表。否则按
+			// label 吊销会假成功，而该指纹经另一行仍被授权——吊销契约 fail-open（错误可见、fail-closed）。
+			return fmt.Errorf("devices: duplicate cert_sha256 %s (labels %q and %q); refusing to load",
+				d.CertSHA256, prev.Label, d.Label)
+		}
+		if d.RateLimit < 0 {
+			// 负 rate_limit 只来自手编 devices.json（CLI 的 Resolve 在登记期已拒负值）。非安全不变量
+			// （middleware 只采信 >0），故大声告警并归零到代理默认而非拒载整个文件——避免一处 typo 锁死整个 fleet。
+			slog.Warn("devices: negative rate_limit coerced to proxy default",
+				"label", d.Label, "rate_limit", d.RateLimit)
+			d.RateLimit = 0
 		}
 		m[d.CertSHA256] = d
 	}
@@ -108,6 +125,7 @@ func (s *DeviceStore) StartWatch() {
 		defer s.wg.Done()
 		t := time.NewTicker(s.pollInterval)
 		defer t.Stop()
+		statFailing := false // 状态翻转去重：stat 持续失败时仅在进入/恢复各记一条，避免每秒刷屏。
 		for {
 			select {
 			case <-s.stop:
@@ -115,10 +133,24 @@ func (s *DeviceStore) StartWatch() {
 			case <-t.C:
 				fi, err := os.Stat(s.path)
 				if err != nil {
+					// stat 失败（文件被删 / 目录被挪 / 权限破坏）与 reload 失败同源：旧表继续
+					// 生效，但操作者必须可见——否则 `rm devices.json` 这类「紧急全撤销」直觉动作后，
+					// 全部设备无限期沿用旧授权且零信号（错误可见、fail-closed）。
+					if !statFailing {
+						slog.Error("devices stat failed; keeping previous table", "path", s.path, "err", err)
+						statFailing = true
+					}
 					continue
 				}
+				if statFailing {
+					slog.Info("devices stat recovered", "path", s.path)
+					statFailing = false
+				}
 				s.mu.RLock()
-				changed := fi.ModTime().After(s.lastMod)
+				// !Equal 而非 After：同时覆盖「同 mtime 二次写」与「mtime 回退（cp -p/rsync -a
+				// 从备份恢复，时间戳变旧）」——After 会漏掉回退（旧 mtime 永不 > lastMod），使恢复
+				// 意图静默不生效直至重启。
+				changed := !fi.ModTime().Equal(s.lastMod)
 				s.mu.RUnlock()
 				if changed {
 					if err := s.reload(); err != nil {
