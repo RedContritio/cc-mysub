@@ -23,12 +23,12 @@ func genTestCA(t *testing.T) (certPEM, keyPEM []byte) {
 	}
 
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "cc-mysub test CA"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "cc-mysub test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 	}
 
@@ -153,6 +153,75 @@ func TestLoadCA_BadDERKey(t *testing.T) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: []byte("garbage-der")})
 	if _, err := LoadCA(certPEM, keyPEM); err == nil {
 		t.Error("expected error for corrupt DER key, got nil")
+	}
+}
+
+// TestLoadCA_RejectsMismatchedKey 验证加载期 fail-fast：私钥与 CA 证书公钥不配对须被拒绝。
+// 模拟「部分备份恢复 / 手工搬动 crt 或 key 之一」造成 crt 用 keyA、随附 key 却是 keyB 的错配。
+func TestLoadCA_RejectsMismatchedKey(t *testing.T) {
+	keyA, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyB, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(4),
+		Subject:               pkix.Name{CommonName: "mismatched-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	// 证书公钥来自 keyA。
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &keyA.PublicKey, keyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	// 随附私钥却是 keyB。
+	keyDER, err := x509.MarshalECPrivateKey(keyB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if _, err := LoadCA(certPEM, keyPEM); err == nil {
+		t.Error("expected error loading mismatched key/cert pair, got nil")
+	}
+}
+
+// TestLoadCA_RejectsExpiredCA 验证加载期 fail-fast：已过期的 CA 证书须被拒绝
+// （否则 CreateCertificate 不校验 parent 有效期，会签出在设备验链时才以含糊错误暴露的叶证书）。
+// 私钥与证书配对，确保触发的是过期分支而非密钥错配分支。
+func TestLoadCA_RejectsExpiredCA(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(5),
+		Subject:               pkix.Name{CommonName: "expired-ca"},
+		NotBefore:             time.Now().Add(-48 * time.Hour),
+		NotAfter:              time.Now().Add(-24 * time.Hour), // 已过期
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if _, err := LoadCA(certPEM, keyPEM); err == nil {
+		t.Error("expected error loading expired CA cert, got nil")
 	}
 }
 
