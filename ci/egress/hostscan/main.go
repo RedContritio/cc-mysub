@@ -1,7 +1,9 @@
 // Command hostscan 静态扫描 claude 可执行文件(Mach-O 原生打包 或 npm cli.js bundle 均可),
-// 提取其中硬编码的、与「CC 自发遥测/控制面」相关的域名候选,供 egress-audit 的清单漂移守卫
-// diff 一份 checked-in 的已审基线(ci/egress/known-hosts.txt)。出现基线外的新候选 → CI 报错,
-// 逼人把新域名语义分类(CC 遥测/控制面=该进 internal/hosts 收口 vs MCP/功能端点/staging 死域=直连)。
+// 提取其中硬编码的、与「CC 自发遥测/控制面」相关的域名候选,供 egress-audit 的漂移守卫 diff 一份
+// checked-in 的已审基线(ci/egress/known-hosts.txt)。Monitored 会先把自家域名(hosts.IsFirstParty——
+// 经 FirstPartySuffixes 后缀自动收口、零维护)排除,只留需人决策的第三方候选;出现基线外的新第三方
+// 域名 → CI 报错,逼人分类(新遥测厂商/新 datadog region=加进 hosts.PassthroughExact 收口 vs 第三方
+// MCP/SDK 死码=记进基线直连)。
 //
 // 定位(诚实标注,见 docs/SUBSCRIPTION-FORWARDING.md):这是漂移「提醒」,不是穷尽「保证」。
 //  1. 只盯命中遥测/控制面关键词(kwRe)的域名——不含已知关键词的全新遥测厂商域名(如 metrics-xyz.io)
@@ -18,6 +20,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/redcontritio/cc-mysub/internal/hosts"
 )
 
 // httpsRe 抓带 scheme 的 endpoint(host 部分);bareRe 抓裸 host 字符串(如 datadog intake——
@@ -78,6 +82,19 @@ func ScanHosts(data []byte) []string {
 	return out
 }
 
+// Monitored 返回需漂移监控的域名:ScanHosts 提取结果中排除自家域名(hosts.IsFirstParty——经后缀
+// 自动收口、无需基线管理),只留需精确决策的第三方候选(新遥测厂商/新 datadog region 之类)。
+func Monitored(data []byte) []string {
+	var out []string
+	for _, h := range ScanHosts(data) {
+		if hosts.IsFirstParty(h) {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 func main() {
 	if len(os.Args) != 2 {
 		fmt.Fprintln(os.Stderr, "usage: hostscan <path-to-claude-executable>")
@@ -88,7 +105,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "read %s: %v\n", os.Args[1], err)
 		os.Exit(2)
 	}
-	for _, h := range ScanHosts(data) {
+	for _, h := range Monitored(data) {
 		fmt.Println(h)
 	}
 }

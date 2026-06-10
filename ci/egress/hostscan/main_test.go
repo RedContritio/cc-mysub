@@ -41,6 +41,22 @@ func TestScanHosts_bareDatadogIntake(t *testing.T) {
 	}
 }
 
+// Monitored 排除自家域名(后缀自动收口),只留需基线管理的第三方候选。
+func TestMonitored(t *testing.T) {
+	data := []byte(`
+		a="https://api.anthropic.com/v1"       // 自家(MITM)→排除
+		b="status.claude.com"                  // 自家(后缀)→排除
+		c="http-intake.logs.us5.datadoghq.com" // 第三方收口→保留
+		d="https://api.datadoghq.com/mcp"      // 第三方 MCP→保留
+		e="https://github.com/x"               // 非关键词→ScanHosts 已滤
+	`)
+	got := Monitored(data)
+	want := []string{"api.datadoghq.com", "http-intake.logs.us5.datadoghq.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Monitored\n got: %v\nwant: %v", got, want)
+	}
+}
+
 // github 等功能域名不得进入候选(关键词子集只盯遥测/控制面;功能/MCP 域名本就直连)。
 func TestScanHosts_dropsNonKeyword(t *testing.T) {
 	got := ScanHosts([]byte(`https://github.com/x https://registry.npmjs.org/y https://login.microsoftonline.com/z`))

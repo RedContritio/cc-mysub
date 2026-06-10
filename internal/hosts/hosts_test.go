@@ -63,6 +63,22 @@ func TestExactSetsDisjoint(t *testing.T) {
 	}
 }
 
+func TestIsFirstParty(t *testing.T) {
+	first := []string{"anthropic.com", "api.anthropic.com", "foo.claude.ai", "claude.com", "bridge.claudeusercontent.com", "beacon.claude-ai.staging.ant.dev"}
+	for _, h := range first {
+		if !IsFirstParty(h) {
+			t.Errorf("IsFirstParty(%q) = false, want true", h)
+		}
+	}
+	// 第三方(精确收口/直连)与混淆域名不算自家
+	third := []string{"api.datadoghq.com", "mcp.sentry.dev", "claude.fedstart.com", "github.com", "evil-anthropic.com"}
+	for _, h := range third {
+		if IsFirstParty(h) {
+			t.Errorf("IsFirstParty(%q) = true, want false", h)
+		}
+	}
+}
+
 func TestMatchSuffix(t *testing.T) {
 	cases := []struct {
 		host, suffix string

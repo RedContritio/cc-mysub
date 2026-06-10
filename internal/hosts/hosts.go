@@ -89,3 +89,15 @@ func Classify(host string) Class {
 	}
 	return Direct
 }
+
+// IsFirstParty 报告 host 是否命中任一 Anthropic/Claude 自家域名后缀(FirstPartySuffixes)。
+// 自家域名经 Classify 自动 passthrough 收口、无需逐个登记或漂移监控,故 egress-audit 的漂移
+// 守卫(ci/egress/hostscan)用它把自家域名从基线 diff 中排除——只留需精确决策的第三方收口域名。
+func IsFirstParty(host string) bool {
+	for _, s := range FirstPartySuffixes {
+		if matchSuffix(host, s) {
+			return true
+		}
+	}
+	return false
+}
