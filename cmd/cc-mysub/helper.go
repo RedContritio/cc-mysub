@@ -62,12 +62,7 @@ func runHelper(args []string) int {
 	proxyURL := "http://" + ln.Addr().String()
 	cmd := exec.Command(childArgs[0], childArgs[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	cmd.Env = append(os.Environ(),
-		"HTTPS_PROXY="+proxyURL,
-		"HTTP_PROXY="+proxyURL,
-		"ALL_PROXY="+proxyURL,
-		"NODE_USE_ENV_PROXY=1",
-	)
+	cmd.Env = proxyEnv(os.Environ(), proxyURL)
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -77,4 +72,25 @@ func runHelper(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// proxyEnv 返回让 claude 走本地 splitter 的环境:先剔除可能绕过 splitter 的代理变量(NO_PROXY 直连
+// 豁免、任意大小写的 *_proxy),再注入权威大写值。否则环境残留 NO_PROXY=anthropic.com 或小写
+// https_proxy 会让自家流量静默绕过收口、泄漏设备真实 IP(codex 全仓审查 P2-5)。
+func proxyEnv(base []string, proxyURL string) []string {
+	out := make([]string, 0, len(base)+4)
+	for _, kv := range base {
+		k, _, _ := strings.Cut(kv, "=")
+		switch strings.ToUpper(k) {
+		case "NO_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out,
+		"HTTPS_PROXY="+proxyURL,
+		"HTTP_PROXY="+proxyURL,
+		"ALL_PROXY="+proxyURL,
+		"NODE_USE_ENV_PROXY=1",
+	)
 }

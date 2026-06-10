@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -93,5 +94,43 @@ func TestHelper_InjectsProxyAndRunsChild(t *testing.T) {
 	re := regexp.MustCompile(`^http://127\.0\.0\.1:\d+\|1$`)
 	if !re.Match(got) {
 		t.Errorf("child env = %q, want HTTPS_PROXY=http://127.0.0.1:<port> and NODE_USE_ENV_PROXY=1", got)
+	}
+}
+
+// TestProxyEnv 校验代理环境清理:残留的 NO_PROXY/任意大小写 *_proxy 被剔(防绕过 splitter),
+// 权威大写值被设,非代理变量保留(codex 全仓审查 P2-5)。
+func TestProxyEnv(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"NO_PROXY=anthropic.com",
+		"no_proxy=claude.ai",
+		"HTTPS_PROXY=http://old",
+		"https_proxy=http://old2",
+		"http_proxy=http://old3",
+		"ALL_PROXY=socks://old",
+		"HOME=/home/x",
+	}
+	m := map[string]string{}
+	for _, kv := range proxyEnv(base, "http://127.0.0.1:9999") {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	// NO_PROXY 剔除不重设(防直连豁免);小写代理变体剔除(改用权威大写)
+	for _, k := range []string{"NO_PROXY", "no_proxy", "https_proxy", "http_proxy", "all_proxy"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%s 应被剔除,仍在(可绕过 splitter): %q", k, m[k])
+		}
+	}
+	// 权威大写代理值已设,base 里的旧值(http://old / socks://old)被替换
+	for _, k := range []string{"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"} {
+		if m[k] != "http://127.0.0.1:9999" {
+			t.Errorf("%s=%q want http://127.0.0.1:9999(旧值未替换?)", k, m[k])
+		}
+	}
+	if m["NODE_USE_ENV_PROXY"] != "1" {
+		t.Errorf("NODE_USE_ENV_PROXY=%q want 1", m["NODE_USE_ENV_PROXY"])
+	}
+	if m["PATH"] != "/usr/bin" || m["HOME"] != "/home/x" {
+		t.Errorf("非代理变量丢失: PATH=%q HOME=%q", m["PATH"], m["HOME"])
 	}
 }
