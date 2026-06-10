@@ -23,7 +23,8 @@ import (
 func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
 	fs := flag.NewFlagSet("device-init", flag.ContinueOnError)
 	fs.SetOutput(out)
-	label := fs.String("label", "", "device label (default: hostname)")
+	// label 仅用于打印 add-device 登记命令，绝不写入证书 CN（CN 恒为固定非 PII 占位，见下）。
+	label := fs.String("label", "", "device label（仅用于打印 add-device 登记命令；不写入证书 CN）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -31,7 +32,19 @@ func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
 	crtPath := filepath.Join(cfgDir, "device.crt")
 
 	// 幂等：已存在则只重打印指纹，绝不重生成（避免覆盖已登记的设备身份）。
-	if fileExists(keyPath) && fileExists(crtPath) {
+	// statExists 把非 NotExist 的 stat 错误（瞬时 EIO/路径异常等）原样 surface，而非误判为「不存在」
+	// 走重生成分支、用新私钥原子覆盖既有 device.key（旧指纹随之作废且不可恢复）——对齐 enroll.EnsureCA。
+	keyExists, err := statExists(keyPath)
+	if err != nil {
+		fmt.Fprintln(out, "检查 device.key:", err)
+		return 1
+	}
+	crtExists, err := statExists(crtPath)
+	if err != nil {
+		fmt.Fprintln(out, "检查 device.crt:", err)
+		return 1
+	}
+	if keyExists && crtExists {
 		der, err := readCertDER(crtPath)
 		if err != nil {
 			fmt.Fprintf(out, "device.crt 损坏，无法解析: %v\n", err)
@@ -50,12 +63,10 @@ func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
 		fmt.Fprintln(out, "生成密钥:", err)
 		return 1
 	}
-	cn := *label
-	if cn == "" {
-		// 固定非 PII CN：不取主机名，避免把设备标识写进客户端证书（TLS1.2 下证书在握手中明文，
-		// frps 透传虽不解密但链路上可被旁观）。身份由指纹承载，CN 仅作占位、不参与认证。
-		cn = "cc-mysub-device"
-	}
+	// CN 与 label 解耦：CN 恒为固定非 PII 占位，绝不取 label/主机名——避免把设备标识写进客户端证书
+	// （TLS1.2 下证书在握手中明文，frps 透传虽不解密但链路上可被旁观；install.sh 默认以 hostname 作
+	// label，若 label 进 CN 即把主机名泄漏进证书）。身份由指纹承载，CN 不参与认证；label 仅供打印登记命令。
+	const cn = "cc-mysub-device"
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		fmt.Fprintln(out, "生成序列号:", err)
@@ -90,7 +101,7 @@ func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
 		fmt.Fprintln(out, "写证书:", err)
 		return 1
 	}
-	printEnroll(out, der, cn)
+	printEnroll(out, der, *label)
 	return 0
 }
 
@@ -103,9 +114,16 @@ func printEnroll(out io.Writer, der []byte, label string) {
 	fmt.Fprintf(out, "  cc-mysub add-device --label %q --fingerprint %s\n", label, fp)
 }
 
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
+// statExists 报告 path 是否存在；NotExist → false,nil；其余 stat 错误（权限/IO/路径异常）原样
+// surface——不能误判为「不存在」走重生成分支覆盖既存 device.key（对齐 enroll.EnsureCA 的 statExists）。
+func statExists(path string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return true, nil
+	} else if os.IsNotExist(err) {
+		return false, nil
+	} else {
+		return false, fmt.Errorf("stat %s: %w", path, err)
+	}
 }
 
 func readCertDER(crtPath string) ([]byte, error) {

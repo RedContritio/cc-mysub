@@ -47,7 +47,7 @@ func main() {
 		os.Exit(runDeviceInit(os.Args[2:], defaultConfigDir(), os.Stdout))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "gen-config" {
-		os.Exit(runGenConfig(os.Args[2:], defaultConfigDir(), os.Stdout))
+		os.Exit(runGenConfig(os.Args[2:], defaultConfigDir(), os.Stdout, os.Stderr))
 	}
 
 	cfgDir := flag.String("config-dir", defaultConfigDir(), "config directory")
@@ -69,7 +69,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 加载 cc-mysub CA：既作外层 TLS 身份的现签根，也作内层 MITM 现签根。
+	// 加载 cc-mysub 自有 CA：仅作内层 MITM 现签根（api/console.anthropic.com 叶证书）。
+	// 外层 TLS 身份用真 LE 证书（见下文 certs/<public_host>.{crt,key}），不靠此 CA。
 	caCert, err := os.ReadFile(filepath.Join(*cfgDir, "ca.crt"))
 	if err != nil {
 		slog.Error("read ca.crt", "err", err)
@@ -131,10 +132,29 @@ func main() {
 	}
 }
 
-func defaultConfigDir() string {
+// resolveConfigDir 解析默认配置目录：优先 XDG_CONFIG_HOME，否则用户主目录下 .config/cc-mysub。
+// HOME/用户主目录不可解析时返回 error——绝不静默回退到文件系统根下的 /.config/cc-mysub。
+// LaunchDaemon 的最小环境不含 HOME，os.UserHomeDir 此时返回错误；若把错误丢给 `_` 并继续，
+// 配置目录会静默解析为根路径、读不到 operator 写入的真实配置，进而 LoadConfig 失败 + KeepAlive
+// 无限 crash-loop（错误只落在 /tmp 日志）。错误可见纪律要求此处 fail-fast 而非静默回退。
+func resolveConfigDir() (string, error) {
 	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
-		return filepath.Join(d, "cc-mysub")
+		return filepath.Join(d, "cc-mysub"), nil
 	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "cc-mysub")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("无法确定配置目录: %w; 请设置 XDG_CONFIG_HOME 或显式传 --config-dir", err)
+	}
+	return filepath.Join(home, ".config", "cc-mysub"), nil
+}
+
+// defaultConfigDir 返回默认配置目录，解析失败即 fail-fast（slog.Error + os.Exit(1)）——
+// 所有子命令与服务主路径共用此默认值，不静默用根路径继续。
+func defaultConfigDir() string {
+	dir, err := resolveConfigDir()
+	if err != nil {
+		slog.Error("default config dir", "err", err)
+		os.Exit(1)
+	}
+	return dir
 }

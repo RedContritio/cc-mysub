@@ -72,6 +72,52 @@ func TestDeviceInit_GeneratesKeyCertPrintsFingerprint(t *testing.T) {
 	}
 }
 
+// TestDeviceInit_LabelNotInCertCN 守 id 44：--label 仅用于打印登记命令，绝不写进证书 CN
+// （install.sh 默认以 hostname 作 label；若 label 进 CN 即把主机名/PII 泄漏进客户端证书）。
+// CN 恒为固定非 PII 占位 "cc-mysub-device"，身份由指纹承载。
+func TestDeviceInit_LabelNotInCertCN(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "cc-mysub")
+	var out bytes.Buffer
+	const label = "my-secret-hostname"
+	if rc := runDeviceInit([]string{"-label", label}, cfg, &out); rc != 0 {
+		t.Fatalf("rc=%d out=%s", rc, out.String())
+	}
+	der := diReadCertDER(t, filepath.Join(cfg, "device.crt"))
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaf.Subject.CommonName != "cc-mysub-device" {
+		t.Errorf("cert CN = %q, want fixed non-PII placeholder cc-mysub-device (label must not enter CN)", leaf.Subject.CommonName)
+	}
+	if strings.Contains(leaf.Subject.CommonName, label) {
+		t.Errorf("device label leaked into cert CN: %q", leaf.Subject.CommonName)
+	}
+	// label 仍出现在打印的 add-device 登记命令里（供 operator 直接粘贴）。
+	if !strings.Contains(out.String(), label) {
+		t.Errorf("printed enroll command should carry the label %q:\n%s", label, out.String())
+	}
+}
+
+// TestDeviceInit_StatErrorIsVisible 守 id 64：非 NotExist 的 stat 错误不得被塌缩成「不存在」走
+// 重生成分支（会覆盖既有 device.key）。把 cfgDir 设成一个普通文件 → stat 子路径返回 ENOTDIR
+// （os.IsNotExist 为 false）→ runDeviceInit 须报错退出而非静默继续。
+func TestDeviceInit_StatErrorIsVisible(t *testing.T) {
+	// cfgDir 指向一个普通文件，使 filepath.Join(cfgDir, "device.key") 的 stat 触发 ENOTDIR。
+	notADir := filepath.Join(t.TempDir(), "iam-a-file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	rc := runDeviceInit(nil, notADir, &out)
+	if rc == 0 {
+		t.Fatalf("expected nonzero rc when stat returns a non-NotExist error, got 0; out=%s", out.String())
+	}
+	if out.Len() == 0 {
+		t.Errorf("stat error must be surfaced (错误可见), got empty output")
+	}
+}
+
 func TestDeviceInit_Idempotent(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "cc-mysub")
 	if rc := runDeviceInit(nil, cfg, &bytes.Buffer{}); rc != 0 {

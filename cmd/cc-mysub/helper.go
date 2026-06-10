@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/redcontritio/cc-mysub/internal/connect"
 	"github.com/redcontritio/cc-mysub/internal/splitter"
 )
 
@@ -51,9 +52,10 @@ func runHelper(args []string) int {
 	}
 	defer ln.Close()
 
-	var extra []string
-	if *allowCSV != "" {
-		extra = strings.Split(*allowCSV, ",")
+	extra, err := parseAllow(*allowCSV)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
 	sp := splitter.New(*host, cert, extra, nil)
 	go sp.Serve(ln) //nolint:errcheck
@@ -74,11 +76,18 @@ func runHelper(args []string) int {
 	return 0
 }
 
-// proxyEnv 返回让 claude 走本地 splitter 的环境:先剔除可能绕过 splitter 的代理变量(NO_PROXY 直连
-// 豁免、任意大小写的 *_proxy),再注入权威大写值。否则环境残留 NO_PROXY=anthropic.com 或小写
-// https_proxy 会让自家流量静默绕过收口、泄漏设备真实 IP(codex 全仓审查 P2-5)。
+// proxyEnv 返回让 claude 走本地 splitter 的环境:先剔除可能绕过/误导 splitter 的全部代理变量
+// (NO_PROXY 直连豁免、任意大小写的 *_proxy),再只注入 HTTPS_PROXY 指向本地 splitter。
+//
+// 只注入 HTTPS_PROXY、不注入 HTTP_PROXY/ALL_PROXY 是有意为之:splitter 只实现 CONNECT 隧道,而
+// plain-HTTP 经代理是 absolute-form `GET http://... HTTP/1.1`(curl/git/npm 对 http:// URL),splitter
+// 一律回 400——若注入 HTTP_PROXY/ALL_PROXY,claude 的 Bash 子进程对任何 http:// 目标既不直连也不转发
+// 而是 400,违背 README「其余一切本地直连」声明。需收口的 first-party 端点(internal/hosts:api/console/
+// 遥测/下载)全为 HTTPS,HTTPS_PROXY 已完整覆盖;plain-HTTP 必非 first-party,不注入即按「本地直连」走
+// (与第三方 https 直连同策,不泄漏 token 或 first-party IP)。仍剔除继承的 HTTP_PROXY/ALL_PROXY/小写
+// 变体/NO_PROXY,避免残留值让自家 HTTPS 流量静默绕过收口、泄漏设备真实 IP(codex 全仓审查 P2-5)。
 func proxyEnv(base []string, proxyURL string) []string {
-	out := make([]string, 0, len(base)+4)
+	out := make([]string, 0, len(base)+2)
 	for _, kv := range base {
 		k, _, _ := strings.Cut(kv, "=")
 		switch strings.ToUpper(k) {
@@ -89,8 +98,30 @@ func proxyEnv(base []string, proxyURL string) []string {
 	}
 	return append(out,
 		"HTTPS_PROXY="+proxyURL,
-		"HTTP_PROXY="+proxyURL,
-		"ALL_PROXY="+proxyURL,
 		"NODE_USE_ENV_PROXY=1",
 	)
+}
+
+// parseAllow 把 --allow 的逗号分隔值规范化为与 splitter 收口查找一致的 host 形态:TrimSpace + ToLower +
+// 剥尾点 FQDN,镜像 connect.ParseConnect 对 CONNECT host 的规范化(connect.go:23),否则带空格/大写/尾点的
+// override(如 " Mcp.Notion.So"/"foo.example.")存进 extra map 后永远匹配不到规范化后的 host、收口静默
+// no-op、该 host 落回直连泄漏设备 IP——正是 split-egress 要防的隐私回退。非法条目(含端口/通配/非法字符)
+// 经 connect.ValidHost 直接 loud-fail(返回 error),让 typo 的 override 可见而非静默忽略;纯空段(尾随逗号
+// 等良性格式)跳过。
+func parseAllow(csv string) ([]string, error) {
+	if csv == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, raw := range strings.Split(csv, ",") {
+		h := strings.ToLower(strings.TrimRight(strings.TrimSpace(raw), "."))
+		if h == "" {
+			continue
+		}
+		if !connect.ValidHost(h) {
+			return nil, fmt.Errorf("--allow 含非法 host %q (规范化后 %q): 须为裸主机名/IP, 不含端口/通配/空格", raw, h)
+		}
+		out = append(out, h)
+	}
+	return out, nil
 }
