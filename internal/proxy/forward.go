@@ -130,6 +130,8 @@ type ForwardProxy struct {
 	outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
 	sema      chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
 	wg        sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
+	connMu    sync.Mutex                                           // 保护 conns
+	conns     map[string]map[net.Conn]struct{}                     // fingerprint → 活跃外层连接（P1-2：吊销时主动断开）
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
@@ -173,6 +175,48 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 		},
 		outerCert: outerCert,
 		sema:      make(chan struct{}, maxInFlight),
+		conns:     make(map[string]map[net.Conn]struct{}),
+	}
+}
+
+// registerConn 把外层连接登记到其设备指纹(P1-2:供 RevokeConns 主动断开)。
+func (fp *ForwardProxy) registerConn(fingerprint string, c net.Conn) {
+	fp.connMu.Lock()
+	defer fp.connMu.Unlock()
+	set := fp.conns[fingerprint]
+	if set == nil {
+		set = make(map[net.Conn]struct{})
+		fp.conns[fingerprint] = set
+	}
+	set[c] = struct{}{}
+}
+
+// unregisterConn 在 handle 退出时注销连接。
+func (fp *ForwardProxy) unregisterConn(fingerprint string, c net.Conn) {
+	fp.connMu.Lock()
+	defer fp.connMu.Unlock()
+	if set := fp.conns[fingerprint]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(fp.conns, fingerprint)
+		}
+	}
+}
+
+// RevokeConns 关闭这些 fingerprint 的所有既有外层连接——吊销即时生效:既有长连接被断,claude 重连时
+// 新外层 mTLS 握手被 VerifyPeerCertificate 拒(指纹已不在 devices.json)。供 DeviceStore.SetOnRevoke 回调。
+// 先锁内收集、锁外 Close:Close 触发 handle 退出 → unregisterConn 再取 connMu,锁外避免重入死锁。
+func (fp *ForwardProxy) RevokeConns(fingerprints []string) {
+	fp.connMu.Lock()
+	var toClose []net.Conn
+	for _, f := range fingerprints {
+		for c := range fp.conns[f] {
+			toClose = append(toClose, c)
+		}
+	}
+	fp.connMu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
 	}
 }
 
@@ -222,6 +266,9 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
+	// 握手成功:把该外层连接登记到其设备指纹,供吊销时主动断开(P1-2);handle 退出时注销。
+	fp.registerConn(connDevice.CertSHA256, outer)
+	defer fp.unregisterConn(connDevice.CertSHA256, outer)
 	br := bufio.NewReader(outer)
 	// 手动字节累加器(pre-200 cap):CONNECT 行 + 每个头行长度累加,超 maxConnectHeaderBytes → 400 + Close。
 	// 不用 io.LimitReader 包 conn——会被 bufio 预读误计并破坏 br.Buffered()/prefixConn 回放。

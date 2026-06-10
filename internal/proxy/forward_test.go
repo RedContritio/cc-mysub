@@ -273,6 +273,56 @@ func connect200(t *testing.T, outer net.Conn, host string) *bufio.Reader {
 	return br
 }
 
+// TestRevokeConns 验证 P1-2:RevokeConns 关闭目标 fingerprint 的所有既有连接,不碰其它 fingerprint。
+func TestRevokeConns(t *testing.T) {
+	fp := &ForwardProxy{conns: make(map[string]map[net.Conn]struct{})}
+	a1, a1p := net.Pipe()
+	a2, a2p := net.Pipe()
+	b1, b1p := net.Pipe()
+	defer func() { a1p.Close(); a2p.Close(); b1p.Close() }()
+	fp.registerConn("fpA", a1)
+	fp.registerConn("fpA", a2)
+	fp.registerConn("fpB", b1)
+
+	fp.RevokeConns([]string{"fpA"})
+
+	// fpA 的 a1/a2 被关:对已关 net.Pipe 端 Write 应失败
+	for i, c := range []net.Conn{a1, a2} {
+		_ = c.SetDeadline(time.Now().Add(time.Second))
+		if _, err := c.Write([]byte("x")); err == nil {
+			t.Errorf("revoked conn %d still writable", i)
+		}
+	}
+	// fpB 的 b1 不受影响:仍可写(peer 读走)
+	go func() { buf := make([]byte, 1); _, _ = b1p.Read(buf) }()
+	_ = b1.SetDeadline(time.Now().Add(time.Second))
+	if _, err := b1.Write([]byte("y")); err != nil {
+		t.Errorf("non-target conn closed: %v", err)
+	}
+}
+
+// TestForwardProxy_RevokeClosesActiveConn 端到端验证 P1-2:已建立的外层连接被 handle 注册后,
+// RevokeConns 关它 → 客户端侧读到连接断开(吊销即时生效,不必等连接自然结束)。
+func TestForwardProxy_RevokeClosesActiveConn(t *testing.T) {
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	br := connect200(t, outer, "api.anthropic.com") // 握手+CONNECT 完成 → handle 已 registerConn(cfp)
+
+	fp.RevokeConns([]string{cfp}) // 主动吊销该指纹的既有连接
+
+	// 客户端侧:连接被服务端关 → 读到 EOF/error(而非阻塞到超时)
+	_ = outer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := br.Read(make([]byte, 1)); err == nil {
+		t.Error("revoked active connection still readable (server did not close it)")
+	}
+}
+
 func TestForwardProxy_EndToEnd(t *testing.T) {
 	// 1) 假真上游 (TLS)，记录每个请求的 Authorization
 	var gotAuth []string

@@ -74,6 +74,40 @@ func TestDevice_UpstreamField(t *testing.T) {
 	}
 }
 
+// TestReloadCallsOnRevoke 验证 P1-2:reload 检测到 fingerprint 从 devices.json 删除时回调 onRevoke
+// (供 forward-proxy 主动断开被吊销设备的既有连接);无变化的 reload 不重复回调。
+func TestReloadCallsOnRevoke(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "devices.json")
+	fpA := strings.Repeat("a", 64)
+	fpB := strings.Repeat("b", 64)
+	writeDevices(t, p, `[{"label":"a","cert_sha256":"`+fpA+`"},{"label":"b","cert_sha256":"`+fpB+`"}]`)
+	s, err := NewDeviceStore(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	s.SetOnRevoke(func(removed []string) { got = append(got, removed...) })
+
+	// 删 A 只留 B → reload 回调 onRevoke([fpA])
+	writeDevices(t, p, `[{"label":"b","cert_sha256":"`+fpB+`"}]`)
+	if err := s.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != fpA {
+		t.Fatalf("onRevoke got %v, want [%s]", got, fpA)
+	}
+
+	// 无变化 reload → 不重复回调
+	got = nil
+	if err := s.reload(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Errorf("onRevoke called on no-change reload: %v", got)
+	}
+}
+
 func TestStoreHotReload(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "devices.json")

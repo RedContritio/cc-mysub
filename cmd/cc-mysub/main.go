@@ -68,7 +68,6 @@ func main() {
 		slog.Error("load devices", "err", err)
 		os.Exit(1)
 	}
-	store.StartWatch()
 
 	// 加载 cc-mysub CA：既作外层 TLS 身份的现签根，也作内层 MITM 现签根。
 	caCert, err := os.ReadFile(filepath.Join(*cfgDir, "ca.crt"))
@@ -111,6 +110,10 @@ func main() {
 	// CONNECT 目标分类由 internal/hosts.Classify 权威裁决（MITM 换 token / 透传盲隧道 / 403）——
 	// 与设备 splitter 共用同一事实源。fail-closed：自家域名后缀通配收口，第三方精确登记。
 	fp := proxy.NewForwardProxy(minter, store, up, nil, outerCert, 512)
+	// 设备从 devices.json 删除(吊销)时,主动断开其既有外层连接,使吊销即时生效(P1-2)。
+	// 在 StartWatch 前设回调,确保第一次热重载就能触发主动断开。
+	store.SetOnRevoke(fp.RevokeConns)
+	store.StartWatch()
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

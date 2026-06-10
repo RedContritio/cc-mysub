@@ -27,6 +27,8 @@ type DeviceStore struct {
 	stop      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+
+	onRevoke func([]string) // 被删除(吊销)的 fingerprint 回调;reload 检测到删除时调(P1-2)
 }
 
 func NewDeviceStore(path string) (*DeviceStore, error) {
@@ -58,10 +60,34 @@ func (s *DeviceStore) reload() error {
 		m[d.CertSHA256] = d
 	}
 	s.mu.Lock()
+	old := s.byHash
 	s.byHash = m
 	s.lastMod = fi.ModTime()
+	cb := s.onRevoke
 	s.mu.Unlock()
+
+	// diff:旧表有、新表无的 fingerprint = 被吊销 → 回调(forward-proxy 关其既有外层连接,P1-2 即时吊销)。
+	// 锁外调,避免回调里再触及 store 造成重入。首次 reload(old==nil)无 diff。
+	if cb != nil && old != nil {
+		var removed []string
+		for fp := range old {
+			if _, ok := m[fp]; !ok {
+				removed = append(removed, fp)
+			}
+		}
+		if len(removed) > 0 {
+			cb(removed)
+		}
+	}
 	return nil
+}
+
+// SetOnRevoke 注册「fingerprint 从 devices.json 删除(吊销)」的回调,reload 检测到删除时调用。
+// 用于 P1-2:让 forward-proxy 主动断开被吊销设备的既有外层连接,使吊销即时生效。须在 StartWatch 前设。
+func (s *DeviceStore) SetOnRevoke(f func([]string)) {
+	s.mu.Lock()
+	s.onRevoke = f
+	s.mu.Unlock()
 }
 
 // Lookup 按客户端证书指纹（SHA-256(DER) 小写 hex）直接查白名单。fp 已是 digest，
