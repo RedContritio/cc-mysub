@@ -124,16 +124,15 @@ JSON
 
 AUDIT_CA="$WORK/audit-ca"   # audit CA + api.anthropic.com / evil.example leaves (system-trusted)
 
-apply_firewall_v4() {
-  # = apply_firewall (default-DROP OUTPUT, lo ACCEPT) + a QUIC bypass guard:
-  # LOG+DROP udp dport 443. The lo ACCEPT (added by apply_firewall) precedes this
-  # DROP, so localhost UDP is unaffected (DNS to 127.0.0.1:53 is udp:53, not :443).
-  # In the sealed netns there is no real egress; this rule is a regression guard so
-  # a future leak via QUIC/HTTP3 to :443 trips the LOG counter we assert on below.
-  apply_firewall
-  in_ns iptables -A OUTPUT -p udp --dport 443 -j LOG --log-prefix "QUIC-DROP " || true
-  in_ns iptables -A OUTPUT -p udp --dport 443 -j DROP || true
-}
+# NB(id 34): there is intentionally no separate QUIC/HTTP3 (udp:443) guard. The audit
+# netns has only lo and no external route, so any UDP egress to a non-loopback address
+# fails at routing (ENETUNREACH) before it ever enters the OUTPUT chain — a QUIC leak is
+# structurally impossible here, not merely dropped. The former LOG+DROP udp:443 rule sat
+# *after* `-A OUTPUT -o lo ACCEPT`, and the DNS catch-all maps every name to 127.0.0.x, so
+# its counter was permanently zero (the asserted-on counter never existed and could not be
+# nonzero) = dead defensive code with a comment claiming coverage it never had. Removed in
+# favor of honest documentation; stage_split uses apply_firewall directly. TCP sealing is
+# proven by selfcheck_seal.
 
 # gen_audit_pki: one audit CA + leaves for api.anthropic.com and evil.example.
 # The CA is installed into the container trust store so cc-mysub's default
@@ -255,10 +254,18 @@ start_services_split() {
   log "services up (cc-mysub:443 mock:127.0.0.2:443/TLS sink:127.0.0.3:443 dns:53)"
 }
 
+# b_sni_count <host>: echo B(mock)的 SNI inventory 中该 host 的连接计数(缺则空)。供 ASSERT-C 的
+# 来源归因校验(id 35)使用。mock.out 渲染格式为 "%-44s count=%d",故 host 行有前导标记段后 $1=host、
+# $2=count=N;限定在 "B EGRESS SNI INVENTORY" 段内匹配,避免误读 Authorization 段。
+b_sni_count() {
+  awk -v h="$1" '/B EGRESS SNI INVENTORY/{f=1; next} f && $1==h {n=$2; sub(/^count=/,"",n); print n; exit}' \
+    "$WORK/mock.out" 2>/dev/null
+}
+
 stage_split() {
   # ---- v4 split-egress coverage guard, mTLS-adapted (see banner above). ----
   setup_netns
-  apply_firewall_v4
+  apply_firewall   # default-DROP OUTPUT + lo ACCEPT(QUIC udp:443 在 lo-only netns 不可达,见上 NB id 34)
   selfcheck_seal   # 主动验证密封（netns 无外网卡；连任一公网 IP 必失败，连通=seal leak→fail）
   build_bins_v4
   gen_ccmysub_ca_and_enroll
@@ -320,9 +327,14 @@ stage_split() {
   # 403 它、它绝不到 B。这区别于 Probe B(evil 经直连落 sink):rogue **确实流经 cc-mysub** 并被其
   # 收口策略拒绝,故 ASSERT-SCOPE 检验的是 cc-mysub 的 allowlist、而非 DNS 拓扑的副产物。
   log "Probe D: curl via helper --allow rogue.example (force-chain a deny host, over-forward probe) ..."
+  # -sS(非 -s): 保留 curl 的错误行,使「代理 CONNECT 被拒(502)」在 curlD.out 可见 → ASSERT-SCOPE
+  # 的存活性正向断言可证伪(见下)。不带 `|| true`,捕获 rc。
   in_ns "$WORK/bin/cc-mysub" helper \
     --host "$PROXY_HOST" --client-cert "$DEV_CRT" --client-key "$DEV_KEY" --allow rogue.example \
-    -- curl -sk --max-time 10 https://rogue.example/probe > "$WORK/curlD.out" 2>&1 || true
+    -- curl -sS -k --max-time 10 https://rogue.example/probe > "$WORK/curlD.out" 2>&1
+  local curlD_rc=$?
+  echo "[run.sh] Probe D curl rc=$curlD_rc"
+  echo "----- curlD.out -----"; cat "$WORK/curlD.out" 2>/dev/null; echo "---------------------"
   sleep 1
 
   # Drain recorders (SIGINT flushes mock auths + B SNI inventory + sink inventory to stdout).
@@ -347,21 +359,46 @@ stage_split() {
   # tunnel — proves the splitter chained it to cc-mysub (not direct-dialed) — AND (2) appear
   # in B's SNI inventory — proves it reached the unified egress (cc-mysub didn't 403 it).
   for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai status.anthropic.com api.datadoghq.com; do
-    grep -F "passthrough" "$WORK/cc.err" 2>/dev/null | grep -qF "$ph" \
+    local ptcount
+    ptcount="$(grep -F "passthrough" "$WORK/cc.err" 2>/dev/null | grep -cF "$ph")"
+    [ "$ptcount" -gt 0 ] \
       || fail "ASSERT-C: cc-mysub never logged passthrough for $ph (splitter direct-dialed it? not chained)"
     grep -qF "$ph" "$WORK/mock.out" 2>/dev/null \
       || fail "ASSERT-C: B SNI inventory missing $ph (cc-mysub 403'd it? not forwarded to egress)"
+    # 来源归因(id 35): B 上看到 $ph 的连接数必须 ≤ cc-mysub 记录的 passthrough 隧道数。两跳拓扑里 $ph
+    # 经 DNS 一律映到 B,无论流量是「splitter→cc-mysub→B」还是「claude 自发遥测绕过 HTTPS_PROXY 直拨 B」。
+    # 合成 curl 探针(ASSERT-C)只验机制本身;若 claude 升级后遥测不尊重 proxy env 直连,连接落 B 却无对应
+    # cc-mysub passthrough 日志 → B_count > ptcount,即设备真实 IP 经直连泄漏的回归。≤ 为安全方向(失败的
+    # 合法隧道只抬高 ptcount,不误红);B 多出连接才变红。
+    local bcount
+    bcount="$(b_sni_count "$ph")"; bcount="${bcount:-0}"
+    if [ "$bcount" -gt "$ptcount" ]; then
+      fail "ASSERT-C(attribution): B saw $ph ${bcount}× but cc-mysub logged only ${ptcount} passthrough tunnel(s) — $((bcount - ptcount)) connection(s) reached B WITHOUT traversing cc-mysub (telemetry bypassing HTTPS_PROXY → device IP leak)"
+    fi
   done
-  log "ASSERT-C ok: 4 passthrough hosts (datadog intake/downloads/.anthropic.com 后缀子域/datadog MCP) forwarded via cc-mysub and reached B"
+  log "ASSERT-C ok: 4 passthrough hosts (datadog intake/downloads/.anthropic.com 后缀子域/datadog MCP) forwarded via cc-mysub, reached B, and B saw no proxy-bypassing direct egress (count parity)"
 
   # (SCOPE) cc-mysub 收口=allowlist,不是 DNS 副产物: Probe D force-chained rogue.example THROUGH
   # cc-mysub (helper --allow), and rogue.example's DNS points at B@127.0.0.2 — so an over-forward
   # bug WOULD surface here. cc-mysub must 403 it (not in MITM/passthrough), so it never reaches B.
-  # 这条对任意 cc-mysub 过度转发 bug 可证伪(区别于只看 evil:那是 DNS 把直连引去 sink 的副产物)。
+  #
+  # 探针存活性(id 32): 单看「rogue ∉ B」是纯负向断言,Probe D 链路断裂时空真(fail-open):
+  #   - helper --allow 改名/坏 → flag 解析失败、curl 在运行前就退出 → rogue 流量根本不产生;
+  #   - splitter 误把 rogue 当直连 → 它落 B(catch-all/DNS),反而被下面负向断言抓到。
+  # 故先正向证明 Probe D 确实流经 splitter→cc-mysub 并被拒,再做负向断言:
+  #   (1) curl 必须非 0 退出。rc=0 = CONNECT 隧道建成 = cc-mysub 过度转发 或 rogue 被直连到 B(回归)。
+  #   (2) curlD.out 必须含代理 CONNECT 拒绝信号(cc-mysub 对 Direct 类回 403 → splitter 改写 502 给 curl;
+  #       curl -sS 打印 "...response 502 / tunnel failed / after CONNECT")。--allow 解析失败时 curlD.out
+  #       只含 flag 用法错误、无此信号 → 变红,堵住空真。(此 harness 内 cc-mysub 已起且 Probe A/C 证明
+  #       chain 可达,故 502 来自 cc-mysub 的 deny 而非拨号失败。)
+  [ "$curlD_rc" -ne 0 ] \
+    || fail "ASSERT-SCOPE: Probe D curl succeeded (rc=0) — cc-mysub over-forwarded rogue.example or it was direct-dialed to B"
+  grep -qiE '502|tunnel failed|after CONNECT' "$WORK/curlD.out" 2>/dev/null \
+    || fail "ASSERT-SCOPE: Probe D never hit the splitter→cc-mysub deny path (helper --allow broke? probe link dead) — the negative rogue∉B check below would be vacuous"
   if grep -qF "rogue.example" "$WORK/mock.out" 2>/dev/null; then
     fail "ASSERT-SCOPE: force-chained rogue.example reached B — cc-mysub over-forwarded a deny host"
   fi
-  log "ASSERT-SCOPE ok: cc-mysub 403'd force-chained rogue.example (never reached B)"
+  log "ASSERT-SCOPE ok: Probe D force-chained rogue.example traversed cc-mysub and was 403'd (curl rc=$curlD_rc, never reached B)"
 
   # (B) 非 Anthropic 直连: helper direct-dialed evil.example (not allowlisted) → sink, not B.
   grep -qF "evil.example" "$WORK/sink.out" 2>/dev/null \
@@ -373,11 +410,6 @@ stage_split() {
 
   # claude rc (non-fatal log; ASSERT-A above is the real proof inference reached upstream).
   log "Probe A claude rc=$claude_rc (non-fatal; ASSERT-A proves inference reached upstream)"
-
-  # QUIC guard: log the udp:443 LOG/DROP counter. Zero is expected in the sealed
-  # netns (no real egress); a nonzero count would mean claude attempted QUIC/:443.
-  echo "===== QUIC GUARD (udp dpt:443 LOG/DROP counter) ====="
-  in_ns iptables -L OUTPUT -v -n 2>/dev/null | grep -E 'udp dpt:443' || echo "(no udp:443 rule matched in listing)"
 }
 
 # Topology-agnostic stages: seal self-check and DNS mapping. Independent of the

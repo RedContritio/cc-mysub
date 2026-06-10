@@ -48,16 +48,9 @@ func main() {
 				last = a
 			}
 		}
-		smu.Lock()
-		hosts := make([]string, 0, len(sni))
-		for h := range sni {
-			hosts = append(hosts, h)
-		}
-		smu.Unlock()
-		sort.Strings(hosts)
 		fmt.Println("=== B EGRESS SNI INVENTORY ===")
-		for _, h := range hosts {
-			fmt.Printf("%-44s count=%d\n", h, sni[h])
+		for _, line := range sniInventory(&smu, sni) {
+			fmt.Println(line)
 		}
 		os.Exit(0)
 	}
@@ -116,6 +109,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "mock:", err)
 		os.Exit(1)
 	}
+}
+
+// sniInventory 把 SNI 计数表渲染成有序的 "host count=N" 行。读 map 全程持 mu,与并发的 getCert
+// 写(每次 TLS 握手 sni[name]++)互斥。dumpAndExit 由 SIGINT 触发时通常仍有在途连接(cc-mysub 端
+// keep-alive 重试 / 收尾的透传隧道),早先实现只在锁内拷 key、却在锁外按 key 读计数,与 getCert 写
+// 构成 data race → Go runtime「concurrent map read and map write」fatal、mock.out 被截断、SNI
+// inventory 段丢失致 CI 偶发假红(finding id 67)。此处一次性持锁快照,渲染只读快照。
+func sniInventory(mu *sync.Mutex, sni map[string]int) []string {
+	mu.Lock()
+	snap := make(map[string]int, len(sni))
+	for h, n := range sni {
+		snap[h] = n
+	}
+	mu.Unlock()
+	hosts := make([]string, 0, len(snap))
+	for h := range snap {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	lines := make([]string, len(hosts))
+	for i, h := range hosts {
+		lines[i] = fmt.Sprintf("%-44s count=%d", h, snap[h])
+	}
+	return lines
 }
 
 // mintSelfSigned 为透传 host 现签一张自签叶(仅为让 GetCertificate 有返回值;客户端是否接受无所谓,

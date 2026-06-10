@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.22.12'   # 精确 patch pin(id 55): 与 ci.yml / release.yml 单一工具链对齐,不浮动
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -38,6 +38,12 @@ jobs:
           CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
           echo "scanning: $CLAUDE_BIN"
           /tmp/hostscan "$CLAUDE_BIN" | sort -u > /tmp/scanned.txt
+          # fail-closed 哨兵(id 33): comm -13 只算单向新增,扫描产出为空时(claude 改薄启动器 shim /
+          # CLAUDE_BIN 解析到不含遥测域名的 wrapper / 扫描 rot)NEW 恒空、守卫静默绿过、漂移失明。
+          # 对正确的 claude 二进制,hostscan 必产出 datadog intake(CC 自发遥测,实测裸域名无 https:// 前缀);
+          # 缺该哨兵 = 扫描目标失效,变红。
+          grep -qx 'http-intake.logs.us5.datadoghq.com' /tmp/scanned.txt \
+            || { echo '::error::scan canary missing — CLAUDE_BIN packaging changed or scan broken (scanned.txt lacks datadog intake host)'; exit 1; }
           grep -vE '^[[:space:]]*(#|$)' ci/egress/known-hosts.txt | sort -u > /tmp/baseline.txt
           NEW="$(comm -13 /tmp/baseline.txt /tmp/scanned.txt)"
           if [ -n "$NEW" ]; then

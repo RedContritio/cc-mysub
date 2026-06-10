@@ -71,6 +71,7 @@ gen_leaf() {  # gen_leaf <host> <out-basename>
     -extfile <(printf "subjectAltName=DNS:%s" "$h") -out "$base.crt" >/dev/null 2>&1 || fail "openssl leaf $h"
 }
 gen_leaf "$PUBLIC_HOST" "$WORK/cfg/certs/$PUBLIC_HOST"
+chmod 600 "$WORK/cfg/certs/$PUBLIC_HOST.key" # cc-mysub 启动校验外层私钥权限(P1-3),openssl 默认 644 会被拒
 gen_leaf "$UPSTREAM_HOST" "$CA/$UPSTREAM_HOST"
 cp "$CA/ca.crt" /usr/local/share/ca-certificates/cc-mysub-e2e-ca.crt \
   && update-ca-certificates >/dev/null 2>&1 \
@@ -81,6 +82,7 @@ cat > "$WORK/cfg/config.json" <<JSON
 {"listen":"127.0.0.1:443","client":{"public_host":"$PUBLIC_HOST","subscription_type":"max","release_repo":"$RELREPO"}}
 JSON
 echo "{\"oauthToken\":\"$REAL_TOKEN\"}" > "$WORK/cfg/upstream.json"
+chmod 600 "$WORK/cfg/upstream.json" # cc-mysub 启动校验凭据文件权限(P1-3),group/other-readable 被拒
 echo '[]' > "$WORK/cfg/devices.json"
 
 # seed add-device：首次跑触发 EnsureCA 生成 ca.crt/ca.key（gen-config 内联其入部署配置）。
