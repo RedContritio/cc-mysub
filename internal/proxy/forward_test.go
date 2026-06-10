@@ -79,28 +79,31 @@ func newTestClientCert(t *testing.T, cn string) tls.Certificate {
 func TestRewrite_Conditional(t *testing.T) {
 	var gotAuth, gotXAPIKey []string
 	var mu sync.Mutex
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		mu.Lock()
 		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
 		gotXAPIKey = append(gotXAPIKey, r.Header.Get("X-Api-Key"))
 		mu.Unlock()
-		w.WriteHeader(200)
-	}))
-	defer up.Close()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-	h := newRewriteHandler(cfgUp, nil)
+	h := newRewriteHandler(cfgUp, rt)
 	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	// connectHost 注入(生产由 handle BaseContext 注入);出站绑定它,与内层请求 Host 无关。
+	withCtx := func(r *http.Request) *http.Request {
+		ctx := context.WithValue(r.Context(), deviceKey, dev)
+		ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+		return r.WithContext(ctx)
+	}
 
 	// (1) 有入站凭据 + ctx 设备(upstream b) → 换成该设备的 setup-token (b→REAL-B); X-Api-Key 须被删
-	r1 := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
+	r1 := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
 	r1.Header.Set("Authorization", "Bearer placeholder")
 	r1.Header.Set("X-Api-Key", "should-be-stripped")
-	r1 = r1.WithContext(context.WithValue(r1.Context(), deviceKey, dev))
-	h.ServeHTTP(httptest.NewRecorder(), r1)
+	h.ServeHTTP(httptest.NewRecorder(), withCtx(r1))
 	// (2) 无任何入站凭据 (真匿名遥测) → 透传不注入、不碰任何头
-	r2 := httptest.NewRequest("POST", up.URL+"/api/event_logging/v2/batch", nil)
-	r2 = r2.WithContext(context.WithValue(r2.Context(), deviceKey, dev))
-	h.ServeHTTP(httptest.NewRecorder(), r2)
+	r2 := httptest.NewRequest("POST", "https://api.anthropic.com/api/event_logging/v2/batch", nil)
+	h.ServeHTTP(httptest.NewRecorder(), withCtx(r2))
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -119,6 +122,36 @@ func TestRewrite_Conditional(t *testing.T) {
 	}
 	if gotXAPIKey[1] != "" {
 		t.Errorf("X-Api-Key present on anon: got %q", gotXAPIKey[1])
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestForwardSwap_BindsOutboundToConnectHost(P0 回归,codex 全仓审查):出站目标必须绑定到
+// handle() 验证过的 CONNECT host(经 connectHostKey 注入),绝不信内层请求的 Host/URL.Host——
+// 否则不可信但已登记的设备发 Host: attacker(或 absolute-form URL)就能把换上的真 token 导向任意域名。
+func TestForwardSwap_BindsOutboundToConnectHost(t *testing.T) {
+	var gotHost, gotAuth string
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotHost = req.URL.Host
+		gotAuth = req.Header.Get("Authorization")
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header), Request: req}, nil
+	})
+	h := forwardSwap(rt)
+	// 不可信设备的内层请求:absolute-form URL + Host 头都指向 attacker,且带真 token(conditionalAuth
+	// 已注入 realToken)。connectHostKey=api.anthropic.com 是 handle() 验过的 MITM CONNECT host。
+	req := httptest.NewRequest("POST", "https://attacker.example/leak", nil)
+	req.Host = "attacker.example"
+	ctx := context.WithValue(req.Context(), realTokenKey, "REAL-SECRET")
+	ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+	h.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+	if gotHost != "api.anthropic.com" {
+		t.Errorf("SECURITY: 出站 host=%q, 应绑定 CONNECT host api.anthropic.com(不得信内层请求)", gotHost)
+	}
+	if gotAuth != "Bearer REAL-SECRET" {
+		t.Errorf("auth=%q want Bearer REAL-SECRET", gotAuth)
 	}
 }
 

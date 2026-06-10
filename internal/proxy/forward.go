@@ -24,7 +24,13 @@ import (
 
 type rewriteCtxKey int
 
-const realTokenKey rewriteCtxKey = 0
+const (
+	realTokenKey rewriteCtxKey = iota
+	// connectHostKey 持 handle() 已验证分类为 MITM 的 CONNECT host(经 BaseContext 注入)。
+	// forwardSwap 用它强制出站目标,绝不信内层请求的 Host/URL.Host——否则不可信设备发
+	// Host: attacker 就能把换上的真 token 导向任意域名(P0,codex 全仓审查)。
+	connectHostKey
+)
 
 // conditionalAuth 是前置中间件（凭据存在性分流）。设备身份来自外层 mTLS 客户端证书
 // （由 handle() 经 http.Server.BaseContext 注入 ctx 的 deviceKey），不再从内层 token 取。
@@ -54,7 +60,8 @@ func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 }
 
 // forwardSwap 是转发 handler（换 token + 逐字节透传）：
-//   - 上游 = 入站请求的 scheme/host（per-connection CONNECT 目标；scheme 缺省 https）
+//   - 上游 = ctx 注入的 connectHost（handle 验证过的 MITM CONNECT host）；scheme 固定 https。
+//     绝不取内层请求的 Host/URL.Host（不可信设备控制 → 真 token 旁路，见 connectHostKey 注释）
 //   - 恒删出站 X-Api-Key
 //   - ctx 有 realToken（命中设备，由 conditionalAuth 注入）→ 出站 Authorization 换成 Bearer real
 //   - ctx 无 realToken（匿名）→ 不注入 cc-mysub 凭据，对入站 Authorization 逐字节透传——
@@ -67,17 +74,14 @@ func forwardSwap(rt http.RoundTripper) http.Handler {
 	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			scheme := pr.In.URL.Scheme
-			if scheme == "" {
-				scheme = "https"
-			}
-			host := pr.In.URL.Host
-			if host == "" {
-				host = pr.In.Host
-			}
-			pr.Out.URL.Scheme = scheme
-			pr.Out.URL.Host = host
-			pr.Out.Host = "" // Host 头取 URL.Host
+			// 出站目标强制绑定 handle() 已验证分类为 MITM 的 CONNECT host(经 BaseContext 注入 connectHostKey)——
+			// 绝不信内层请求的 URL.Host/Host 头(不可信设备控制),否则设备发 Host: attacker 就能把真 token 导走(P0)。
+			// scheme 固定 https(MITM 上游恒 https,防设备发 http:// 降级)。connectHost 空(无注入)→ 出站 host 空,
+			// Transport 报错走 ErrorHandler 502,fail-closed(绝不转发到不受控目标)。
+			connectHost, _ := pr.In.Context().Value(connectHostKey).(string)
+			pr.Out.URL.Scheme = "https"
+			pr.Out.URL.Host = connectHost
+			pr.Out.Host = "" // Host 头取 URL.Host(=connectHost)
 			if real, _ := pr.In.Context().Value(realTokenKey).(string); real != "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+real)
 				pr.Out.Header.Del("X-Api-Key") // 仅非匿名分支删；匿名请求一个头都不碰（§0）
@@ -308,7 +312,11 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		Handler:           fp.handler,
 		ReadHeaderTimeout: 30 * time.Second,
 		BaseContext: func(net.Listener) context.Context {
-			return context.WithValue(context.Background(), deviceKey, connDevice)
+			// 注入设备(认证身份)+ connectHost(已验证 MITM 的 CONNECT 目标)——后者使 forwardSwap 把出站
+			// 绑定到此 host,杜绝内层请求 Host 头把真 token 导向任意域名(P0)。host 已经 ParseConnect
+			// 规范化且 ∈ MITMHosts(Classify=MITM 才走到这),故是 api/console.anthropic.com 之一。
+			ctx := context.WithValue(context.Background(), deviceKey, connDevice)
+			return context.WithValue(ctx, connectHostKey, host)
 		},
 	}
 	_ = srv.Serve(&oneConnListener{conn: nc, closed: closed})
