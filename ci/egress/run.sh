@@ -179,6 +179,7 @@ build_bins_v4() {
  "client":{"public_host":"$PROXY_HOST","subscription_type":"max"}}
 JSON
   echo "{\"oauthToken\":\"$MOCKTEST\"}" > "$WORK/cfg/upstream.json"
+  chmod 600 "$WORK/cfg/upstream.json" # cc-mysub 启动校验凭据文件权限(P1-3),group/other-readable 被拒
 }
 
 # gen_ccmysub_ca_and_enroll: mTLS enroll（信道 token 已删，身份由客户端证书承载）。
