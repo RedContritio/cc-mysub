@@ -29,5 +29,23 @@ jobs:
         run: npm i -g @anthropic-ai/claude-code
       - name: unit tests
         run: go test ./ci/egress/...
+      - name: host-allowlist drift guard (static scan vs known-hosts baseline)
+        # 静态扫描 latest claude 的硬编码遥测/控制面域名,diff 已审基线;出现基线外新候选即 fail,
+        # 逼人复核分类(CC 遥测→收口进 internal/hosts;MCP/控制面/staging→补进基线)。
+        # 非穷尽保证,补运行时 stage_split 的视野盲点(行为谱不全);定位见 ci/egress/hostscan/main.go。
+        run: |
+          go build -o /tmp/hostscan ./ci/egress/hostscan
+          CLAUDE_BIN="$(readlink -f "$(command -v claude)")"
+          echo "scanning: $CLAUDE_BIN"
+          /tmp/hostscan "$CLAUDE_BIN" | sort -u > /tmp/scanned.txt
+          grep -vE '^[[:space:]]*(#|$)' ci/egress/known-hosts.txt | sort -u > /tmp/baseline.txt
+          NEW="$(comm -13 /tmp/baseline.txt /tmp/scanned.txt)"
+          if [ -n "$NEW" ]; then
+            echo "::error::telemetry/control-plane host(s) hardcoded in claude but absent from ci/egress/known-hosts.txt:"
+            echo "$NEW"
+            echo "Classify each — CC telemetry/IP-leaking → add to internal/hosts; MCP/control-plane/staging → add to baseline with a category comment."
+            exit 1
+          fi
+          echo "drift guard: no new telemetry/control-plane candidates beyond baseline"
       - name: run egress audit (v4 split-egress coverage guard)
         run: sudo -E "$(command -v bash)" ci/egress/run.sh --split
