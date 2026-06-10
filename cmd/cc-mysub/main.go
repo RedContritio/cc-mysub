@@ -100,6 +100,10 @@ func main() {
 	}
 	outerCertPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".crt")
 	outerKeyPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".key")
+	if err := config.RequireOwnerOnly(outerKeyPath); err != nil {
+		slog.Error("outer TLS key permission", "err", err)
+		os.Exit(1)
+	}
 	outerCert := proxy.NewOuterCertLoader(outerCertPath, outerKeyPath)
 	if _, err := outerCert(nil); err != nil {
 		slog.Error("load outer TLS cert", "cert", outerCertPath, "err", err)
