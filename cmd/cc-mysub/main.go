@@ -30,6 +30,16 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "remove-device" {
+		if err := enroll.RunRemove(os.Args[2:], defaultConfigDir(), os.Stdout); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			fmt.Fprintln(os.Stderr, "remove-device:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "helper" {
 		os.Exit(runHelper(os.Args[2:]))
 	}

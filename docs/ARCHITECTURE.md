@@ -68,7 +68,7 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 由此得到三个安全性质：
 
 1. **真 token 永不出门**——整头替换而非追加，上游永远看不到设备侧的值。
-2. **泄露隔离**——偷到一台设备的证书 + 私钥也摸不到主钥匙；删 `devices.json` 一行即吊销，其他设备无感。
+2. **泄露隔离**——偷到一台设备的证书 + 私钥也摸不到主钥匙；`cc-mysub remove-device` 即吊销该设备，其他设备无感。
 3. **防残留**——删入站 `X-Api-Key`，杜绝旁路泄漏。
 
 ## 认证与凭据管理（`~/.config/cc-mysub/`）
@@ -82,7 +82,7 @@ CC MySub 进程本身只监听本地端口；如何把端口安全暴露到远�
 
 设备入网用通用 `install.sh`（拉部署配置 → sha256 校验下二进制 → `device-init` **在设备本地**生成私钥 + 客户端证书并打印指纹 → 轮询现有 mTLS 端点等批准 → 写 daily `myclaude` wrapper）。operator 在代理主机用 `cc-mysub add-device --fingerprint <SHA-256> --label <设备名>` **批准**该设备（把证书指纹追加进 `devices.json`）。详见 README 与 `OPERATING.md`。
 
-吊销 = 删 `devices.json` 条目；文件改动通过 mtime polling 热重载，无需重启。
+吊销 = `cc-mysub remove-device --fingerprint <fp>`（或 `--label`）；cli 按指纹/标签删条目并原子写回（temp+rename），文件改动通过 mtime polling 热重载，无需重启。全程走 cli、不手动编辑 `devices.json`。
 
 ## 入口层加密（部署矩阵 — 历史 rationale）
 

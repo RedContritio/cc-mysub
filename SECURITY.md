@@ -82,7 +82,7 @@ cc-mysub 自有 CA(`<config-dir>/ca.crt` + `ca.key`)由 `add-device` 首次生�
 
 **边界 #1（设备私钥是设备本地凭据，按文件权限保护）。** 设备凭据是 `device-init` 在本地生成的私钥文件 `device.key`(chmod 0600);helper 以 `--client-key` 读取它做外层 mTLS,**不**放进任何 env、也**不**继承给 `claude` 子进程。故旧版「信道 token 经 env 继承给 claude 后代(MCP / npm / Bash 工具)可读」的向量在 mTLS 下**消失**:设备内层仍持的 `CLAUDE_CODE_OAUTH_TOKEN` 已是**占位串(非凭据)**,后代读到也无用。残留暴露 = `device.key` 是该设备本地文件,**同 uid 进程 / root / 备份**可读即可冒充该设备连 cc-mysub——这是「设备本地凭据对该设备用户可读」的固有事实,作为 **deliberate accepted exposure** 如实记录,由 0600 + 删指纹吊销收敛。
 
-**边界 #2（限流豁免路径）。** mTLS 下**每个连接都已认证设备**(证书握手保证),故匿名内层请求(无 app token、但连接已认证)归入**其证书设备的限流桶**——旧版「匿名走透传且不受 per-device 限流」的 un-rate-limited relay 面**不再存在**。残留:`/api/`、`/mcp-registry` 前缀**豁免限流**(`rateLimitExemptPrefixes`,使遥测 / 注册表查询逐字节不动、不引入与直连可区分的行为)——一个被盗的设备私钥可借豁免路径不受限地发请求、消耗 cc-mysub 资源(但匿名请求被 Anthropic 401、拿不到订阅)。由**删 `devices.json` 一行**(吊销该证书指纹)的路径收敛。这是被接受的残留风险,非零暴露。
+**边界 #2（限流豁免路径）。** mTLS 下**每个连接都已认证设备**(证书握手保证),故匿名内层请求(无 app token、但连接已认证)归入**其证书设备的限流桶**——旧版「匿名走透传且不受 per-device 限流」的 un-rate-limited relay 面**不再存在**。残留:`/api/`、`/mcp-registry` 前缀**豁免限流**(`rateLimitExemptPrefixes`,使遥测 / 注册表查询逐字节不动、不引入与直连可区分的行为)——一个被盗的设备私钥可借豁免路径不受限地发请求、消耗 cc-mysub 资源(但匿名请求被 Anthropic 401、拿不到订阅)。由 **`cc-mysub remove-device`**(吊销该证书指纹)的路径收敛。这是被接受的残留风险,非零暴露。
 
 ## 订阅档位声明（subscriptionType）的诚实边界
 

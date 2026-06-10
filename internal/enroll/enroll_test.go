@@ -151,6 +151,61 @@ func TestReplaceDevicePreservesSiblings(t *testing.T) {
 
 // ---- Resolve ----
 
+// ---- RemoveDevice / RunRemove (吊销走 cli) ----
+
+// TestRemoveDevice 验证吊销: 按指纹/label 删除、写回合法 JSON、删后 store.Lookup 不命中(即时失效)、
+// 旁邻保留、无匹配报错(错误可见)。
+func TestRemoveDevice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	must(t, AppendDevice(path, Params{Label: "a", PublicHost: "h", SubType: "max"}, fp("a")))
+	must(t, AppendDevice(path, Params{Label: "b", PublicHost: "h", SubType: "max"}, fp("b")))
+
+	// 按指纹删 a；写回仍是合法 JSON(否则 readDevices Fatal),旁邻 b 保留。
+	must(t, RemoveDevice(path, fp("a"), ""))
+	if list := readDevices(t, path); len(list) != 1 || list[0].Label != "b" {
+		t.Fatalf("after remove a by fp: %+v", list)
+	}
+	// 删后 store Lookup a 不命中、b 仍命中(吊销即时,经热重载读到新表)。
+	store, err := auth.NewDeviceStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.Lookup(fp("a")); ok {
+		t.Error("removed device a still resolves (NOT revoked)")
+	}
+	if _, ok := store.Lookup(fp("b")); !ok {
+		t.Error("sibling b lost")
+	}
+
+	// 按 label 删 b → 空。
+	must(t, RemoveDevice(path, "", "b"))
+	if list := readDevices(t, path); len(list) != 0 {
+		t.Fatalf("after remove b by label, want empty, got %+v", list)
+	}
+
+	// 无匹配 → 报错(不静默成功)。
+	if err := RemoveDevice(path, fp("z"), ""); err == nil {
+		t.Error("removing nonexistent fingerprint should error")
+	}
+}
+
+// TestRunRemove 验证 remove-device cli 入口: --label 删除生效;缺 --fingerprint/--label 报错。
+func TestRunRemove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "devices.json")
+	must(t, AppendDevice(path, Params{Label: "x", PublicHost: "h", SubType: "max"}, fp("a")))
+	var out bytes.Buffer
+	if err := RunRemove([]string{"--config-dir", dir, "--label", "x"}, dir, &out); err != nil {
+		t.Fatalf("RunRemove: %v", err)
+	}
+	if list := readDevices(t, path); len(list) != 0 {
+		t.Fatalf("device not removed: %+v", list)
+	}
+	if err := RunRemove([]string{"--config-dir", dir}, dir, &out); err == nil {
+		t.Error("RunRemove without --fingerprint/--label should error")
+	}
+}
+
 func TestResolveFlagOverridesConfig(t *testing.T) {
 	def := &config.ClientConfig{PublicHost: "cfg.example.com", SubscriptionType: "max"}
 	got, err := Resolve(def, Params{Label: "x", SubType: "pro"})

@@ -116,7 +116,7 @@ cc-mysub add-device --fingerprint <设备打印的指纹> --label my-laptop
 
 ### 吊销
 
-删掉 `devices.json` 里对应那一行(该设备指纹)即可,热重载后该设备立即失效,其他设备无感。
+`cc-mysub remove-device --fingerprint <fp>`(或 `--label <name>`)——按指纹/标签删除并**原子写回** `devices.json`,热重载后该设备立即失效,其他设备无感。**全程走 cli、不要手动编辑 `devices.json`**:cli 路径(add/rotate/remove)统一 temp+rename 原子写,保证文件永远是合法完整 JSON;手动删行可能写坏 JSON,届时热重载会保留旧表(撤销不生效)。
 
 ### 其它
 
