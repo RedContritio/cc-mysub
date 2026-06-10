@@ -59,16 +59,16 @@ Claude Code 会对**请求 body** 算一个非加密 xxHash64(`x-anthropic-billi
 
 ## v4 收口架构与加密边界
 
-设备只设 `HTTPS_PROXY` 指向**本地** `cc-mysub helper`(用户态、无系统改动)。helper 分流(三类):
-- **`api.anthropic.com`/`console.anthropic.com`** 经**外层双向 TLS（mTLS）** 链到 cc-mysub(cc-mysub 出示 public_host 真 LE 证书、helper 经系统信任验真;helper 出示设备客户端证书、cc-mysub 按指纹认证) → cc-mysub 内层按 host 现签 MITM 终结、换 token;
-- **遥测/更新**(`http-intake.logs.us5.datadoghq.com` / `downloads.claude.ai`)同样经外层 TLS 链到 cc-mysub,但 cc-mysub 做**纯透传盲隧道**——不解密、不换 token,仅把出口 IP 收敛到统一出口(否则从设备直连会泄漏设备真实 IP、破坏同出口等效)。二者不带订阅 token(datadog 用 DD-API-KEY、downloads 无认证),故透传不泄露凭据;
-- **其余一切**(WebFetch 目标/MCP/`raw.githubusercontent.com`/包管理器) helper **本地直连**真主机, **永不接触 cc-mysub、不被 MITM**(cert-pinning 主机不破)。
+设备只设 `HTTPS_PROXY` 指向**本地** `cc-mysub helper`(用户态、无系统改动)。收口判据 = **fail-closed 后缀通配(档位 C,权威在 `internal/hosts.Classify`)**:自家域名一律收口、非自家第三方直连。helper 分流(三类):
+- **MITM 换 token**:`api.anthropic.com`/`console.anthropic.com` 经**外层双向 TLS（mTLS）** 链到 cc-mysub(cc-mysub 出示 public_host 真 LE 证书、helper 经系统信任验真;helper 出示设备客户端证书、cc-mysub 按指纹认证) → cc-mysub 内层按 host 现签 MITM 终结、换 token;
+- **纯透传盲隧道(收口出口 IP)**:其余自家域名(`*.anthropic.com`/`*.claude.ai`/`*.claude.com`/`*.claudeusercontent.com`/`*.ant.dev` 的控制面/状态/文档/MCP 网关/用户内容/staging)+ 第三方遥测/MCP(`http-intake.logs.us5.datadoghq.com`/`api.datadoghq.com`/`mcp.sentry.dev`/`claude*.fedstart.com`)经外层 TLS 链到 cc-mysub,cc-mysub **不解密、不换 token**,仅把出口 IP 收敛到统一出口(否则直连泄漏设备真实 IP)。均不带订阅 token,透传不泄露凭据;
+- **本地直连**:非自家第三方(WebFetch 目标/用户自配 MCP/`raw.githubusercontent.com`/包管理器) helper 直连真主机, **永不接触 cc-mysub、不被 MITM**(cert-pinning 主机不破)。
 
 **双层 TLS**: 外层 = 双向 mTLS(cc-mysub 真 LE 身份 + 设备客户端证书指纹认证;防 CONNECT 目标 host 在 helper↔cc-mysub 跳明文); 内层 = api.anthropic.com MITM(设备经 `NODE_EXTRA_CA_CERTS` 信任 cc-mysub 自有 CA)。
 
 **helper 无密钥面**: 不终结内层 TLS、不持 setup-token、不持 CA 私钥(只持 CA 公证书做外层身份验证)。
 
-**隐私改善(相对 v3 blanket 代理)**: 与 Anthropic 无关的第三方流量(WebFetch/MCP/`raw.githubusercontent.com`/包管理器)留在设备本地, cc-mysub 不接触。遥测/更新虽经 cc-mysub 收口出口 IP, 但走盲隧道**不解密**, cc-mysub 同样读不到其内容。
+**隐私改善(相对 v3 blanket 代理)**: 非自家第三方流量(WebFetch/用户自配 MCP/`raw.githubusercontent.com`/包管理器)留在设备本地, cc-mysub 不接触。自家域名与第三方遥测/MCP 虽经 cc-mysub 收口出口 IP, 但(除 `api.anthropic.com` 内层 MITM 外)走盲隧道**不解密**, cc-mysub 读不到其内容。
 
 ## CA 私钥管理
 

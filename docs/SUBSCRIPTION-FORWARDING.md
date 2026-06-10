@@ -46,26 +46,27 @@
 
 ## 2. CC 访问哪些端点 / 转发哪些
 
-CC 运行时会触及多个端点(下表据 Claude Code 官方 `network-config` / `data-usage` / `env-vars` 文档与 2.1.169 实测)。处理分三类——**经出口转发 / 本地直连 / 不触发**。关键判据:**凡 Anthropic 能观测到的流量——发往 `api.anthropic.com`,或 Anthropic 摄取的遥测/更新——绝不能从设备直连**(会暴露设备真实 IP、破坏同出口等效),必须经统一出口(`api` 换 token、遥测/更新纯透传);只有 Anthropic 观测不到的第三方流量才本地直连。
+CC 运行时会触及多个端点。收口判据 = **fail-closed 后缀通配(档位 C)**:凡 **Anthropic/Claude 自家域名**(`*.anthropic.com` / `*.claude.ai` / `*.claude.com` / `*.claudeusercontent.com` / 内部 `*.ant.dev`)一律经统一出口收口——不论用途吃不吃得准,「不漏」优先;只有 Anthropic 观测不到的**非自家第三方**流量(WebFetch 用户 URL、用户自配 MCP、github/npm)才本地直连。依据:自用工具下「流量经自己服务器」无隐私损失,**直连才暴露设备真实 IP**,故收口在隐私上恒优、唯一代价是带宽。判据从早先「精确清单、新增 host 显式登记」反转为后缀自适应——CC 新增的自家端点自动收口、无需人跟版(分类权威在 `internal/hosts.Classify`)。
 
 | 端点 | 用途 | 处理 |
 |---|---|---|
-| `api.anthropic.com` | 推理(`/v1/messages`)、OAuth token 使用、WebFetch 域名预检(`/api/web/domain_info`) | **转发**——经出口换发真 token(唯一需要真凭据的流量) |
-| `http-intake.logs.us5.datadoghq.com` 遥测日志(`/api/v2/logs`) / `downloads.claude.ai` 自动更新(`/claude-code-releases/…`) | 操作指标·日志 / 二进制·插件更新 | **转发(纯透传)**——经出口盲隧道,不解密、不换 token(二者都不带订阅 token) |
-| `claude.ai` / `platform.claude.com`(早期 `console.anthropic.com`) | 交互式登录认证 | 不触发——中转用 `setup-token` 预生成凭据,运行时不登录 |
-| WebFetch 用户 URL / MCP server / `raw.githubusercontent.com`(版本说明)/ npm registry / 工具里的包管理器 | 用户内容 / 工具执行 / 非 Anthropic 资源 | 直连——与订阅、与 Anthropic 基础设施无关,Anthropic 观测不到 |
+| `api.anthropic.com` / `console.anthropic.com` | 推理、OAuth token 使用、WebFetch 域名预检 | **转发·MITM**——经出口换发真 token(唯一需要真凭据的流量) |
+| 其余自家域名:控制面/账户(`claude.ai`/`platform.claude.com`/`code.claude.com`)、文档/状态/支持、MCP 网关(`*.mcp.claude.com`)、用户内容(`*.claudeusercontent.com`)、内部/staging(`*.ant.dev`) | 登录态/控制面/Anthropic 托管 MCP/用户内容 | **转发·纯透传**——盲隧道收口出口 IP(不解密、不换 token);多数 setup-token 场景运行时不触发,fail-closed 一并收口无害 |
+| 第三方收口(精确登记):`http-intake.logs.us5.datadoghq.com`、`api.datadoghq.com`/`mcp.sentry.dev`、`claude*.fedstart.com` | CC 自发遥测 / 硬编码第三方 MCP / FedRAMP 部署 | **转发·纯透传**——非自家、后缀匹配不到,精确登记;收口以对该第三方也隐藏设备 IP |
+| WebFetch 用户 URL / 用户自配 MCP(`mcp.notion.so` 之类) / `raw.githubusercontent.com` / npm | 用户内容 / 工具执行 / 非 Anthropic 资源 | **直连**——非自家、Anthropic 观测不到;自配 MCP 要收口须加进 `hosts.PassthroughExact` |
 
 **为什么遥测 / 更新必须经出口转发、而不能从设备直连**:它们虽不发往 `api.anthropic.com`,但 Anthropic 仍摄取——遥测进 Anthropic 的 Datadog 账户、更新由 Anthropic 的 CDN 提供。若从设备直连,它们从设备真实 IP 出网,IP ≠ 统一出口,于是「推理来自出口、遥测/更新来自设备」IP 不一致,直接破坏「同出口普通登录设备」等效。所以处理它们的轴是**收口出口 IP**,而非端点域名是否属 `anthropic.com`。
 
-**实测端点与处理(Claude Code 2.1.169:二进制硬编码域名提取 + CONNECT 抓包)**:
+**实测端点与处理(Claude Code 2.1.170:二进制硬编码域名提取 + CONNECT 抓包;`ci/egress/hostscan` 漂移守卫持续跟版)**:
 
 - 遥测 `http-intake.logs.us5.datadoghq.com/api/v2/logs`:Datadog 日志 intake,用 `DD-API-KEY` 头认证(Anthropic 内嵌的 Datadog key),**不携带用户 OAuth token**。
 - 更新 `downloads.claude.ai/claude-code-releases/…`:公开 CDN,**无认证**。
-- 本版**无独立 sentry / statsig**:特性开关走 `api.anthropic.com/api/claude_code/settings`、指标走 `/api/claude_code/metrics`(均在 `api.anthropic.com`,已随推理流量转发)。
+- 第三方 MCP `api.datadoghq.com`/`mcp.sentry.dev`:CC 推荐配置里的 MCP server 端点(需用户显式配密钥才连);档位 C 一并收口。
+- 本版**无独立 sentry / statsig 遥测**:特性开关走 `api.anthropic.com/api/claude_code/settings`、指标走 `/api/claude_code/metrics`(均在 `api.anthropic.com`,已随推理流量转发)。
 
 二者都不带订阅 token,故**纯透传**即足够:经出口盲 CONNECT 隧道把出口 IP 收敛到统一出口,**不解密、不换 token、不扩解密面、不破坏 cert pinning**(claude 与真上游端到端做 TLS,cc-mysub 只搬 TCP 字节)。这正是「等效」要的——遥测/更新与推理同出口,且字节与普通设备一致。(禁用 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 是更激进的替代:TCB 更小但牺牲遥测/更新功能;本部署选保留功能、走转发。)
 
-**真正能直连的只有与 Anthropic 无关的流量**:WebFetch 用户给的 URL、MCP server、`raw.githubusercontent.com` / npm 等发往第三方主机——Anthropic 的服务器观测不到,不构成感知面;且普通登录设备这些同样直连。
+**真正直连的只有非自家第三方流量**:WebFetch 用户给的 URL、用户运行时自配 MCP、`raw.githubusercontent.com` / npm 等发往第三方主机——Anthropic 观测不到,不构成感知面;且普通登录设备这些同样直连。用户自配 MCP 默认直连(功能正常、暴露设备 IP),要收口须把该 host 加进 `hosts.PassthroughExact`(--allow 不行——只让设备 chain,cc-mysub 仍按 allowlist 403)。
 
 > 控制面登录域名官方文档现用 `platform.claude.com`(早期为 `console.anthropic.com`);无论哪个都属交互登录端点,`setup-token` 预生成凭据的中转场景运行时不依赖它。
 

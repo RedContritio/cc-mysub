@@ -112,12 +112,12 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // ForwardProxy 是 CONNECT forward-proxy。整个 device↔cc-mysub 跳被外层 TLS 包裹
 // （外层呈现 cc-mysub 自身身份证书 serverName，使 CONNECT 目标 host 不以明文上线）；
-// 在外层 TLS 内读 CONNECT 目标，按 host 分类（§2 中转表）:
-//   - MITM 类（allow）: 回 200 后按 host 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP
+// 在外层 TLS 内读 CONNECT 目标，按 hosts.Classify 分类:
+//   - MITM 类: 回 200 后按 host 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP
 //     请求经 rewrite handler 换 token 转发到真目标 host。
-//   - 透传类（passthrough）: 先拨真上游、成功才回 200，再盲转发原始字节（不解密、不碰 token）——
-//     CC 的遥测/更新经统一出口出网，避免设备直连泄漏真实 IP；不扩解密面、不破坏 cert pinning。
-//   - 均不在 → 403（纵深防御）。
+//   - 透传类（自家域名后缀 + 第三方精确）: 先拨真上游、成功才回 200，再盲转发原始字节（不解密、
+//     不碰 token）——经统一出口出网，避免设备直连泄漏真实 IP；不扩解密面、不破坏 cert pinning。
+//   - Direct → 403（纵深防御）。
 type ForwardProxy struct {
 	minter    certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
 	handler   http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
