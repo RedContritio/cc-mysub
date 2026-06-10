@@ -66,7 +66,12 @@ func main() {
 		slog.Error("read ca.crt", "err", err)
 		os.Exit(1)
 	}
-	caKey, err := os.ReadFile(filepath.Join(*cfgDir, "ca.key"))
+	caKeyPath := filepath.Join(*cfgDir, "ca.key")
+	if err := config.RequireOwnerOnly(caKeyPath); err != nil {
+		slog.Error("ca.key permission", "err", err)
+		os.Exit(1)
+	}
+	caKey, err := os.ReadFile(caKeyPath)
 	if err != nil {
 		slog.Error("read ca.key", "err", err)
 		os.Exit(1)

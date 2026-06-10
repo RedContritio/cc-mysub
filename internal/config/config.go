@@ -91,7 +91,24 @@ func LoadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
+// RequireOwnerOnly 校验 path 仅属主可访问(mode 无 group/other 位)。敏感凭据(setup-token 池 /
+// MITM CA 私钥)若 group/other-accessible,同机其他用户或误同步会读到真 token / CA 私钥 →
+// fail-closed 拒绝启动(治理总纲:错误可见)。README 要求 upstream.json/ca.key chmod 600。
+func RequireOwnerOnly(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("%s perm %#o too open (group/other-accessible); chmod 600", path, perm)
+	}
+	return nil
+}
+
 func LoadUpstream(path string) (*Upstream, error) {
+	if err := RequireOwnerOnly(path); err != nil {
+		return nil, fmt.Errorf("upstream perm: %w", err)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read upstream: %w", err)

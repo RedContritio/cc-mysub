@@ -69,6 +69,34 @@ func TestUpstream_PoolAndLegacy(t *testing.T) {
 	}
 }
 
+// TestRequireOwnerOnly 校验敏感凭据文件的 fail-closed 权限门：仅 0600(或更严)放行，
+// 任何 group/other 可访问位被拒(codex 全仓审查 P1-3)。
+func TestRequireOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	priv := filepath.Join(dir, "priv")
+	if err := os.WriteFile(priv, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireOwnerOnly(priv); err != nil {
+		t.Errorf("0600 应通过: %v", err)
+	}
+	for _, mode := range []os.FileMode{0o640, 0o644, 0o604, 0o660, 0o666} {
+		p := filepath.Join(dir, "open")
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil { // 绕开 umask,确保实际 mode
+			t.Fatal(err)
+		}
+		if err := RequireOwnerOnly(p); err == nil {
+			t.Errorf("mode %#o 应被拒(group/other-accessible)", mode)
+		}
+	}
+	if err := RequireOwnerOnly(filepath.Join(dir, "nonexist")); err == nil {
+		t.Error("缺失文件应报错")
+	}
+}
+
 // TestParseUpstream_StrictContract 覆盖严格契约：两种 token 全空、空池、池条目空 id/token、重复 id 均须报错。
 func TestParseUpstream_StrictContract(t *testing.T) {
 	cases := map[string]string{
