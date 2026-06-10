@@ -909,3 +909,214 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 		t.Errorf("app-token swap: upstream Authorization=%q want Bearer REAL-B", gotAuth)
 	}
 }
+
+// TestConditionalAuth_NoDeviceFailsClosed 验证 P2-38:fail-closed 安全契约——入站有凭据但 ctx 无设备
+// (或空 Label) → 502 no_device,绝不 fall-through 到 up.PickToken("")=默认真 token,且上游零命中。
+func TestConditionalAuth_NoDeviceFailsClosed(t *testing.T) {
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "sk-ant-oat01-REAL"}}}
+	var upHits int
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { upHits++; w.WriteHeader(200) })
+	h := conditionalAuth(cfgUp)(next)
+
+	check := func(name string, withCtx func(*http.Request) *http.Request) {
+		r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+		r.Header.Set("Authorization", "Bearer placeholder")
+		if withCtx != nil {
+			r = withCtx(r)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("%s: got %d want 502", name, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "no_device") {
+			t.Errorf("%s: body=%q want no_device", name, w.Body.String())
+		}
+	}
+	check("no device in ctx", nil)
+	check("empty-label device", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: ""}))
+	})
+	if upHits != 0 {
+		t.Errorf("SECURITY: upstream must never be reached on no_device (default-token leak), hits=%d", upHits)
+	}
+}
+
+// TestNewForwardProxy_PanicsOnBadArgs 验证 P3-39:两条以 panic 强制的输入契约。
+func TestNewForwardProxy_PanicsOnBadArgs(t *testing.T) {
+	caPEM, keyPEM := genCA(t)
+	ca, err := mitm.LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+	store := newTestStore(t, map[string]string{})
+	cfgUp := &config.Upstream{}
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
+	oc := NewOuterCertLoader(cp, kp)
+
+	mustPanic := func(name string, fn func()) {
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: expected panic, got none", name)
+			}
+		}()
+		fn()
+	}
+	mustPanic("maxInFlight==0", func() { NewForwardProxy(minter, store, cfgUp, nil, oc, 0) })
+	mustPanic("maxInFlight<0", func() { NewForwardProxy(minter, store, cfgUp, nil, oc, -1) })
+	mustPanic("outerCert==nil", func() { NewForwardProxy(minter, store, cfgUp, nil, nil, 8) })
+}
+
+// TestForwardProxy_OversizedConnectFirstLineIs400 验证 P3-40:pre-200 首行本身超长(CONNECT 行 padding
+// 撑过 maxConnectHeaderBytes,仍带 \r\n 终止)→ 400,不现签叶证书(此前只覆盖了头行分支)。
+func TestForwardProxy_OversizedConnectFirstLineIs400(t *testing.T) {
+	const host = "api.anthropic.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	big := strings.Repeat("a", maxConnectHeaderBytes+100)
+	_, _ = outer.Write([]byte("CONNECT " + big + ":443 HTTP/1.1\r\n\r\n"))
+	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	all, _ := io.ReadAll(outer)
+	if !strings.Contains(string(all), "400") {
+		t.Errorf("oversized first CONNECT line must be 400, got %q", all)
+	}
+	if strings.Contains(string(all), "200 Connection Established") {
+		t.Errorf("SECURITY: 200 on oversized first line: %q", all)
+	}
+	if spy.called(host) {
+		t.Errorf("minted leaf despite oversized first line")
+	}
+}
+
+// TestForwardProxy_NewlinelessFloodIs400 验证 P2-0:无 '\n' 终止符的超长流——ReadSlice 缓冲(=maxConnectHeaderBytes)
+// 填满即 ErrBufferFull → 400,内存硬钉在缓冲大小(此前 ReadString 会无界累积整行才检查,8KB 上限对此路径不生效)。
+func TestForwardProxy_NewlinelessFloodIs400(t *testing.T) {
+	const host = "api.anthropic.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	// "CONNECT " 起头后持续灌字节、永不发 '\n'。
+	flood := []byte("CONNECT " + strings.Repeat("a", maxConnectHeaderBytes+4096))
+	_ = outer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_, _ = outer.Write(flood)
+	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	all, _ := io.ReadAll(outer)
+	if !strings.Contains(string(all), "400") {
+		t.Errorf("newline-less oversized flood must be 400, got %q", all)
+	}
+	if strings.Contains(string(all), "200") {
+		t.Errorf("must not 200 on flood: %q", all)
+	}
+	if spy.called(host) {
+		t.Errorf("minted leaf despite newline-less flood")
+	}
+}
+
+// TestForwardProxy_MITMNon443Rejected 验证 P3-47:MITM 类 host 的 CONNECT 端口非 443 → 与透传对称地
+// 显式 403(不静默当 443 处理),且在现签叶证书前就拒。
+func TestForwardProxy_MITMNon443Rejected(t *testing.T) {
+	const host = "api.anthropic.com" // MITM 类
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	_, _ = outer.Write([]byte("CONNECT " + host + ":8080 HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "403") {
+		t.Errorf("MITM host on non-443 must be 403, got %q", status)
+	}
+	if strings.Contains(status, "200") {
+		t.Errorf("must not 200 on non-443 MITM CONNECT: %q", status)
+	}
+	if spy.called(host) {
+		t.Errorf("contract: minted leaf for non-443 MITM CONNECT (must reject before mint)")
+	}
+}
+
+// TestRewrite_XApiKeyOnlyStripped 验证 P3-48:仅 X-Api-Key 入站(HasInboundCredential 算凭据)→ 走带凭据分支,
+// 上游不见 X-Api-Key、Authorization 换成真 token(钉住「带凭据分支删 X-Api-Key」不变量)。
+func TestRewrite_XApiKeyOnlyStripped(t *testing.T) {
+	var gotAuth, gotXAPIKey string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotAuth = r.Header.Get("Authorization")
+		gotXAPIKey = r.Header.Get("X-Api-Key")
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	h := newRewriteHandler(cfgUp, rt)
+	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	r.Header.Set("X-Api-Key", "should-be-stripped") // 无 Authorization,仅 x-api-key
+	ctx := context.WithValue(r.Context(), deviceKey, dev)
+	ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+	h.ServeHTTP(httptest.NewRecorder(), r.WithContext(ctx))
+	if gotXAPIKey != "" {
+		t.Errorf("X-Api-Key not stripped on x-api-key-only inbound: got %q", gotXAPIKey)
+	}
+	if gotAuth != "Bearer REAL-B" {
+		t.Errorf("Authorization not swapped: got %q want Bearer REAL-B", gotAuth)
+	}
+}
+
+// TestAccessLog_RecordsShortCircuitRejections 验证 P2-2:AccessLog 在最外层(生产链序),使 RateLimit 的 429 与
+// conditionalAuth 的 502(no_upstream_token / no_device)短路拒绝也产生 AccessRecord——被拒流量不再对日志失明。
+func TestAccessLog_RecordsShortCircuitRejections(t *testing.T) {
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
+	var recs []AccessRecord
+	sink := func(rec AccessRecord) { recs = append(recs, rec) }
+	// 与 NewForwardProxy 同序:AccessLog 最外层。
+	chain := AccessLog(sink)(conditionalAuth(cfgUp)(RateLimitByDevice(1)(forwardSwap(rt))))
+
+	mk := func(dev auth.Device, injectDev bool) int {
+		r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", strings.NewReader("{}"))
+		r.Header.Set("Authorization", "Bearer placeholder")
+		ctx := context.WithValue(r.Context(), connectHostKey, "api.anthropic.com")
+		if injectDev {
+			ctx = context.WithValue(ctx, deviceKey, dev)
+		}
+		w := httptest.NewRecorder()
+		chain.ServeHTTP(w, r.WithContext(ctx))
+		return w.Code
+	}
+
+	devOK := auth.Device{Label: "laptop", Upstream: "b", RateLimit: 1}
+	if code := mk(devOK, true); code != 200 {
+		t.Fatalf("first request got %d want 200", code)
+	}
+	if code := mk(devOK, true); code != http.StatusTooManyRequests {
+		t.Fatalf("second request got %d want 429", code)
+	}
+	if code := mk(auth.Device{Label: "x", Upstream: "zzz"}, true); code != http.StatusBadGateway {
+		t.Fatalf("missing upstream got %d want 502", code)
+	}
+	if code := mk(auth.Device{}, false); code != http.StatusBadGateway {
+		t.Fatalf("no_device got %d want 502", code)
+	}
+
+	if len(recs) != 4 {
+		t.Fatalf("AccessLog must record all 4 requests incl. rejections, got %d", len(recs))
+	}
+	var got429, got502 int
+	for _, r := range recs {
+		switch r.Status {
+		case http.StatusTooManyRequests:
+			got429++
+		case http.StatusBadGateway:
+			got502++
+		}
+	}
+	if got429 != 1 {
+		t.Errorf("429 rejection not logged (count=%d)", got429)
+	}
+	if got502 != 2 {
+		t.Errorf("502 rejections not logged (count=%d want 2)", got502)
+	}
+}

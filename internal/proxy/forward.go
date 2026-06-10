@@ -62,7 +62,8 @@ func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 // forwardSwap 是转发 handler（换 token + 逐字节透传）：
 //   - 上游 = ctx 注入的 connectHost（handle 验证过的 MITM CONNECT host）；scheme 固定 https。
 //     绝不取内层请求的 Host/URL.Host（不可信设备控制 → 真 token 旁路，见 connectHostKey 注释）
-//   - 恒删出站 X-Api-Key
+//   - 带凭据分支删出站 X-Api-Key：X-Api-Key 非空即凭据（HasInboundCredential 把它算凭据），故携带者
+//     必经此分支被删；匿名分支一个头都不碰（§0），空白 X-Api-Key 非凭据、原样透传(no-op)。
 //   - ctx 有 realToken（命中设备，由 conditionalAuth 注入）→ 出站 Authorization 换成 Bearer real
 //   - ctx 无 realToken（匿名）→ 不注入 cc-mysub 凭据，对入站 Authorization 逐字节透传——
 //     保字节级不可区分于直连（治理总纲 §0）。真匿名遥测本就无 Authorization，此处为 no-op。
@@ -139,14 +140,27 @@ type ForwardProxy struct {
 const handshakeReadTimeout = 15 * time.Second
 
 // maxConnectHeaderBytes 限定 pre-200 阶段（CONNECT 行 + 全部 CONNECT 头）的累计字节数，
-// 防超长头打爆 handle goroutine 内存。手动累加器，不用 io.LimitReader——后者会与 bufio 预读
-// 互相误计并破坏 br.Buffered()/prefixConn 的流水线回放（spec §3.2 第 1 点）。
+// 防超长头打爆 handle goroutine 内存。两道闸:(1) bufio 缓冲尺寸 = maxConnectHeaderBytes,读行用
+// ReadSlice → 单行内存硬钉在缓冲大小,遇不到 '\n' 的超长流(无终止符 flood)立即返回 ErrBufferFull
+// 而非像 ReadString 那样无界累积整行再检查(P2-0);(2) 手动累加器卡跨行累计字节,堵很多短行的总量。
+// 不用 io.LimitReader 包 conn——后者会与 bufio 预读互相误计并破坏 br.Buffered()/prefixConn 的流水线回放。
 const maxConnectHeaderBytes = 8192
 
 // idleTimeout 是已建立隧道(内层 MITM keep-alive / passthrough relay)的空闲回收超时:双向无字节流动
 // 超过此值即断、释放并发槽(§3.4 的 sema),防被盗设备开满空闲连接占满槽(P2-6)。10 分钟覆盖 claude
 // 正常 turn 内工具执行 + turn 间思考,挂机超 10 分钟才回收;claude 断后重连透明(见 P1-2 研究)。
 const idleTimeout = 10 * time.Minute
+
+// readPreambleLine 读一条 '\n' 结尾的 pre-200 CONNECT 行,用 ReadSlice 把单行内存硬钉在 bufio 缓冲尺寸
+// (= maxConnectHeaderBytes):无终止符的超长流在缓冲填满时返回 bufio.ErrBufferFull,而非 ReadString 的
+// 无界整行累积(P2-0)。返回 string 即拷贝出缓冲(ReadSlice 的切片在下一次读时失效),供调用方跨后续读保留。
+func readPreambleLine(br *bufio.Reader) (string, error) {
+	s, err := br.ReadSlice('\n')
+	if err != nil {
+		return "", err
+	}
+	return string(s), nil
+}
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
@@ -155,8 +169,9 @@ const idleTimeout = 10 * time.Minute
 // outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
 // maxInFlight 为全局并发上限（>0 强制要求，<=0 panic；饱和时 shed 新连接）。
 //
-// serving chain：conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → AccessLog
-// → forwardSwap（换 token 转发）。设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入。
+// serving chain：AccessLog（最外层,包住下面的短路拒绝,使 429/502 也进访问日志,P2-2）→
+// conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → forwardSwap（换 token 转发）。
+// 设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入,任何链位都能读到。
 func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
 	if maxInFlight <= 0 {
 		panic("proxy: NewForwardProxy requires maxInFlight > 0")
@@ -164,9 +179,9 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 	if outerCert == nil {
 		panic("proxy: NewForwardProxy requires outerCert")
 	}
-	handler := conditionalAuth(up)(
-		RateLimitByDevice(120)(
-			AccessLog(nil)(
+	handler := AccessLog(nil)(
+		conditionalAuth(up)(
+			RateLimitByDevice(120)(
 				forwardSwap(upstream),
 			),
 		),
@@ -252,7 +267,13 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	defer func() { <-fp.sema }() // 释放并发槽位(与 Serve 的 fp.sema<-struct{}{} 配对)
 	// 外层 TLS（双向 mTLS）：呈现真 LE 身份证书；要求并按指纹白名单校验客户端证书。
 	// 此后所有读写都走 outer（Close(outer) 即 Close(rawConn)）。
-	var connDevice auth.Device // 由 VerifyPeerCertificate 在握手内捕获（消二次 Lookup 的热重载 TOCTOU）
+	// connDevice 由 VerifyPeerCertificate 在握手内一次性捕获（消二次 Lookup 的热重载 TOCTOU），此后该外层
+	// 连接所有内层请求经 BaseContext 复用这份快照。已知权衡(P3-16):连接生命周期内 Device 快照不刷新——
+	// 同指纹的属性变更（rotate 改 upstream/rate_limit，或 remove+add 被同一 poll 周期合并）不会断既有长连接,
+	// 故活跃 keep-alive 连接继续按握手时的旧 upstream token / rate_limit 服务,改绑要等设备重连(新握手取新值)。
+	// 吊销（指纹从 devices.json 删除）路径不受影响:store.reload 的删除 diff → onRevoke → RevokeConns 主动断连,
+	// claude 重连时新 mTLS 握手被拒。属性变更的即时传播需扩展 reload diff（store.go,不在本工区），此处如实记录。
+	var connDevice auth.Device
 	outer := tls.Server(rawConn, &tls.Config{
 		GetCertificate: fp.outerCert,
 		ClientAuth:     tls.RequireAnyClientCert,
@@ -283,20 +304,19 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
-	br := bufio.NewReader(outer)
-	// 手动字节累加器(pre-200 cap):CONNECT 行 + 每个头行长度累加,超 maxConnectHeaderBytes → 400 + Close。
-	// 不用 io.LimitReader 包 conn——会被 bufio 预读误计并破坏 br.Buffered()/prefixConn 回放。
-	line, err := br.ReadString('\n')
+	// bufio 缓冲 = maxConnectHeaderBytes,故 readPreambleLine(ReadSlice) 把单行内存硬钉在缓冲大小:
+	// 无 '\n' 的超长流返回 ErrBufferFull → 400(而非无界累积);手动累加器 byteCount 再卡跨行总量。
+	br := bufio.NewReaderSize(outer, maxConnectHeaderBytes)
+	line, err := readPreambleLine(br)
 	if err != nil {
+		// ErrBufferFull = 单行超过 pre-200 内存上限 → 400(显式拒,叶证书未现签);其余(EOF/读超时)= 客户端走了 → 静默关。
+		if err == bufio.ErrBufferFull {
+			_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		}
 		outer.Close()
 		return
 	}
 	byteCount := len(line)
-	if byteCount > maxConnectHeaderBytes {
-		_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		outer.Close()
-		return
-	}
 	host, ok := connect.ParseConnect(line)
 	if !ok {
 		// 非法/非 CONNECT 请求行 = 客户端错误（区别于 allowlist 策略拒绝的 403）
@@ -306,8 +326,11 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	}
 	// drain CONNECT 头到空行（身份已由外层 mTLS 证书确定，不再解析 Proxy-Authorization）。
 	for {
-		h, err := br.ReadString('\n')
+		h, err := readPreambleLine(br)
 		if err != nil {
+			if err == bufio.ErrBufferFull {
+				_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			}
 			outer.Close()
 			return
 		}
@@ -328,18 +351,17 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
+	// MITM 与透传都只放行标准 HTTPS :443——CONNECT 端口非 443 = 越权,两条路径对称地显式 403(不静默改写)。
+	// MITM 出站恒拨 :443、透传盲隧道恒拨 :443,故非 443 的 CONNECT 端口在两路都无意义;此前 MITM 分支静默
+	// 把端口当 443 处理与透传分支的「显式 403」不对称(P3-47),现统一在分类后、动作前校验。ParseConnect 已
+	// 保证 line 含合法 host:port(fields[1] 必存在)。
+	if _, port, err := net.SplitHostPort(strings.Fields(line)[1]); err != nil || port != "443" {
+		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+		outer.Close()
+		return
+	}
 	if class == hosts.Passthrough {
-		// 透传类盲隧道。allowlist 是 host-only，但透传仅放行标准 HTTPS :443——与 MITM 路径恒拨
-		// :443 对称，且防止借盲隧道把 cc-mysub 出口当任意端口 port-forward（最小权限）。CONNECT
-		// 端口非 443 = 越权,显式 403（不静默改写）。ParseConnect 已校验 host:port 合法。
-		target := strings.Fields(line)[1]
-		_, port, err := net.SplitHostPort(target)
-		if err != nil || port != "443" {
-			_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
-			outer.Close()
-			return
-		}
-		// 拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
+		// 透传类盲隧道:拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
 		fp.tunnel(outer, br, host)
 		return
 	}

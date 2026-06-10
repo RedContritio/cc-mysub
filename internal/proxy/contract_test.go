@@ -37,10 +37,10 @@ func TestContractFullChain(t *testing.T) {
 	// 池：设备 upstream id "b" → 真 token sk-ant-oat01-REAL。
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
 
-	// Build the serving chain exactly as NewForwardProxy does.
-	chain := conditionalAuth(cfgUp)(
-		RateLimitByDevice(120)(
-			AccessLog(nil)(
+	// Build the serving chain exactly as NewForwardProxy does (AccessLog outermost, P2-2).
+	chain := AccessLog(nil)(
+		conditionalAuth(cfgUp)(
+			RateLimitByDevice(120)(
 				forwardSwap(rt),
 			),
 		),
