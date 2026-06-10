@@ -34,4 +34,24 @@ func TestParseConnect_RejectsInvalidHost(t *testing.T) {
 	}
 }
 
+// TestParseConnect_Canonicalizes 验证 host 规范化为 DNS 等价小写、剥尾点 FQDN——否则
+// API.ANTHROPIC.COM / api.anthropic.com. 等变体会绕过 hosts.Classify 的 fail-closed 收口(codex 对抗评审)。
+func TestParseConnect_Canonicalizes(t *testing.T) {
+	cases := []struct{ line, want string }{
+		{"CONNECT API.ANTHROPIC.COM:443 HTTP/1.1\r\n", "api.anthropic.com"},   // 大写
+		{"CONNECT api.anthropic.com.:443 HTTP/1.1\r\n", "api.anthropic.com"},  // 尾点 FQDN
+		{"CONNECT Api.Anthropic.Com.:443 HTTP/1.1\r\n", "api.anthropic.com"},  // 混合大小写 + 尾点
+		{"CONNECT api.anthropic.com..:443 HTTP/1.1\r\n", "api.anthropic.com"}, // 多尾点
+	}
+	for _, c := range cases {
+		if h, ok := ParseConnect(c.line); !ok || h != c.want {
+			t.Errorf("ParseConnect(%q) = %q,%v; want %q,true", c.line, h, ok, c.want)
+		}
+	}
+	// 纯尾点畸形 host 规范化后为空 → 拒
+	if h, ok := ParseConnect("CONNECT .:443 HTTP/1.1\r\n"); ok {
+		t.Errorf("bare-dot host should reject, got %q", h)
+	}
+}
+
 // 注：ParseProxyAuthorization/ValidToken 已随信道 token 子系统删除（mTLS 证书取代），其测试一并移除。
