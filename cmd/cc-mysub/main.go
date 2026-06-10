@@ -13,7 +13,6 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
 	"github.com/redcontritio/cc-mysub/internal/enroll"
-	"github.com/redcontritio/cc-mysub/internal/hosts"
 	"github.com/redcontritio/cc-mysub/internal/mitm"
 	"github.com/redcontritio/cc-mysub/internal/proxy"
 )
@@ -94,10 +93,9 @@ func main() {
 	}
 
 	// forward-proxy serving chain：conditionalAuth → RateLimit → AccessLog → forwardSwap（见 NewForwardProxy）。
-	// 主机分类的权威清单在 internal/hosts：MITM 类（Anthropic 控制面/数据面，换 token）+ 透传类
-	// （CC 遥测/更新，盲隧道经出口）；其余 403（纵深防御）。设备 splitter 默认 allow 取自同一清单。
-	fp := proxy.NewForwardProxy(minter, store, up, nil,
-		hosts.MITMHosts, hosts.PassthroughHosts, outerCert, 512)
+	// CONNECT 目标分类由 internal/hosts.Classify 权威裁决（MITM 换 token / 透传盲隧道 / 403）——
+	// 与设备 splitter 共用同一事实源。fail-closed：自家域名后缀通配收口，第三方精确登记。
+	fp := proxy.NewForwardProxy(minter, store, up, nil, outerCert, 512)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/redcontritio/cc-mysub/internal/hosts"
 	"github.com/redcontritio/cc-mysub/internal/splitter"
 )
 
@@ -23,10 +22,10 @@ func runHelper(args []string) int {
 		host       = fs.String("host", "", "cc-mysub 域名 host（拨 host:443 + 外层 TLS ServerName，必填）")
 		clientCert = fs.String("client-cert", "", "本设备客户端证书路径（device-init 生成，必填）")
 		clientKey  = fs.String("client-key", "", "本设备私钥路径（device-init 生成，必填）")
-		// 默认链到 cc-mysub 的 host 取自权威清单 hosts.All()（MITM 类 + 透传类）：除 Anthropic
-		// 控制面/数据面外，也含遥测/更新（经出口盲转发，避免设备直连泄漏真实 IP）。与 cc-mysub 侧
-		// 同源，避免两端 allowlist 漂移。
-		allowCSV = fs.String("allow", strings.Join(hosts.All(), ","), "链到 cc-mysub 的 host（逗号分隔）")
+		// 收口集由 internal/hosts.Classify 权威裁决（与 cc-mysub 侧同源，避免两端漂移）：自家域名后缀
+		// 通配 + 第三方精确收口，其余本地直连。--allow 仅用于在该集之外额外强制 chain 个别 host
+		// （默认空；非清单 host 即便 chain 到 cc-mysub 也会被其 allowlist 403）。
+		allowCSV = fs.String("allow", "", "在默认收口集之外额外强制经 cc-mysub 收口的 host（逗号分隔）")
 	)
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -52,8 +51,11 @@ func runHelper(args []string) int {
 	}
 	defer ln.Close()
 
-	allow := strings.Split(*allowCSV, ",")
-	sp := splitter.New(*host, cert, allow, nil)
+	var extra []string
+	if *allowCSV != "" {
+		extra = strings.Split(*allowCSV, ",")
+	}
+	sp := splitter.New(*host, cert, extra, nil)
 	go sp.Serve(ln) //nolint:errcheck
 
 	// exec claude，注入 HTTPS_PROXY 指向本地分流器

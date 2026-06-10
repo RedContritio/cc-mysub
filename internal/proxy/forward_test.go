@@ -176,7 +176,7 @@ func genCA(t *testing.T) (certPEM, keyPEM []byte) {
 // newMTLSProxy 装配一个 ForwardProxy：外层 TLS 身份用 ocWriteSelfSigned 产的自签证书经
 // NewOuterCertLoader 加载；内层 MITM 用 genCA 产的 CA → minter；store 由 fpToUpstream（客户端
 // 证书指纹 → upstream id）构造。返回 proxy + 内层 CA 池（client 验内层 api.anthropic.com 叶证书用）。
-func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Upstream, upstream http.RoundTripper, allow []string, maxInFlight int) (*ForwardProxy, *x509.CertPool) {
+func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Upstream, upstream http.RoundTripper, maxInFlight int) (*ForwardProxy, *x509.CertPool) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -187,7 +187,7 @@ func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Up
 	store := newTestStore(t, fpToUpstream)
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(minter, store, cfgUp, upstream, allow, nil, NewOuterCertLoader(cp, kp), maxInFlight)
+	fp := NewForwardProxy(minter, store, cfgUp, upstream, NewOuterCertLoader(cp, kp), maxInFlight)
 	caPool := x509.NewCertPool()
 	caPool.AddCert(ca.Cert)
 	return fp, caPool
@@ -264,7 +264,7 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com", "console.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, 8)
 	addr := serveProxy(t, fp)
 
 	// helper-style client: 外层 mTLS 到 cc-mysub(出示已登记 client cert) → CONNECT(无 Proxy-Auth) → 200 → 内层 TLS
@@ -312,7 +312,7 @@ func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -329,7 +329,7 @@ func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
 // device 与真上游端到端做 TLS（cc-mysub 不解密、绝不现签叶证书）。证明：① 字节端到端通到上游；
 // ② 透传 host 不触发 CertFor（不 MITM）。
 func TestForwardProxy_PassthroughTunnelsWithoutMITM(t *testing.T) {
-	const passHost = "telemetry.example" // 透传类（测试用任意 host，经 passthrough 列表登记）
+	const passHost = "api.datadoghq.com" // 透传类（精确 passthrough host，hosts.Classify→Passthrough）
 
 	// 假上游（真 TLS 服务端）：device 经盲隧道与它端到端做 TLS；记录收到请求数证明字节通。
 	var hits int
@@ -344,7 +344,7 @@ func TestForwardProxy_PassthroughTunnelsWithoutMITM(t *testing.T) {
 	upstreamAddr := upstream.Listener.Addr().String()
 
 	// spy minter 断言透传 host 绝不现签叶证书；allow 空、passthrough=[passHost]。
-	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	fp, spy, clientCert := newSpyProxy(t)
 	// 注入 passDial：把透传上游重定向到假上游（替代真 DNS）。
 	fp.passDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddr)
@@ -385,8 +385,8 @@ func TestForwardProxy_PassthroughTunnelsWithoutMITM(t *testing.T) {
 // TestForwardProxy_PassthroughDialFailureIs502：透传上游拨号失败 → 502（CONNECT 尚未回 200，
 // 故可如实回错），且不现签叶证书。
 func TestForwardProxy_PassthroughDialFailureIs502(t *testing.T) {
-	const passHost = "telemetry.example"
-	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	const passHost = "api.datadoghq.com"
+	fp, spy, clientCert := newSpyProxy(t)
 	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return nil, io.EOF // 模拟拨号失败
 	}
@@ -407,24 +407,12 @@ func TestForwardProxy_PassthroughDialFailureIs502(t *testing.T) {
 	}
 }
 
-// TestNewForwardProxy_PanicsOnOverlap：装配契约——一个 host 同时在 allow(MITM) 与 passthrough
-// 两表 → 分类歧义,NewForwardProxy fail-fast panic(与 maxInFlight<=0 同级)。
-func TestNewForwardProxy_PanicsOnOverlap(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("NewForwardProxy 须在 host 同属 allow 与 passthrough 时 panic")
-		}
-	}()
-	oc := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return nil, nil }
-	NewForwardProxy(nil, nil, nil, nil, []string{"dup.example"}, []string{"dup.example"}, oc, 8)
-}
-
 // TestForwardProxy_PassthroughNon443Rejected：透传只放行 :443。非 443 端口 → 403(在拨号前拒),
 // 不现签叶证书。passDial 设为返回 io.EOF：若端口校验误放行,tunnel 会拨号并回 502——故拿到 403
 // (而非 502)即证明在拨号前就被端口校验拒掉,堵住「借盲隧道把出口当任意端口 port-forward」。
 func TestForwardProxy_PassthroughNon443Rejected(t *testing.T) {
-	const passHost = "telemetry.example"
-	fp, spy, clientCert := newSpyProxy(t, nil, []string{passHost})
+	const passHost = "api.datadoghq.com"
+	fp, spy, clientCert := newSpyProxy(t)
 	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) { return nil, io.EOF }
 	addr := serveProxy(t, fp)
 
@@ -471,7 +459,7 @@ func TestForwardProxy_NoClientCertHandshakeFails(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	assertOuterRejected(t, addr, &tls.Config{InsecureSkipVerify: true})
@@ -483,7 +471,7 @@ func TestForwardProxy_UnregisteredClientCertHandshakeFails(t *testing.T) {
 	registered := newTestClientCert(t, "device-leaf")
 	rfp := auth.CertFingerprint(registered.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{rfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{rfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	stranger := newTestClientCert(t, "stranger") // 指纹不在 store
@@ -543,7 +531,7 @@ func (s *spyMinter) called(host string) bool {
 // newSpyProxy builds a running-ready ForwardProxy whose minter is a spy, plus the spy
 // and a registered client cert for outer-mTLS dialing. inner RoundTripper is nil (no
 // inner request is expected on the 400/403 paths). allow lists the MITM hosts.
-func newSpyProxy(t *testing.T, allow, passthrough []string) (*ForwardProxy, *spyMinter, tls.Certificate) {
+func newSpyProxy(t *testing.T) (*ForwardProxy, *spyMinter, tls.Certificate) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -557,14 +545,14 @@ func newSpyProxy(t *testing.T, allow, passthrough []string) (*ForwardProxy, *spy
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, passthrough, NewOuterCertLoader(cp, kp), 8)
+	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, NewOuterCertLoader(cp, kp), 8)
 	fp.minter = spy // 覆写为 spy(both satisfy certMinter)
 	return fp, spy, clientCert
 }
 
 func TestForwardProxy_OversizedConnectHeaderIs400(t *testing.T) {
 	const host = "api.anthropic.com"
-	fp, spy, clientCert := newSpyProxy(t, []string{host}, nil)
+	fp, spy, clientCert := newSpyProxy(t)
 	addr := serveProxy(t, fp)
 	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
@@ -618,7 +606,7 @@ func TestForwardProxy_InnerSwapNoProxyAuthBodyIntact(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -658,7 +646,7 @@ func TestForwardProxy_ShedsWhenSaturated(t *testing.T) {
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	// maxInFlight=1: the proxy can hold exactly one in-flight handle.
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 1)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 1)
 	addr := serveProxy(t, fp)
 
 	// Client A: complete outer mTLS + CONNECT, then PARK (never send inner
@@ -690,7 +678,7 @@ func TestForwardProxy_AnonInnerPassesThrough(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -745,7 +733,7 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 		},
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)

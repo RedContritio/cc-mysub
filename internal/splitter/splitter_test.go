@@ -69,8 +69,8 @@ func clientLeaf(t *testing.T) tls.Certificate {
 }
 
 // newTrusting 构造 splitter 并白盒注入测试 CA pool（生产走系统信任验真 LE；测试用自签需注入）。
-func newTrusting(host string, clientCert tls.Certificate, caPool *x509.CertPool, allow []string, dial dialFunc) *Splitter {
-	sp := New(host, clientCert, allow, dial)
+func newTrusting(host string, clientCert tls.Certificate, caPool *x509.CertPool, extraAllow []string, dial dialFunc) *Splitter {
+	sp := New(host, clientCert, extraAllow, dial)
 	sp.tlsCfg.RootCAs = caPool
 	return sp
 }
@@ -182,7 +182,7 @@ func TestSplitter_RoutesAnthropicToUpstreamElseDirect(t *testing.T) {
 		dMu.Unlock()
 		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
 	}
-	sp := newTrusting(serverName, clientLeaf(t), caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting(serverName, clientLeaf(t), caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestSplitter_AllowBranchPresentsClientCertNoProxyAuth(t *testing.T) {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
 	}
-	sp := newTrusting(serverName, myCert, caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting(serverName, myCert, caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +333,7 @@ func TestSplitter_DirectBranchHasNoProxyAuth(t *testing.T) {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
 	}
-	sp := newTrusting("cc.example", clientLeaf(t), caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting("cc.example", clientLeaf(t), caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -361,5 +361,83 @@ func TestSplitter_DirectBranchHasNoProxyAuth(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for direct-branch forwarded bytes")
+	}
+}
+
+// TestSplitter_ExtraAllowForceChains：--allow 把一个不在 hosts.Classify 收口集的 host
+// （rogue.example→Direct）强制 chain 到 cc-mysub（设备侧 override）。证明 extraAllow 生效——
+// 它走 chain 分支（拨 serverName:443）而非 direct 分支。cc-mysub 端是否放行是其 allowlist 的事
+// （非清单 host 仍 403，见 proxy 测试与 stage_split Probe D）。
+func TestSplitter_ExtraAllowForceChains(t *testing.T) {
+	const serverName = "cc.example"
+	cert, caPool := selfSigned(t, serverName)
+
+	var upHost string
+	gotCh := make(chan string, 1)
+	upLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		h, err := readConnectHost(c)
+		if err != nil {
+			return
+		}
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		gotCh <- h
+		buf := make([]byte, 256)
+		for {
+			if _, e := c.Read(buf); e != nil {
+				return
+			}
+		}
+	}()
+
+	directLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directLn.Close()
+
+	// dial 按 addr 分流：chain 分支拨 serverName:443→upLn；direct 分支拨 target→directLn。
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == net.JoinHostPort(serverName, "443") {
+			return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
+	}
+	sp := newTrusting(serverName, clientLeaf(t), caPool, []string{"rogue.example"}, dial)
+	spLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spLn.Close()
+	go sp.Serve(spLn)
+
+	c, err := net.Dial("tcp", spLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("CONNECT rogue.example:443 HTTP/1.1\r\nHost: rogue.example:443\r\n\r\n"))
+	br := bufio.NewReader(c)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("client status %q", status)
+	}
+
+	select {
+	case upHost = <-gotCh:
+		if upHost != "rogue.example:443" {
+			t.Errorf("cc-mysub should see force-chained rogue.example:443, got %q", upHost)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: --allow host was not chained to cc-mysub (extraAllow ignored?)")
 	}
 }

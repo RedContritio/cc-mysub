@@ -18,6 +18,7 @@ import (
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
 	"github.com/redcontritio/cc-mysub/internal/connect"
+	"github.com/redcontritio/cc-mysub/internal/hosts"
 	"github.com/redcontritio/cc-mysub/internal/mitm"
 )
 
@@ -118,15 +119,13 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 //     CC 的遥测/更新经统一出口出网，避免设备直连泄漏真实 IP；不扩解密面、不破坏 cert pinning。
 //   - 均不在 → 403（纵深防御）。
 type ForwardProxy struct {
-	minter      certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
-	handler     http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
-	auth        Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
-	allow       map[string]bool                                      // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
-	passthrough map[string]bool                                      // 允许纯透传（盲隧道、不 MITM）的 CONNECT 目标 host（遥测/更新）
-	passDial    dialFunc                                             // 透传隧道拨真上游（nil→默认 net.Dialer；测试注入重定向）
-	outerCert   func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
-	sema        chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
-	wg          sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
+	minter    certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
+	handler   http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
+	auth      Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
+	passDial  dialFunc                                             // 透传隧道拨真上游（nil→默认 net.Dialer；测试注入重定向）
+	outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
+	sema      chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
+	wg        sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
@@ -140,32 +139,19 @@ const maxConnectHeaderBytes = 8192
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
-// allow 为允许 MITM（解密换 token）的 CONNECT 目标 host 列表；passthrough 为允许纯透传（盲隧道、
-// 不解密、不碰 token）的 host 列表（CC 遥测/更新）——两类经统一出口，其余 403。
+// CONNECT 目标的分类（MITM 换 token / 透传盲隧道 / 403）由 internal/hosts.Classify 权威裁决——
+// 不再从参数收 host 列表（单一事实源，消除设备 splitter 与本代理两端清单漂移）。
 // outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
 // maxInFlight 为全局并发上限（>0 强制要求，<=0 panic；饱和时 shed 新连接）。
 //
 // serving chain：conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → AccessLog
 // → forwardSwap（换 token 转发）。设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入。
-func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow, passthrough []string, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
+func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
 	if maxInFlight <= 0 {
 		panic("proxy: NewForwardProxy requires maxInFlight > 0")
 	}
 	if outerCert == nil {
 		panic("proxy: NewForwardProxy requires outerCert")
-	}
-	allowSet := make(map[string]bool, len(allow))
-	for _, h := range allow {
-		allowSet[h] = true
-	}
-	passSet := make(map[string]bool, len(passthrough))
-	for _, h := range passthrough {
-		// 契约：一个 host 不能既 MITM 又透传——否则 handle() 的分类有歧义（会静默把本应换 token
-		// 的 host 降级成盲隧道，占位 token 直达上游）。两表必须互斥，相交即编程错，fail-fast。
-		if allowSet[h] {
-			panic("proxy: host " + h + " in both allow(MITM) and passthrough sets")
-		}
-		passSet[h] = true
 	}
 	handler := conditionalAuth(up)(
 		RateLimitByDevice(120)(
@@ -175,11 +161,9 @@ func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstr
 		),
 	)
 	return &ForwardProxy{
-		minter:      m,
-		handler:     handler,
-		auth:        a,
-		allow:       allowSet,
-		passthrough: passSet,
+		minter:  m,
+		handler: handler,
+		auth:    a,
 		passDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, network, addr)
 		},
@@ -272,15 +256,14 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 			break
 		}
 	}
-	// host 分类（§2 中转表）：MITM 类（解密换 token）/ 透传类（盲隧道）/ 其余 403（纵深防御）。
-	mitmHost := fp.allow[host]
-	passHost := fp.passthrough[host]
-	if !mitmHost && !passHost {
+	// host 分类（internal/hosts.Classify）：MITM 类（解密换 token）/ 透传类（盲隧道）/ Direct→403（纵深防御）。
+	class := hosts.Classify(host)
+	if class == hosts.Direct {
 		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 		outer.Close()
 		return
 	}
-	if passHost {
+	if class == hosts.Passthrough {
 		// 透传类盲隧道。allowlist 是 host-only，但透传仅放行标准 HTTPS :443——与 MITM 路径恒拨
 		// :443 对称，且防止借盲隧道把 cc-mysub 出口当任意端口 port-forward（最小权限）。CONNECT
 		// 端口非 443 = 越权,显式 403（不静默改写）。ParseConnect 已校验 host:port 合法。

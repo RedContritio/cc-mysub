@@ -1,5 +1,6 @@
-// Package splitter 实现设备本地 CONNECT 分流器：白名单 host 经外层 mTLS 链到 cc-mysub
-// forward-proxy（出示本设备客户端证书，cc-mysub 按指纹认证后做内层 MITM），其余 host 本地直连盲转发。
+// Package splitter 实现设备本地 CONNECT 分流器：属 hosts.Classify 收口集的 host 经外层 mTLS 链到
+// cc-mysub forward-proxy（出示本设备客户端证书，cc-mysub 按指纹认证后做内层 MITM），其余 host 本地
+// 直连盲转发。
 // 分流器不终止 claude 的内层 TLS——它只盲转发原始字节；持有本设备客户端证书+私钥用于外层 mTLS，
 // 外层服务端身份（真 LE）走设备系统信任验证，故不持有 cc-mysub CA。
 package splitter
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/redcontritio/cc-mysub/internal/connect"
+	"github.com/redcontritio/cc-mysub/internal/hosts"
 )
 
 type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -21,17 +23,18 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 type Splitter struct {
 	host   string          // cc-mysub 域名(public_host); 拨 host:443 + 外层 TLS ServerName
 	tlsCfg *tls.Config     // 外层 mTLS: 出示本设备客户端证书 + 系统信任验真 LE 服务端身份
-	allow  map[string]bool // 链到 cc-mysub 的 host(其余直连)
-	dial   dialFunc        // 拨号(nil→默认 net.Dialer); 测试注入(allow 与 direct 两分支都经此)
+	extra  map[string]bool // --allow 额外强制 chain 的 host(精确); 默认收口判定走 hosts.Classify
+	dial   dialFunc        // 拨号(nil→默认 net.Dialer); 测试注入(chain 与 direct 两分支都经此)
 }
 
 // New 构造分流器。host = cc-mysub 域名(拨 host:443、外层 ServerName)；clientCert = 本设备客户端
-// 证书+私钥，外层 mTLS 握手出示（cc-mysub 按其指纹认证）；allow = 链到 cc-mysub 的 host；
+// 证书+私钥，外层 mTLS 握手出示（cc-mysub 按其指纹认证）；extraAllow = 在 hosts.Classify 收口集之外
+// 额外强制 chain 到 cc-mysub 的 host（--allow override，精确；默认收口集见 internal/hosts）；
 // dial = 拨号(nil→默认)。外层服务端身份(真 LE)走系统信任验证，故不收 CA pool。
-func New(host string, clientCert tls.Certificate, allow []string, dial dialFunc) *Splitter {
-	allowSet := make(map[string]bool, len(allow))
-	for _, h := range allow {
-		allowSet[h] = true
+func New(host string, clientCert tls.Certificate, extraAllow []string, dial dialFunc) *Splitter {
+	extra := make(map[string]bool, len(extraAllow))
+	for _, h := range extraAllow {
+		extra[h] = true
 	}
 	if dial == nil {
 		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -41,7 +44,7 @@ func New(host string, clientCert tls.Certificate, allow []string, dial dialFunc)
 	return &Splitter{
 		host:   host,
 		tlsCfg: &tls.Config{ServerName: host, Certificates: []tls.Certificate{clientCert}},
-		allow:  allowSet,
+		extra:  extra,
 		dial:   dial,
 	}
 }
@@ -80,7 +83,8 @@ func (s *Splitter) handle(c net.Conn) {
 			break
 		}
 	}
-	if s.allow[host] {
+	// 收口判定：属 hosts.Classify 收口集(自家后缀+第三方精确)或 --allow 额外指定 → 经 cc-mysub；其余直连。
+	if hosts.Classify(host) != hosts.Direct || s.extra[host] {
 		// 外层 mTLS 到 cc-mysub(拨 host:443, 出示本设备客户端证书), 链式 CONNECT。
 		// 身份由客户端证书承载，不再带 Proxy-Authorization 信道 token。
 		raw, err := s.dial(context.Background(), "tcp", net.JoinHostPort(s.host, "443"))

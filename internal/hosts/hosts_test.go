@@ -1,47 +1,83 @@
 package hosts
 
-import (
-	"slices"
-	"sort"
-	"testing"
-)
+import "testing"
 
-// TestDisjoint 守护两类互斥的契约:一个 host 不能既 MITM 又透传(否则 forward-proxy 分类歧义,
-// 会把本应换 token 的 host 降级成盲隧道)。NewForwardProxy 也在运行期 panic 强制此契约,这里在
-// 清单层面再钉一道,使误把 host 写进两表在测试期即暴露。
-func TestDisjoint(t *testing.T) {
-	for _, h := range MITMHosts {
-		if slices.Contains(PassthroughHosts, h) {
-			t.Errorf("host %q 同时在 MITMHosts 与 PassthroughHosts(两类必须互斥)", h)
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		host string
+		want Class
+	}{
+		// 精确 MITM(换 token)
+		{"api.anthropic.com", MITM},
+		{"console.anthropic.com", MITM},
+		// 自家后缀:apex + 任意级子域 → passthrough 收口
+		{"anthropic.com", Passthrough},
+		{"status.anthropic.com", Passthrough},
+		{"claude.ai", Passthrough},
+		{"foo.claude.ai", Passthrough},
+		{"downloads.claude.ai", Passthrough},
+		{"claude.com", Passthrough},
+		{"slack.mcp.claude.com", Passthrough},
+		{"bridge.claudeusercontent.com", Passthrough},
+		{"beacon.claude-ai.staging.ant.dev", Passthrough},
+		// 精确 passthrough(第三方 host)
+		{"http-intake.logs.us5.datadoghq.com", Passthrough},
+		{"api.datadoghq.com", Passthrough},
+		{"mcp.sentry.dev", Passthrough},
+		{"claude.fedstart.com", Passthrough},
+		{"claude-staging.fedstart.com", Passthrough},
+		// Direct:功能/第三方/用户自配 MCP
+		{"github.com", Direct},
+		{"registry.npmjs.org", Direct},
+		{"mcp.notion.so", Direct}, // 运行时自配 MCP——不在硬编码,C 的固有 gap
+		{"datadoghq.com", Direct}, // datadog apex 非自家、不在精确集
+		{"fedstart.com", Direct},  // 第三方平台 apex 不收口(只精确 claude.fedstart.com)
+		// 后缀边界:防混淆域名误命中
+		{"evil-anthropic.com", Direct},
+		{"anthropic.com.evil.com", Direct},
+	}
+	for _, c := range cases {
+		if got := Classify(c.host); got != c.want {
+			t.Errorf("Classify(%q) = %v, want %v", c.host, got, c.want)
 		}
 	}
 }
 
-// TestAll 验证 All() = MITMHosts ∪ PassthroughHosts(无重复、覆盖两类全部 host),
-// 供设备 splitter 默认 allow 与 cc-mysub 合并准入门用。
-func TestAll(t *testing.T) {
-	all := All()
-	want := []string{
-		"api.anthropic.com",
-		"console.anthropic.com",
-		"downloads.claude.ai",
-		"http-intake.logs.us5.datadoghq.com",
+// api.anthropic.com 命中 .anthropic.com 自家后缀,但精确 MITM 必须优先——否则换 token 被降级成
+// 盲隧道、占位 token 直达上游。这是 Classify precedence 的关键不变量。
+func TestClassify_MITMPrecedenceOverSuffix(t *testing.T) {
+	if Classify("api.anthropic.com") != MITM {
+		t.Fatal("api.anthropic.com 必须走 MITM,不得被 .anthropic.com 后缀降级为 Passthrough")
 	}
-	got := append([]string(nil), all...)
-	sort.Strings(got)
-	sort.Strings(want)
-	if len(got) != len(want) {
-		t.Fatalf("All() = %v, want %v (len mismatch)", all, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("All() sorted = %v, want %v", got, want)
+}
+
+// 精确 MITM 与精确 passthrough 不相交:一个 host 不能既换 token 又盲透传(否则 forward-proxy 分类
+// 歧义)。后缀不参与此检查——精确 MITM 在 Classify 里永远先判,故后缀与 MITM 精确 host 重叠是良性的。
+func TestExactSetsDisjoint(t *testing.T) {
+	for _, m := range MITMHosts {
+		for _, p := range PassthroughExact {
+			if m == p {
+				t.Errorf("host %q 同时在 MITMHosts 与 PassthroughExact(两精确集必须互斥)", m)
+			}
 		}
 	}
-	// All() 是两类的并集——逐一核对每个 host 确属其一(防止 All 漏项或混入第三类)。
-	for _, h := range all {
-		if !slices.Contains(MITMHosts, h) && !slices.Contains(PassthroughHosts, h) {
-			t.Errorf("All() 含 %q 但既不在 MITMHosts 也不在 PassthroughHosts", h)
+}
+
+func TestMatchSuffix(t *testing.T) {
+	cases := []struct {
+		host, suffix string
+		want         bool
+	}{
+		{"anthropic.com", "anthropic.com", true},           // apex
+		{"x.anthropic.com", "anthropic.com", true},         // 子域
+		{"a.b.anthropic.com", "anthropic.com", true},       // 多级子域
+		{"evil-anthropic.com", "anthropic.com", false},     // 无 "." 边界
+		{"anthropic.com.evil.com", "anthropic.com", false}, // 后缀在中间
+		{"notanthropic.com", "anthropic.com", false},
+	}
+	for _, c := range cases {
+		if got := matchSuffix(c.host, c.suffix); got != c.want {
+			t.Errorf("matchSuffix(%q,%q) = %v, want %v", c.host, c.suffix, got, c.want)
 		}
 	}
 }
