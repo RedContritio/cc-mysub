@@ -213,8 +213,10 @@ gen_ccmysub_ca_and_enroll() {
 
 start_dns_split() {
   # 两跳 B 模型的 DNS（v4）:in-scope host → 127.0.0.2 (B=统一出口); 其余一切 → 127.0.0.3
-  # (直连 sink)。in-scope = MITM 类 api.anthropic.com + 透传类 datadog/downloads(此处硬编码,
-  # 须与 internal/hosts 的 MITMHosts/PassthroughHosts 手动同步)。PROXY_HOST → 127.0.0.1 (cc-mysub)。
+  # (直连 sink)。in-scope = MITM 类 api.anthropic.com + 透传类:datadog intake/downloads/第三方 MCP
+  # api.datadoghq.com + 自家后缀子域 status.anthropic.com(验 .anthropic.com 后缀 passthrough,且与
+  # 精确 MITM api.anthropic.com 共存=precedence)。此处硬编码,须与 internal/hosts.Classify 同步。
+  # PROXY_HOST → 127.0.0.1 (cc-mysub)。
   # rogue.example → 127.0.0.2 (B):它**不在** cc-mysub 任何 allowlist,但映到 B,使「cc-mysub
   # 若过度转发」会在 B 现形(Probe D 的 over-forward 探针;详见 ASSERT-SCOPE)。dnsmasq 的具体
   # address=/host/ 覆盖 catch-all address=/#/。
@@ -227,6 +229,8 @@ address=/#/127.0.0.3
 address=/api.anthropic.com/127.0.0.2
 address=/http-intake.logs.us5.datadoghq.com/127.0.0.2
 address=/downloads.claude.ai/127.0.0.2
+address=/status.anthropic.com/127.0.0.2
+address=/api.datadoghq.com/127.0.0.2
 address=/rogue.example/127.0.0.2
 address=/$PROXY_HOST/127.0.0.1
 EOF
@@ -292,13 +296,15 @@ stage_split() {
     > "$WORK/curlB.out" 2>&1 || true
   sleep 1
 
-  # Probe C — 透传转发: curl via helper to the in-scope passthrough hosts. These ARE in
-  # the splitter allow (hosts.All()) → chained to cc-mysub → cc-mysub classifies them
-  # passthrough → blind-tunnels to the real host → DNS maps it to B@127.0.0.2. curl -k
-  # accepts B's self-signed leaf for the host; we only need B to record the SNI and
-  # cc-mysub to log the passthrough. If cc-mysub wrongly 403'd them, B would never see
-  # them; if the splitter wrongly direct-dialed them, cc-mysub would never log them.
-  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai; do
+  # Probe C — 透传转发: curl via helper to the in-scope passthrough hosts. hosts.Classify
+  # routes them to passthrough → splitter chains to cc-mysub → cc-mysub blind-tunnels to the
+  # real host → DNS maps it to B@127.0.0.2. 覆盖三种 passthrough 来源:第三方精确(datadog
+  # intake / api.datadoghq.com MCP)、自家后缀子域(status.anthropic.com,验 .anthropic.com 后缀
+  # 收口且不被精确 MITM api.anthropic.com 吞=precedence)、downloads(.claude.ai 后缀). curl -k
+  # accepts B's self-signed leaf; we need B to record the SNI and cc-mysub to log the passthrough.
+  # If cc-mysub wrongly 403'd them, B never sees them; if splitter wrongly direct-dialed, cc-mysub
+  # never logs them.
+  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai status.anthropic.com api.datadoghq.com; do
     log "Probe C: curl via cc-mysub helper to $ph (passthrough forward) ..."
     in_ns "$WORK/bin/cc-mysub" helper \
       --host "$PROXY_HOST" --client-cert "$DEV_CRT" --client-key "$DEV_KEY" \
@@ -338,13 +344,13 @@ stage_split() {
   # (C) 透传转发经 A: each passthrough host must (1) be logged by cc-mysub as a passthrough
   # tunnel — proves the splitter chained it to cc-mysub (not direct-dialed) — AND (2) appear
   # in B's SNI inventory — proves it reached the unified egress (cc-mysub didn't 403 it).
-  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai; do
+  for ph in http-intake.logs.us5.datadoghq.com downloads.claude.ai status.anthropic.com api.datadoghq.com; do
     grep -F "passthrough" "$WORK/cc.err" 2>/dev/null | grep -qF "$ph" \
       || fail "ASSERT-C: cc-mysub never logged passthrough for $ph (splitter direct-dialed it? not chained)"
     grep -qF "$ph" "$WORK/mock.out" 2>/dev/null \
       || fail "ASSERT-C: B SNI inventory missing $ph (cc-mysub 403'd it? not forwarded to egress)"
   done
-  log "ASSERT-C ok: datadog + downloads passthrough-forwarded via cc-mysub and reached B"
+  log "ASSERT-C ok: 4 passthrough hosts (datadog intake/downloads/.anthropic.com 后缀子域/datadog MCP) forwarded via cc-mysub and reached B"
 
   # (SCOPE) cc-mysub 收口=allowlist,不是 DNS 副产物: Probe D force-chained rogue.example THROUGH
   # cc-mysub (helper --allow), and rogue.example's DNS points at B@127.0.0.2 — so an over-forward
