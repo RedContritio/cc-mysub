@@ -67,6 +67,41 @@ func TestRateLimit_ExemptsTelemetry(t *testing.T) {
 	}
 }
 
+// TestRateLimit_ExemptOnlyAnonymous 验证 P3-7:豁免路径只对匿名(无凭据)请求豁免;带凭据的同路径
+// 走 per-device 限流,堵借 /api/ 前缀绕过。
+func TestRateLimit_ExemptOnlyAnonymous(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	dev := auth.Device{Label: "laptop", RateLimit: 1}
+	h := injectDevice(dev, RateLimitByDevice(1)(next))
+
+	anon := func() int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/api/event_logging/v2/batch", nil))
+		return w.Code
+	}
+	withCred := func() int {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/api/event_logging/v2/batch", nil)
+		r.Header.Set("Authorization", "Bearer placeholder")
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	// 匿名豁免:远超 limit=1 的连打仍永不 429(逐字节透传初衷保留)
+	for i := 0; i < 10; i++ {
+		if code := anon(); code != 200 {
+			t.Fatalf("anon /api hit %d got %d want 200 (anonymous exempt)", i, code)
+		}
+	}
+	// 带凭据:同豁免路径走 per-device 桶,首发过、再发被限(不得借豁免前缀绕过)
+	if code := withCred(); code != 200 {
+		t.Fatalf("first credentialed /api got %d want 200", code)
+	}
+	if code := withCred(); code != http.StatusTooManyRequests {
+		t.Errorf("second credentialed /api got %d want 429 (must not bypass via exempt prefix)", code)
+	}
+}
+
 func TestAccessLogCapturesStatusAndUsage(t *testing.T) {
 	var got AccessRecord
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

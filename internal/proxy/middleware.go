@@ -52,8 +52,10 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 	l := ratelimit.NewLimiter(nil)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isExempt(r.URL.Path) {
-				next.ServeHTTP(w, r) // 豁免遥测：永不限流
+			// 仅匿名(无凭据)的遥测/注册表查询豁免限流——带凭据的同路径(/api/ 等)走 per-device 桶,
+			// 堵借豁免前缀绕过 per-device 限流(P3-7)。匿名遥测逐字节透传的初衷由「无凭据」保留。
+			if isExempt(r.URL.Path) && !auth.HasInboundCredential(r) {
+				next.ServeHTTP(w, r)
 				return
 			}
 			dev, _ := r.Context().Value(deviceKey).(auth.Device)
