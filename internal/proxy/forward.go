@@ -143,6 +143,11 @@ const handshakeReadTimeout = 15 * time.Second
 // 互相误计并破坏 br.Buffered()/prefixConn 的流水线回放（spec §3.2 第 1 点）。
 const maxConnectHeaderBytes = 8192
 
+// idleTimeout 是已建立隧道(内层 MITM keep-alive / passthrough relay)的空闲回收超时:双向无字节流动
+// 超过此值即断、释放并发槽(§3.4 的 sema),防被盗设备开满空闲连接占满槽(P2-6)。10 分钟覆盖 claude
+// 正常 turn 内工具执行 + turn 间思考,挂机超 10 分钟才回收;claude 断后重连透明(见 P1-2 研究)。
+const idleTimeout = 10 * time.Minute
+
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
 // CONNECT 目标的分类（MITM 换 token / 透传盲隧道 / 403）由 internal/hosts.Classify 权威裁决——
@@ -395,15 +400,41 @@ func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host string) {
 	// 可观测性：记录经出口透传的 host（不解密 body，仅目标 host——已知于 allowlist，非用户内容）。
 	// 与 MITM 路径的 AccessLog 对称，亦供 egress 审计断言 cc-mysub 确实经此转发遥测/更新。
 	slog.Info("passthrough", "host", host)
-	relayBlind(outer, outerR, up)
+	relayBlind(outer, outerR, up, idleTimeout)
 }
 
 // relayBlind 双向盲拷贝 outer<->up，任一方向结束即收尾（关闭两端解除另一方向阻塞）。
-// outerR 为 outer 的读端（可能已缓冲），写仍用裸 outer。镜像 splitter.relay。
-func relayBlind(outer net.Conn, outerR io.Reader, up net.Conn) {
+// outerR 为 outer 的读端（可能已缓冲），写仍用裸 outer。idle>0 时加空闲回收（P2-6）:任一方向有字节
+// 流动就把双向 read deadline 刷新到 now+idle（故单向流量如下载不会误断），双向静默超 idle → Read
+// 超时 → 断、释放 sema 槽。
+func relayBlind(outer net.Conn, outerR io.Reader, up net.Conn, idle time.Duration) {
+	touch := func() {
+		if idle > 0 {
+			d := time.Now().Add(idle)
+			_ = outer.SetReadDeadline(d)
+			_ = up.SetReadDeadline(d)
+		}
+	}
+	touch()
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(up, outerR); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(outer, up); done <- struct{}{} }()
+	cp := func(dst net.Conn, src io.Reader) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				touch() // 任一方向有流量 → 刷新双向 deadline（单向流量不误断）
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go cp(up, outerR)
+	go cp(outer, up)
 	<-done
 	outer.Close()
 	up.Close()

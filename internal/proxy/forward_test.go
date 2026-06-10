@@ -563,6 +563,70 @@ func TestForwardProxy_UnregisteredClientCertHandshakeFails(t *testing.T) {
 
 // TestPrefixConn_ReplaysPrefixThenConn 确定性验证 prefixConn 先回放 prefix 再读底层 conn，
 // 字节顺序无丢失/错位（handle 流水线分支的握手关键路径，整跳难以确定性触发故单测此逻辑）。
+// TestRelayBlind_IdleTimeout 验证 P2-6:双向静默超过 idle → relayBlind 断开返回(回收 sema 槽)。
+func TestRelayBlind_IdleTimeout(t *testing.T) {
+	outerA, outerB := net.Pipe()
+	upA, upB := net.Pipe()
+	defer func() { outerB.Close(); upB.Close() }()
+	done := make(chan struct{})
+	go func() {
+		relayBlind(outerA, outerA, upA, 150*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done: // idle 超时断开
+	case <-time.After(3 * time.Second):
+		t.Fatal("relayBlind did not idle-timeout on silent connection")
+	}
+}
+
+// TestRelayBlind_UnidirectionalKeepsAlive 验证 P2-6 的 correctness:单向流量(如下载,只 up→outer)
+// 不应误触发 idle 断开——任一方向有字节就刷新双向 deadline。idle=1s 宽松以抗 -race 时序抖动。
+func TestRelayBlind_UnidirectionalKeepsAlive(t *testing.T) {
+	outerA, outerB := net.Pipe()
+	upA, upB := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		relayBlind(outerA, outerA, upA, time.Second)
+		close(done)
+	}()
+	stop := make(chan struct{})
+	go func() { // up→outer 持续发(模拟下载)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = upB.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if _, err := upB.Write([]byte("data")); err != nil {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}()
+	go func() { // outerB 读走,否则 relay 写 outerA 阻塞
+		buf := make([]byte, 64)
+		for {
+			_ = outerB.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := outerB.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+		close(stop)
+		outerB.Close()
+		upB.Close()
+		t.Error("relayBlind idle-timed out despite unidirectional traffic")
+	case <-time.After(600 * time.Millisecond): // < idle 1s,单向流量应保活
+		close(stop)
+		outerB.Close()
+		upB.Close()
+	}
+}
+
 func TestPrefixConn_ReplaysPrefixThenConn(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
