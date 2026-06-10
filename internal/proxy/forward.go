@@ -210,7 +210,9 @@ func (fp *ForwardProxy) unregisterConn(fingerprint string, c net.Conn) {
 
 // RevokeConns 关闭这些 fingerprint 的所有既有外层连接——吊销即时生效:既有长连接被断,claude 重连时
 // 新外层 mTLS 握手被 VerifyPeerCertificate 拒(指纹已不在 devices.json)。供 DeviceStore.SetOnRevoke 回调。
-// 先锁内收集、锁外 Close:Close 触发 handle 退出 → unregisterConn 再取 connMu,锁外避免重入死锁。
+// 先锁内收集、锁外 Close:tls.Conn.Close 发 close_notify 带 5s 写超时,锁外 Close 避免持 connMu 期间
+// 被某个慢 Close 卡住、阻塞所有 register/unregister/revoke(unregisterConn 在 handle 另一 goroutine,
+// 与本锁是竞争、非重入)。
 func (fp *ForwardProxy) RevokeConns(fingerprints []string) {
 	fp.connMu.Lock()
 	var toClose []net.Conn
@@ -274,6 +276,13 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	// 握手成功:把该外层连接登记到其设备指纹,供吊销时主动断开(P1-2);handle 退出时注销。
 	fp.registerConn(connDevice.CertSHA256, outer)
 	defer fp.unregisterConn(connDevice.CertSHA256, outer)
+	// register 后复查一次,堵「握手时 Lookup 读到旧表(设备在)→ registerConn 之间设备被吊销、
+	// RevokeConns 遍历时本连接尚未入表而漏关」的 TOCTOU 窗口:此刻起 RevokeConns 必能看到本连接;
+	// 若窗口内已被吊销,这里自行关闭,使吊销严格即时。
+	if _, ok := fp.auth.Lookup(connDevice.CertSHA256); !ok {
+		outer.Close()
+		return
+	}
 	br := bufio.NewReader(outer)
 	// 手动字节累加器(pre-200 cap):CONNECT 行 + 每个头行长度累加,超 maxConnectHeaderBytes → 400 + Close。
 	// 不用 io.LimitReader 包 conn——会被 bufio 预读误计并破坏 br.Buffered()/prefixConn 回放。
@@ -363,6 +372,7 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	srv := &http.Server{
 		Handler:           fp.handler,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       idleTimeout, // keep-alive 请求间空闲超时(P2-6);否则靠 ReadHeaderTimeout 30s 兜底、过短致正常使用频繁重连
 		BaseContext: func(net.Listener) context.Context {
 			// 注入设备(认证身份)+ connectHost(已验证 MITM 的 CONNECT 目标)——后者使 forwardSwap 把出站
 			// 绑定到此 host,杜绝内层请求 Host 头把真 token 导向任意域名(P0)。host 已经 ParseConnect
