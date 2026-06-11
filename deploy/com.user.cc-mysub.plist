@@ -13,8 +13,8 @@
        frp 形态,不要为绑 443 而让整个业务进程跑 root。 -->
   <key>UserName</key><string>_cc-mysub</string>
 
-  <!-- LaunchDaemon 的最小环境不含 HOME,cc-mysub 的 defaultConfigDir 会落到错误路径
-       (HOME 缺失 → /.config/cc-mysub)并 fail-fast 退出。必须显式钉死绝对配置目录、不依赖 HOME。
+  <!-- LaunchDaemon 的最小环境不含 HOME,默认配置目录(XDG/HOME)不可解析;cc-mysub 仅在
+       --config-dir 缺省时才解析默认目录,显式钉死绝对路径即不依赖 HOME、可直接启动。
        改成你的实际配置目录(须由上面的 UserName 可读;ca.key/upstream.json 须 0600 且属主为该用户)。 -->
   <key>ProgramArguments</key>
   <array>

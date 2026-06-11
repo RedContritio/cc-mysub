@@ -197,13 +197,13 @@ func TestRunRemove(t *testing.T) {
 	path := filepath.Join(dir, "devices.json")
 	must(t, AppendDevice(path, Params{Label: "x", PublicHost: "h", SubType: "max"}, fp("a")))
 	var out bytes.Buffer
-	if err := RunRemove([]string{"--config-dir", dir, "--label", "x"}, dir, &out); err != nil {
+	if err := RunRemove([]string{"--config-dir", dir, "--label", "x"}, &out); err != nil {
 		t.Fatalf("RunRemove: %v", err)
 	}
 	if list := readDevices(t, path); len(list) != 0 {
 		t.Fatalf("device not removed: %+v", list)
 	}
-	if err := RunRemove([]string{"--config-dir", dir}, dir, &out); err == nil {
+	if err := RunRemove([]string{"--config-dir", dir}, &out); err == nil {
 		t.Error("RunRemove without --fingerprint/--label should error")
 	}
 }
@@ -293,7 +293,7 @@ func TestRun_RegistersOnly_NoWrapper(t *testing.T) {
 		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"ccapi.example.com","subscription_type":"max"}}`), 0o644)
 	out := &bytes.Buffer{}
 	fp := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	err := Run([]string{"-config-dir", d, "-label", "box", "-fingerprint", fp}, d, out)
+	err := Run([]string{"-config-dir", d, "-label", "box", "-fingerprint", fp}, out)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestRunAssignsUpstream(t *testing.T) {
 
 	cert := fp("b")
 	var sb strings.Builder
-	err := Run([]string{"--label", "work", "--upstream", "b", "--fingerprint", cert}, cfgDir, &sb)
+	err := Run([]string{"--config-dir", cfgDir, "--label", "work", "--upstream", "b", "--fingerprint", cert}, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestRunNormalizesFingerprintToLower(t *testing.T) {
 
 	upper := strings.Repeat("A", 64)
 	var sb strings.Builder
-	err := Run([]string{"--label", "up", "--fingerprint", upper}, cfgDir, &sb)
+	err := Run([]string{"--config-dir", cfgDir, "--label", "up", "--fingerprint", upper}, &sb)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -379,10 +379,10 @@ func TestRunRotateRevokesOldFingerprint(t *testing.T) {
 	newFP := fp("b")
 
 	var sb1 strings.Builder
-	must(t, Run([]string{"--label", "laptop", "--fingerprint", oldFP}, cfgDir, &sb1))
+	must(t, Run([]string{"--config-dir", cfgDir, "--label", "laptop", "--fingerprint", oldFP}, &sb1))
 
 	var sb2 strings.Builder
-	must(t, Run([]string{"--label", "laptop", "--rotate", "--fingerprint", newFP}, cfgDir, &sb2))
+	must(t, Run([]string{"--config-dir", cfgDir, "--label", "laptop", "--rotate", "--fingerprint", newFP}, &sb2))
 
 	store, err := auth.NewDeviceStore(filepath.Join(cfgDir, "devices.json"))
 	must(t, err)
@@ -406,9 +406,9 @@ func TestRunNoRotateRejectsDuplicate(t *testing.T) {
 		[]byte(`{"listen":"127.0.0.1:8788","client":{"public_host":"h","subscription_type":"max"}}`), 0o644))
 
 	var sb1 strings.Builder
-	must(t, Run([]string{"--label", "dup", "--fingerprint", fp("a")}, cfgDir, &sb1))
+	must(t, Run([]string{"--config-dir", cfgDir, "--label", "dup", "--fingerprint", fp("a")}, &sb1))
 	var sb2 strings.Builder
-	err := Run([]string{"--label", "dup", "--fingerprint", fp("b")}, cfgDir, &sb2)
+	err := Run([]string{"--config-dir", cfgDir, "--label", "dup", "--fingerprint", fp("b")}, &sb2)
 	if err == nil {
 		t.Fatal("expected duplicate-label error without --rotate, got nil")
 	}
@@ -533,7 +533,7 @@ func TestRunRemoveRejectsBothFingerprintAndLabel(t *testing.T) {
 	path := filepath.Join(dir, "devices.json")
 	must(t, AppendDevice(path, Params{Label: "real", PublicHost: "h"}, fp("a")))
 	var out bytes.Buffer
-	err := RunRemove([]string{"--config-dir", dir, "--fingerprint", fp("a"), "--label", "real"}, dir, &out)
+	err := RunRemove([]string{"--config-dir", dir, "--fingerprint", fp("a"), "--label", "real"}, &out)
 	if err == nil {
 		t.Fatal("expected error when both --fingerprint and --label are given")
 	}
@@ -550,7 +550,7 @@ func TestRunRemoveMessageOnlyEchoesUsedCriterion(t *testing.T) {
 	path := filepath.Join(dir, "devices.json")
 	must(t, AppendDevice(path, Params{Label: "lbl", PublicHost: "h"}, fp("a")))
 	var out bytes.Buffer
-	must(t, RunRemove([]string{"--config-dir", dir, "--label", "lbl"}, dir, &out))
+	must(t, RunRemove([]string{"--config-dir", dir, "--label", "lbl"}, &out))
 	if !strings.Contains(out.String(), "label=") {
 		t.Errorf("by-label removal should echo the label: %q", out.String())
 	}
@@ -569,7 +569,7 @@ func TestRunRejectsUnknownUpstream(t *testing.T) {
 		[]byte(`{"oauthTokens":[{"id":"team-a","token":"t1"},{"id":"team-b","token":"t2"}]}`), 0o600))
 
 	var out bytes.Buffer
-	err := Run([]string{"--config-dir", cfgDir, "--label", "x", "--upstream", "team-z", "--fingerprint", fp("a")}, cfgDir, &out)
+	err := Run([]string{"--config-dir", cfgDir, "--label", "x", "--upstream", "team-z", "--fingerprint", fp("a")}, &out)
 	if err == nil {
 		t.Fatal("expected error for --upstream id not in pool, got nil")
 	}
@@ -590,7 +590,7 @@ func TestRunAcceptsKnownUpstream(t *testing.T) {
 		[]byte(`{"oauthTokens":[{"id":"team-a","token":"t1"}]}`), 0o600))
 
 	var out bytes.Buffer
-	must(t, Run([]string{"--config-dir", cfgDir, "--label", "x", "--upstream", "team-a", "--fingerprint", fp("a")}, cfgDir, &out))
+	must(t, Run([]string{"--config-dir", cfgDir, "--label", "x", "--upstream", "team-a", "--fingerprint", fp("a")}, &out))
 	list := readDevices(t, filepath.Join(cfgDir, "devices.json"))
 	if len(list) != 1 || list[0].Upstream != "team-a" {
 		t.Fatalf("known --upstream should register: %+v", list)
@@ -609,6 +609,39 @@ func TestResolveFingerprintRejectsNonCertPEM(t *testing.T) {
 	} else if !strings.Contains(err.Error(), "CERTIFICATE") {
 		t.Errorf("error should explain the PEM type mismatch: %v", err)
 	}
+}
+
+// TestRun_NoHome 守 Backlog P1（子命令侧）：HOME/XDG 全缺时，显式 -config-dir 必须豁免
+// 默认目录解析（失败点应是 load config，而非「无法确定配置目录」）；缺 flag 则 loud-fail。
+func TestRun_NoHome(t *testing.T) {
+	t.Setenv("HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	fp64 := strings.Repeat("a", 64)
+
+	t.Run("explicit -config-dir bypasses default resolution", func(t *testing.T) {
+		var out strings.Builder
+		err := Run([]string{"-config-dir", t.TempDir(), "-label", "x", "-fingerprint", fp64}, &out)
+		if err == nil || strings.Contains(err.Error(), "无法确定配置目录") {
+			t.Fatalf("explicit -config-dir 必须豁免默认解析(应失败于 load config), got %v", err)
+		}
+	})
+	t.Run("no flag fails loud", func(t *testing.T) {
+		var out strings.Builder
+		err := Run([]string{"-label", "x", "-fingerprint", fp64}, &out)
+		if err == nil || !strings.Contains(err.Error(), "无法确定配置目录") {
+			t.Fatalf("缺 flag 且无 HOME 必须 loud-fail, got %v", err)
+		}
+	})
+	t.Run("RunRemove same contract", func(t *testing.T) {
+		var out strings.Builder
+		err := RunRemove([]string{"-config-dir", t.TempDir(), "-label", "x"}, &out)
+		if err == nil || strings.Contains(err.Error(), "无法确定配置目录") {
+			t.Fatalf("RunRemove 显式 -config-dir 必须豁免默认解析, got %v", err)
+		}
+		if err := RunRemove([]string{"-label", "x"}, &out); err == nil || !strings.Contains(err.Error(), "无法确定配置目录") {
+			t.Fatalf("RunRemove 缺 flag 必须 loud-fail, got %v", err)
+		}
+	})
 }
 
 // ---- helpers ----

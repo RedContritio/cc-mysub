@@ -4,7 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
+
+// DefaultDir 解析默认配置目录：优先 XDG_CONFIG_HOME，否则用户主目录下 .config/cc-mysub。
+// HOME/用户主目录不可解析时返回 error——绝不静默回退到文件系统根下的 /.config/cc-mysub。
+// LaunchDaemon 最小环境不含 HOME；调用方仅在 --config-dir 缺省时才调用，显式目录绝不经过这里
+// （否则 plist 钉死的 --config-dir 会被默认解析的 fail-fast 抢跑，Backlog P1）。
+func DefaultDir() (string, error) {
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "cc-mysub"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("无法确定配置目录: %w; 请设置 XDG_CONFIG_HOME 或显式传 --config-dir", err)
+	}
+	return filepath.Join(home, ".config", "cc-mysub"), nil
+}
 
 // ClientConfig holds the deployment-facing constants used to generate a
 // per-device `myclaude` wrapper (see `cc-mysub add-device`). They are fixed for

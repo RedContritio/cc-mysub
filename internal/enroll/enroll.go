@@ -283,13 +283,12 @@ func RemoveDevice(path, fingerprint, label string) error {
 // defaults from <config-dir>/config.json, resolves params, ensures the cc-mysub
 // CA exists, registers (or rotates) the device's certificate fingerprint into
 // <config-dir>/devices.json, and prints next steps. It emits no wrapper—device
-// onboarding is owned by install.sh. defaultCfgDir is the fallback when
-// --config-dir is not given.
-func Run(args []string, defaultCfgDir string, out io.Writer) error {
+// onboarding is owned by install.sh. --config-dir 缺省时惰性解析 config.DefaultDir()。
+func Run(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("add-device", flag.ContinueOnError)
 	fs.SetOutput(out)
 	var (
-		cfgDir      = fs.String("config-dir", defaultCfgDir, "config directory")
+		cfgDir      = fs.String("config-dir", "", "config directory (默认: $XDG_CONFIG_HOME/cc-mysub 或 ~/.config/cc-mysub)")
 		label       = fs.String("label", "", "device label (required, unique)")
 		host        = fs.String("host", "", "proxy public host (overrides config client.public_host)")
 		sub         = fs.String("sub", "", "subscription tier (overrides config; 仅用于校验 Resolve 一致性)")
@@ -301,6 +300,15 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// --config-dir 缺省才解析默认目录:显式目录绝不触发 XDG/HOME 解析(Backlog P1),
+	// 解析失败作 error 返回(库代码不 os.Exit)。
+	if *cfgDir == "" {
+		d, err := config.DefaultDir()
+		if err != nil {
+			return err
+		}
+		*cfgDir = d
 	}
 	cfg, err := config.LoadConfig(filepath.Join(*cfgDir, "config.json"))
 	if err != nil {
@@ -359,16 +367,25 @@ func Run(args []string, defaultCfgDir string, out io.Writer) error {
 
 // RunRemove is the `cc-mysub remove-device` entrypoint: 按 --fingerprint 或 --label 从
 // <config-dir>/devices.json 删除设备并原子写回(吊销走 cli,不手动编辑)。热重载后该设备立即失效。
-func RunRemove(args []string, defaultCfgDir string, out io.Writer) error {
+func RunRemove(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("remove-device", flag.ContinueOnError)
 	fs.SetOutput(out)
 	var (
-		cfgDir      = fs.String("config-dir", defaultCfgDir, "config directory")
+		cfgDir      = fs.String("config-dir", "", "config directory (默认: $XDG_CONFIG_HOME/cc-mysub 或 ~/.config/cc-mysub)")
 		fingerprint = fs.String("fingerprint", "", "要吊销的设备证书 SHA-256(DER) 指纹")
 		label       = fs.String("label", "", "要吊销的设备 label (--fingerprint 的替代)")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// --config-dir 缺省才解析默认目录:显式目录绝不触发 XDG/HOME 解析(Backlog P1),
+	// 解析失败作 error 返回(库代码不 os.Exit)。
+	if *cfgDir == "" {
+		d, err := config.DefaultDir()
+		if err != nil {
+			return err
+		}
+		*cfgDir = d
 	}
 	if *fingerprint == "" && *label == "" {
 		return fmt.Errorf("需要 --fingerprint <hex> 或 --label <name>")

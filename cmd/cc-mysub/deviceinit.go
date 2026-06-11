@@ -16,17 +16,30 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/redcontritio/cc-mysub/internal/config"
 )
 
 // runDeviceInit 幂等生成 per-device client-leaf 自签证书 + 私钥(0600)，打印证书指纹与登记命令。
 // 私钥唯一落点 device.key，绝不打印/外传——这是"私钥不离设备"数据安全属性的落点。返回退出码。
-func runDeviceInit(args []string, cfgDir string, out io.Writer) int {
+// -config-dir 缺省时惰性解析 config.DefaultDir()（显式目录绝不触发 XDG/HOME 解析，Backlog P1）。
+func runDeviceInit(args []string, out io.Writer) int {
 	fs := flag.NewFlagSet("device-init", flag.ContinueOnError)
 	fs.SetOutput(out)
+	cfgDirFlag := fs.String("config-dir", "", "config directory (默认: $XDG_CONFIG_HOME/cc-mysub 或 ~/.config/cc-mysub)")
 	// label 仅用于打印 add-device 登记命令，绝不写入证书 CN（CN 恒为固定非 PII 占位，见下）。
 	label := fs.String("label", "", "device label（仅用于打印 add-device 登记命令；不写入证书 CN）")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	cfgDir := *cfgDirFlag
+	if cfgDir == "" {
+		d, err := config.DefaultDir()
+		if err != nil {
+			fmt.Fprintln(out, err)
+			return 1
+		}
+		cfgDir = d
 	}
 	keyPath := filepath.Join(cfgDir, "device.key")
 	crtPath := filepath.Join(cfgDir, "device.crt")

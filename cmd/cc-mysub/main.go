@@ -21,7 +21,7 @@ func main() {
 	// Subcommands. Bare invocation (no subcommand) still serves, so launchd and
 	// existing `cc-mysub [--config-dir ...]` usage keep working unchanged.
 	if len(os.Args) > 1 && os.Args[1] == "add-device" {
-		if err := enroll.Run(os.Args[2:], defaultConfigDir(), os.Stdout); err != nil {
+		if err := enroll.Run(os.Args[2:], os.Stdout); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
 				return
 			}
@@ -31,7 +31,7 @@ func main() {
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "remove-device" {
-		if err := enroll.RunRemove(os.Args[2:], defaultConfigDir(), os.Stdout); err != nil {
+		if err := enroll.RunRemove(os.Args[2:], os.Stdout); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
 				return
 			}
@@ -44,14 +44,17 @@ func main() {
 		os.Exit(runHelper(os.Args[2:]))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "device-init" {
-		os.Exit(runDeviceInit(os.Args[2:], defaultConfigDir(), os.Stdout))
+		os.Exit(runDeviceInit(os.Args[2:], os.Stdout))
 	}
 	if len(os.Args) > 1 && os.Args[1] == "gen-config" {
-		os.Exit(runGenConfig(os.Args[2:], defaultConfigDir(), os.Stdout, os.Stderr))
+		os.Exit(runGenConfig(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
-	cfgDir := flag.String("config-dir", defaultConfigDir(), "config directory")
+	cfgDir := flag.String("config-dir", "", "config directory (默认: $XDG_CONFIG_HOME/cc-mysub 或 ~/.config/cc-mysub)")
 	flag.Parse()
+	if *cfgDir == "" {
+		*cfgDir = defaultConfigDir()
+	}
 
 	cfg, err := config.LoadConfig(filepath.Join(*cfgDir, "config.json"))
 	if err != nil {
@@ -132,26 +135,12 @@ func main() {
 	}
 }
 
-// resolveConfigDir 解析默认配置目录：优先 XDG_CONFIG_HOME，否则用户主目录下 .config/cc-mysub。
-// HOME/用户主目录不可解析时返回 error——绝不静默回退到文件系统根下的 /.config/cc-mysub。
-// LaunchDaemon 的最小环境不含 HOME，os.UserHomeDir 此时返回错误；若把错误丢给 `_` 并继续，
-// 配置目录会静默解析为根路径、读不到 operator 写入的真实配置，进而 LoadConfig 失败 + KeepAlive
-// 无限 crash-loop（错误只落在 /tmp 日志）。错误可见纪律要求此处 fail-fast 而非静默回退。
-func resolveConfigDir() (string, error) {
-	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
-		return filepath.Join(d, "cc-mysub"), nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("无法确定配置目录: %w; 请设置 XDG_CONFIG_HOME 或显式传 --config-dir", err)
-	}
-	return filepath.Join(home, ".config", "cc-mysub"), nil
-}
-
 // defaultConfigDir 返回默认配置目录，解析失败即 fail-fast（slog.Error + os.Exit(1)）——
-// 所有子命令与服务主路径共用此默认值，不静默用根路径继续。
+// 仅服务主路径在 --config-dir 缺省时调用；显式 --config-dir 不经过这里（Backlog P1：
+// launchd 最小环境无 HOME + plist 钉死 --config-dir 时必须可启动）。子命令自行调
+// config.DefaultDir 并把错误作 error 返回。
 func defaultConfigDir() string {
-	dir, err := resolveConfigDir()
+	dir, err := config.DefaultDir()
 	if err != nil {
 		slog.Error("default config dir", "err", err)
 		os.Exit(1)

@@ -145,6 +145,5 @@ cc-mysub --config-dir /path    # 自定义配置目录
 
 ## Backlog(对抗审查发现)
 
-- **P1: `--config-dir` 在 HOME/XDG 缺失时实际无效。** `main.go` 目前在解析 flag 前把 `defaultConfigDir()` 作为默认值求出;若 LaunchDaemon 最小环境没有 HOME,进程会在看到显式 `--config-dir` 前 fail-fast 退出。`deploy/com.user.cc-mysub.plist` 已钉死 `--config-dir`,但当前实现仍会 crash-loop。修复方向:主路径和子命令先解析 `--config-dir`,为空时再调用默认目录解析;补一个 `env -u HOME XDG_CONFIG_HOME= cc-mysub --config-dir <tmp>` 的回归测试。
 - **P2: 外层 TLS 私钥权限只在启动时校验,热重载可绕过。** 启动路径会对 `certs/<public_host>.key` 调 `RequireOwnerOnly`,但 `NewOuterCertLoader` 热重载只看证书文件 mtime/size 并直接 `tls.LoadX509KeyPair`。续期或人工替换后若 key 变成 group/other-readable,长跑进程会接受它。修复方向:每次 reload 前重新校验 key 权限,并把 key 的 mtime/size 也纳入缓存判定。
 - **P3: 限流桶 key 使用 label,与证书指纹身份模型不一致。** 认证、吊销、连接登记都以 `cert_sha256` 为设备身份,但 `RateLimitByDevice` 当前用 `dev.Label` 作为 token bucket key。label 复用或 remove/add 后会继承旧桶状态,不是真正按证书设备隔离。修复方向:限流 key 改为 `dev.CertSHA256`;访问日志仍可展示 label。
