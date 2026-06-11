@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,7 +40,7 @@ func ocWriteSelfSigned(t *testing.T, dir, cn string) (certPath, keyPath string) 
 	_ = pem.Encode(cb, &pem.Block{Type: "CERTIFICATE", Bytes: der})
 	cb.Close()
 	kd, _ := x509.MarshalECPrivateKey(key)
-	kb, _ := os.Create(keyPath)
+	kb, _ := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	_ = pem.Encode(kb, &pem.Block{Type: "EC PRIVATE KEY", Bytes: kd})
 	kb.Close()
 	return
@@ -119,7 +120,7 @@ func ocWriteSelfSignedSANs(t *testing.T, dir, cn string, extraSANs int) (certPat
 	_ = pem.Encode(cb, &pem.Block{Type: "CERTIFICATE", Bytes: der})
 	cb.Close()
 	kd, _ := x509.MarshalECPrivateKey(key)
-	kb, _ := os.Create(keyPath)
+	kb, _ := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	_ = pem.Encode(kb, &pem.Block{Type: "EC PRIVATE KEY", Bytes: kd})
 	kb.Close()
 	return
@@ -180,5 +181,77 @@ func TestOuterCertLoader_ReloadsOnSameMtimeSizeChange(t *testing.T) {
 	leaf, _ := x509.ParseCertificate(c2.Certificate[0])
 	if leaf.Subject.CommonName != "samemtime.example" {
 		t.Fatalf("same-mtime size-changed cert not reloaded, cn=%s want samemtime.example", leaf.Subject.CommonName)
+	}
+}
+
+// TestOuterCertLoader_RejectsLaxKeyPerm 守 Backlog P2:group/other 可读的私钥在加载期即拒
+// (启动探载走同一路径,故启动权限门也由此保证)。
+func TestOuterCertLoader_RejectsLaxKeyPerm(t *testing.T) {
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "lax.example")
+	if err := os.Chmod(kp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	get := NewOuterCertLoader(cp, kp)
+	if _, err := get(nil); err == nil || !strings.Contains(err.Error(), "outer key perm") {
+		t.Fatalf("lax key perm must be rejected, got err=%v", err)
+	}
+}
+
+// TestOuterCertLoader_RejectsPermLoosenedInPlace 守 Backlog P2 的关键场景:加载成功后就地
+// chmod 放宽权限——内容/mtime/size 全不变,只动 ctime——必须在下一次握手被拒。权限校验
+// 不能挂在 mtime/size 缓存失效路径上,否则永不重跑。收紧回 0600 即恢复,无需重启。
+func TestOuterCertLoader_RejectsPermLoosenedInPlace(t *testing.T) {
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "loosen.example")
+	get := NewOuterCertLoader(cp, kp)
+	if _, err := get(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(kp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := get(nil); err == nil || !strings.Contains(err.Error(), "outer key perm") {
+		t.Fatalf("perm loosened in place must be rejected on next handshake, got err=%v", err)
+	}
+	if err := os.Chmod(kp, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := get(nil); err != nil {
+		t.Fatalf("restoring 0600 must restore service, got %v", err)
+	}
+}
+
+// TestOuterCertLoader_KeyOnlyChangeDetected 守 Backlog P2 后半:单独换 key 必须被发现。
+// 续期两文件非原子落盘的间隙,不匹配对 LoadX509KeyPair loud-fail(瞬时,客户端重试自愈);
+// cert 跟上后恢复。旧行为(只 stat cert)会无限期用内存旧 pair,磁盘与内存静默漂移。
+func TestOuterCertLoader_KeyOnlyChangeDetected(t *testing.T) {
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "first.example")
+	get := NewOuterCertLoader(cp, kp)
+	if _, err := get(nil); err != nil {
+		t.Fatal(err)
+	}
+	dir2 := t.TempDir()
+	cp2, kp2 := ocWriteSelfSigned(t, dir2, "renewed.example")
+	ocCopy(t, kp2, kp) // 只换 key
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(kp, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := get(nil); err == nil {
+		t.Fatal("key-only change must trigger reload and loud-fail on mismatched pair (not serve stale cached pair)")
+	}
+	ocCopy(t, cp2, cp) // cert 跟上 → 恢复并服务新证书
+	if err := os.Chtimes(cp, future, future); err != nil {
+		t.Fatal(err)
+	}
+	c, err := get(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(c.Certificate[0])
+	if leaf.Subject.CommonName != "renewed.example" {
+		t.Fatalf("cn=%s want renewed.example", leaf.Subject.CommonName)
 	}
 }

@@ -104,11 +104,9 @@ func main() {
 	}
 	outerCertPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".crt")
 	outerKeyPath := filepath.Join(*cfgDir, "certs", cfg.Client.PublicHost+".key")
-	if err := config.RequireOwnerOnly(outerKeyPath); err != nil {
-		slog.Error("outer TLS key permission", "err", err)
-		os.Exit(1)
-	}
 	outerCert := proxy.NewOuterCertLoader(outerCertPath, outerKeyPath)
+	// 启动探载即走 loader 的完整校验(含私钥权限位,且此后每次握手复检——Backlog P2),
+	// 单独的启动期 RequireOwnerOnly 是死防御,已删。
 	if _, err := outerCert(nil); err != nil {
 		slog.Error("load outer TLS cert", "cert", outerCertPath, "err", err)
 		os.Exit(1)
