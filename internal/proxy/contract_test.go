@@ -48,7 +48,7 @@ func TestContractFullChain(t *testing.T) {
 
 	// Legit request: inbound credential + CC fingerprint headers; device + connectHost
 	// injected into ctx (生产由 handle BaseContext 注入).
-	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	dev := auth.Device{Label: "laptop", Upstream: "b", CertSHA256: fpHex('5')}
 	req := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer placeholder")
 	req.Header.Set("X-Api-Key", "placeholder")

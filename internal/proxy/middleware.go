@@ -70,10 +70,11 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 				return
 			}
 			// 契约:BaseContext 必为每个内层请求注入已认证设备(连接级 mTLS 证书身份)。缺注入 = 编程错,
-			// 与同链 conditionalAuth 的 no_device 502 对称地 loud-fail(500),绝不静默落进 label=="" 共享桶
-			// (死防御:生产中 BaseContext 恒注入)。匿名请求也带连接证书设备,故此处 device 必非零(P3-24)。
+			// 与同链 conditionalAuth 的 no_device 502 对称地 loud-fail(500),绝不静默落进共享桶
+			// (死防御:生产中 BaseContext 恒注入)。哨兵按设备身份字段校验:store.reload 保证表内
+			// CertSHA256 恒为规范 64 位小写 hex,非规范=未注入/构造错(P3-24)。
 			dev, ok := r.Context().Value(deviceKey).(auth.Device)
-			if !ok || dev.Label == "" {
+			if !ok || !auth.CanonicalFingerprint(dev.CertSHA256) {
 				writeJSONError(w, http.StatusInternalServerError, "no_device", "rate limit: authenticated connection missing device identity")
 				return
 			}
@@ -84,7 +85,10 @@ func RateLimitByDevice(defaultPerMin int) func(http.Handler) http.Handler {
 			if dev.RateLimit > 0 {
 				perMin = dev.RateLimit
 			}
-			if !l.Allow(dev.Label, perMin) {
+			// 桶 key=证书指纹(设备身份),与认证/吊销/连接登记同维度(Backlog P3):label 是可复用的
+			// 展示别名,remove/add 复用 label 不得继承旧桶;rotate(换指纹保 label)拿全新满桶,属
+			// 身份模型下的预期语义。访问日志仍展示 label(AccessLog 取 DeviceLabel)。
+			if !l.Allow(dev.CertSHA256, perMin) {
 				writeJSONError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
 				return
 			}

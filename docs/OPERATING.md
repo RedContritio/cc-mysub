@@ -142,7 +142,3 @@ cc-mysub --config-dir /path    # 自定义配置目录
 ```
 
 后台常驻见 [`../deploy/com.user.cc-mysub.plist`](../deploy/com.user.cc-mysub.plist)(launchd),远程暴露见 [`../deploy/frpc.example.toml`](../deploy/frpc.example.toml)。
-
-## Backlog(对抗审查发现)
-
-- **P3: 限流桶 key 使用 label,与证书指纹身份模型不一致。** 认证、吊销、连接登记都以 `cert_sha256` 为设备身份,但 `RateLimitByDevice` 当前用 `dev.Label` 作为 token bucket key。label 复用或 remove/add 后会继承旧桶状态,不是真正按证书设备隔离。修复方向:限流 key 改为 `dev.CertSHA256`;访问日志仍可展示 label。

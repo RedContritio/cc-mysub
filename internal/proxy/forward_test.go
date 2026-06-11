@@ -1087,7 +1087,7 @@ func TestAccessLog_RecordsShortCircuitRejections(t *testing.T) {
 		return w.Code
 	}
 
-	devOK := auth.Device{Label: "laptop", Upstream: "b", RateLimit: 1}
+	devOK := auth.Device{Label: "laptop", Upstream: "b", CertSHA256: fpHex('6'), RateLimit: 1}
 	if code := mk(devOK, true); code != 200 {
 		t.Fatalf("first request got %d want 200", code)
 	}

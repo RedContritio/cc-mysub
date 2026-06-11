@@ -15,7 +15,7 @@ import (
 
 func TestRateLimitByDevice429(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	dev := auth.Device{Label: "test", RateLimit: 1}
+	dev := auth.Device{Label: "test", CertSHA256: fpHex('1'), RateLimit: 1}
 	h := injectDevice(dev, RateLimitByDevice(1)(next))
 	mk := func() int {
 		w := httptest.NewRecorder()
@@ -38,12 +38,15 @@ func injectDevice(dev auth.Device, next http.Handler) http.Handler {
 	})
 }
 
+// fpHex 造一个规范 64 位小写 hex 指纹（测试设备身份）。
+func fpHex(c byte) string { return strings.Repeat(string(c), 64) }
+
 // TestRateLimit_ExemptsTelemetry 验证 V7：免限流路径前缀（/api/）即使同一设备高频命中也永不 429，
 // 而非豁免路径（/v1/messages）超出该设备限额后照常 429。匿名遥测的限流豁免由
 // isExempt(path) && !auth.HasInboundCredential(r) 保证（P3-7），与 dev.Label 无关。
 func TestRateLimit_ExemptsTelemetry(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	dev := auth.Device{Label: "laptop", RateLimit: 1}
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('2'), RateLimit: 1}
 	h := injectDevice(dev, RateLimitByDevice(1)(next))
 
 	hit := func(path string) int {
@@ -72,7 +75,7 @@ func TestRateLimit_ExemptsTelemetry(t *testing.T) {
 // 走 per-device 限流,堵借 /api/ 前缀绕过。
 func TestRateLimit_ExemptOnlyAnonymous(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	dev := auth.Device{Label: "laptop", RateLimit: 1}
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('3'), RateLimit: 1}
 	h := injectDevice(dev, RateLimitByDevice(1)(next))
 
 	anon := func() int {
@@ -149,16 +152,23 @@ func TestCaptureWriterDecodesGzip(t *testing.T) {
 	}
 }
 
-// TestRateLimitByDevice_MissingDevice500 验证 P3-24:契约违规(ctx 无注入设备/空 Label)在 RateLimitByDevice
-// 与同链 conditionalAuth 的 no_device 对称地 loud-fail(500),不静默落进 label=="" 共享桶、不调用下游。
+// TestRateLimitByDevice_MissingDevice500 验证 P3-24:契约违规(ctx 无注入设备/设备缺规范指纹)
+// 在 RateLimitByDevice 与同链 conditionalAuth 的 no_device 对称地 loud-fail(500),不静默落进
+// 共享桶、不调用下游。哨兵=CanonicalFingerprint(身份字段),与桶 key 同维度(Backlog P3)。
 func TestRateLimitByDevice_MissingDevice500(t *testing.T) {
 	cases := []struct {
 		name string
 		ctx  func(*http.Request) *http.Request
 	}{
 		{"no device in ctx", func(r *http.Request) *http.Request { return r }},
-		{"empty-label device", func(r *http.Request) *http.Request {
-			return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: ""}))
+		{"missing fingerprint", func(r *http.Request) *http.Request {
+			return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop"}))
+		}},
+		{"non-canonical fingerprint", func(r *http.Request) *http.Request {
+			return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: "ABC123"}))
+		}},
+		{"uppercase 64-hex fingerprint", func(r *http.Request) *http.Request {
+			return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: strings.ToUpper(fpHex('a'))}))
 		}},
 	}
 	for _, c := range cases {
@@ -210,7 +220,7 @@ func TestIsExempt(t *testing.T) {
 // 走 per-device 桶被限流(不再借 /api/ 前缀绕过豁免)。
 func TestRateLimit_DotSegmentNotExempt(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	dev := auth.Device{Label: "laptop", RateLimit: 1}
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('4'), RateLimit: 1}
 	h := injectDevice(dev, RateLimitByDevice(1)(next))
 	hit := func() int {
 		w := httptest.NewRecorder()
@@ -337,5 +347,41 @@ func TestCaptureWriter_OversizeStreamDropsTailUsage(t *testing.T) {
 	}
 	if u.InputTokens != 11 {
 		t.Errorf("head input_tokens must survive cap, got %d", u.InputTokens)
+	}
+}
+
+// TestRateLimit_BucketKeyIsFingerprint 守 Backlog P3:桶按证书指纹(设备身份)隔离——
+// remove/add 复用同 label 的新设备(新指纹)拿全新桶,不继承旧桶残余;同指纹改 label
+// (展示别名变化)仍是同一桶。与认证/吊销/连接登记的 cert_sha256 身份模型对齐。
+func TestRateLimit_BucketKeyIsFingerprint(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	mw := RateLimitByDevice(1) // 共享同一个 Limiter
+	hit := func(dev auth.Device) int {
+		h := injectDevice(dev, mw(next))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/messages", nil))
+		return w.Code
+	}
+	devA := auth.Device{Label: "shared", CertSHA256: fpHex('a'), RateLimit: 1}
+	if hit(devA) != 200 {
+		t.Fatal("devA first should pass")
+	}
+	if hit(devA) != http.StatusTooManyRequests {
+		t.Fatal("devA second should be 429")
+	}
+	// 同 label、新指纹(remove/add 复用 label):必须拿全新桶
+	devB := auth.Device{Label: "shared", CertSHA256: fpHex('b'), RateLimit: 1}
+	if hit(devB) != 200 {
+		t.Error("label reuse must NOT inherit old bucket (bucket key is fingerprint)")
+	}
+	// 同指纹、label 改名:仍是同一桶(身份未变)
+	devA2 := auth.Device{Label: "renamed", CertSHA256: fpHex('a'), RateLimit: 1}
+	if hit(devA2) != http.StatusTooManyRequests {
+		t.Error("same fingerprint must share bucket regardless of label")
+	}
+	// 同指纹、不同 RateLimit:仍是同一桶(桶 key 只含身份,不含配额)
+	devA3 := auth.Device{Label: "shared", CertSHA256: fpHex('a'), RateLimit: 2}
+	if hit(devA3) != http.StatusTooManyRequests {
+		t.Error("same fingerprint with different RateLimit must still share the bucket (key excludes quota)")
 	}
 }
