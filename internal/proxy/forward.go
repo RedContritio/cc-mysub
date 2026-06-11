@@ -7,27 +7,38 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/redcontritio/cc-mysub/internal/auth"
 	"github.com/redcontritio/cc-mysub/internal/config"
 	"github.com/redcontritio/cc-mysub/internal/connect"
+	"github.com/redcontritio/cc-mysub/internal/hosts"
 	"github.com/redcontritio/cc-mysub/internal/mitm"
 )
 
 type rewriteCtxKey int
 
-const realTokenKey rewriteCtxKey = 0
+const (
+	realTokenKey rewriteCtxKey = iota
+	// connectHostKey 持 handle() 已验证分类为 MITM 的 CONNECT host(经 BaseContext 注入)。
+	// forwardSwap 用它强制出站目标,绝不信内层请求的 Host/URL.Host——否则不可信设备发
+	// Host: attacker 就能把换上的真 token 导向任意域名(P0,codex 全仓审查)。
+	connectHostKey
+)
 
 // conditionalAuth 是前置中间件（凭据存在性分流）。设备身份来自外层 mTLS 客户端证书
 // （由 handle() 经 http.Server.BaseContext 注入 ctx 的 deviceKey），不再从内层 token 取。
 //   - 入站无凭据（匿名遥测）→ 放行，不读 device、不注入 realToken、不碰任何头（匿名零注入）
 //   - 入站有凭据 + ctx 有设备 D → real=up.PickToken(D.Upstream)；real==""→502；注入 realToken 放行
-//   - 入站有凭据但 ctx 无设备 = 编程错（BaseContext 必注入）→ 502，绝不静默用默认 token
+//   - 入站有凭据但 ctx 无设备 = 编程错（BaseContext 必注入）→ 502，绝不静默用默认 token。
+//     哨兵按身份字段校验(CanonicalFingerprint,与 RateLimitByDevice 同维度):store.reload 保证表内
+//     指纹恒规范、但不要求 label 非空——label 是展示别名,空 label 不构成 no_device(终审反馈)。
 func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +47,7 @@ func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 				return
 			}
 			d, ok := r.Context().Value(deviceKey).(auth.Device)
-			if !ok || d.Label == "" {
+			if !ok || !auth.CanonicalFingerprint(d.CertSHA256) {
 				writeJSONError(w, http.StatusBadGateway, "no_device", "authenticated connection missing device identity")
 				return
 			}
@@ -51,8 +62,10 @@ func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 }
 
 // forwardSwap 是转发 handler（换 token + 逐字节透传）：
-//   - 上游 = 入站请求的 scheme/host（per-connection CONNECT 目标；scheme 缺省 https）
-//   - 恒删出站 X-Api-Key
+//   - 上游 = ctx 注入的 connectHost（handle 验证过的 MITM CONNECT host）；scheme 固定 https。
+//     绝不取内层请求的 Host/URL.Host（不可信设备控制 → 真 token 旁路，见 connectHostKey 注释）
+//   - 带凭据分支删出站 X-Api-Key：X-Api-Key 非空即凭据（HasInboundCredential 把它算凭据），故携带者
+//     必经此分支被删；匿名分支一个头都不碰（§0），空白 X-Api-Key 非凭据、原样透传(no-op)。
 //   - ctx 有 realToken（命中设备，由 conditionalAuth 注入）→ 出站 Authorization 换成 Bearer real
 //   - ctx 无 realToken（匿名）→ 不注入 cc-mysub 凭据，对入站 Authorization 逐字节透传——
 //     保字节级不可区分于直连（治理总纲 §0）。真匿名遥测本就无 Authorization，此处为 no-op。
@@ -64,17 +77,14 @@ func forwardSwap(rt http.RoundTripper) http.Handler {
 	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			scheme := pr.In.URL.Scheme
-			if scheme == "" {
-				scheme = "https"
-			}
-			host := pr.In.URL.Host
-			if host == "" {
-				host = pr.In.Host
-			}
-			pr.Out.URL.Scheme = scheme
-			pr.Out.URL.Host = host
-			pr.Out.Host = "" // Host 头取 URL.Host
+			// 出站目标强制绑定 handle() 已验证分类为 MITM 的 CONNECT host(经 BaseContext 注入 connectHostKey)——
+			// 绝不信内层请求的 URL.Host/Host 头(不可信设备控制),否则设备发 Host: attacker 就能把真 token 导走(P0)。
+			// scheme 固定 https(MITM 上游恒 https,防设备发 http:// 降级)。connectHost 空(无注入)→ 出站 host 空,
+			// Transport 报错走 ErrorHandler 502,fail-closed(绝不转发到不受控目标)。
+			connectHost, _ := pr.In.Context().Value(connectHostKey).(string)
+			pr.Out.URL.Scheme = "https"
+			pr.Out.URL.Host = connectHost
+			pr.Out.Host = "" // Host 头取 URL.Host(=connectHost)
 			if real, _ := pr.In.Context().Value(realTokenKey).(string); real != "" {
 				pr.Out.Header.Set("Authorization", "Bearer "+real)
 				pr.Out.Header.Del("X-Api-Key") // 仅非匿名分支删；匿名请求一个头都不碰（§0）
@@ -103,18 +113,28 @@ type certMinter interface {
 	CertFor(host string) (*tls.Certificate, error)
 }
 
+// dialFunc 拨号一个原始 TCP 连接（透传隧道用）；nil → 默认 net.Dialer。测试注入以把透传上游
+// 重定向到假服务端（与 MITM 路径的 upstream http.RoundTripper 注入对应）。
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // ForwardProxy 是 CONNECT forward-proxy。整个 device↔cc-mysub 跳被外层 TLS 包裹
 // （外层呈现 cc-mysub 自身身份证书 serverName，使 CONNECT 目标 host 不以明文上线）；
-// 在外层 TLS 内读 CONNECT 目标、按 allowlist 拒非法 host（纵深防御），回 200 后再按 host
-// 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP 请求经 rewrite handler 转发到真目标 host。
+// 在外层 TLS 内读 CONNECT 目标，按 hosts.Classify 分类:
+//   - MITM 类: 回 200 后按 host 现签证书跑内层 MITM TLS（嵌套 TLS），把解密后的 HTTP
+//     请求经 rewrite handler 换 token 转发到真目标 host。
+//   - 透传类（自家域名后缀 + 第三方精确）: 先拨真上游、成功才回 200，再盲转发原始字节（不解密、
+//     不碰 token）——经统一出口出网，避免设备直连泄漏真实 IP；不扩解密面、不破坏 cert pinning。
+//   - Direct → 403（纵深防御）。
 type ForwardProxy struct {
 	minter    certMinter                                           // 内层 MITM 叶证书现签（spy 可注入）
 	handler   http.Handler                                         // newRewriteHandler 的结果，逐请求按 req.Host 决定上游
 	auth      Authenticator                                        // 外层 mTLS 准入：按客户端证书指纹查白名单（§5.1）
-	allow     map[string]bool                                      // 允许 MITM 的 CONNECT 目标 host（纵深防御，拒其余）
+	passDial  dialFunc                                             // 透传隧道拨真上游（nil→默认 net.Dialer；测试注入重定向）
 	outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error) // 外层 TLS 身份（真 LE，续期热重载）
 	sema      chan struct{}                                        // 全局并发 self-cap：acquire 在 spawn 前、release 在 handle defer（§3.4）
 	wg        sync.WaitGroup                                       // 跟踪在途 handle goroutine，Serve 退出前等待其收尾
+	connMu    sync.Mutex                                           // 保护 conns
+	conns     map[string]map[net.Conn]struct{}                     // fingerprint → 活跃外层连接（P1-2：吊销时主动断开）
 }
 
 // handshakeReadTimeout 限定外层 TLS 握手 + CONNECT 行/头读取的总时长，防 slowloris 把
@@ -122,42 +142,105 @@ type ForwardProxy struct {
 const handshakeReadTimeout = 15 * time.Second
 
 // maxConnectHeaderBytes 限定 pre-200 阶段（CONNECT 行 + 全部 CONNECT 头）的累计字节数，
-// 防超长头打爆 handle goroutine 内存。手动累加器，不用 io.LimitReader——后者会与 bufio 预读
-// 互相误计并破坏 br.Buffered()/prefixConn 的流水线回放（spec §3.2 第 1 点）。
+// 防超长头打爆 handle goroutine 内存。两道闸:(1) bufio 缓冲尺寸 = maxConnectHeaderBytes,读行用
+// ReadSlice → 单行内存硬钉在缓冲大小,遇不到 '\n' 的超长流(无终止符 flood)立即返回 ErrBufferFull
+// 而非像 ReadString 那样无界累积整行再检查(P2-0);(2) 手动累加器卡跨行累计字节,堵很多短行的总量。
+// 不用 io.LimitReader 包 conn——后者会与 bufio 预读互相误计并破坏 br.Buffered()/prefixConn 的流水线回放。
 const maxConnectHeaderBytes = 8192
+
+// idleTimeout 是已建立隧道(内层 MITM keep-alive / passthrough relay)的空闲回收超时:双向无字节流动
+// 超过此值即断、释放并发槽(§3.4 的 sema),防被盗设备开满空闲连接占满槽(P2-6)。10 分钟覆盖 claude
+// 正常 turn 内工具执行 + turn 间思考,挂机超 10 分钟才回收;claude 断后重连透明(见 P1-2 研究)。
+const idleTimeout = 10 * time.Minute
+
+// readPreambleLine 读一条 '\n' 结尾的 pre-200 CONNECT 行,用 ReadSlice 把单行内存硬钉在 bufio 缓冲尺寸
+// (= maxConnectHeaderBytes):无终止符的超长流在缓冲填满时返回 bufio.ErrBufferFull,而非 ReadString 的
+// 无界整行累积(P2-0)。返回 string 即拷贝出缓冲(ReadSlice 的切片在下一次读时失效),供调用方跨后续读保留。
+func readPreambleLine(br *bufio.Reader) (string, error) {
+	s, err := br.ReadSlice('\n')
+	if err != nil {
+		return "", err
+	}
+	return string(s), nil
+}
 
 // NewForwardProxy 装配 forward-proxy。upstream 为到真目标的 transport（含 dial + TLS 验证）；
 // nil 时 forwardSwap 用默认 retryTransport（生产：真 DNS + 验真证书）。
-// allow 为允许 MITM 的 CONNECT 目标 host 列表；outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
+// CONNECT 目标的分类（MITM 换 token / 透传盲隧道 / 403）由 internal/hosts.Classify 权威裁决——
+// 不再从参数收 host 列表（单一事实源，消除设备 splitter 与本代理两端清单漂移）。
+// outerCert 为外层 TLS 身份证书来源（真 LE 加载器）。
 // maxInFlight 为全局并发上限（>0 强制要求，<=0 panic；饱和时 shed 新连接）。
 //
-// serving chain：conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → AccessLog
-// → forwardSwap（换 token 转发）。设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入。
-func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, allow []string, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
+// serving chain：AccessLog（最外层,包住下面的短路拒绝,使 429/502 也进访问日志,P2-2）→
+// conditionalAuth（前置，按证书设备注入 realToken）→ RateLimitByDevice → forwardSwap（换 token 转发）。
+// 设备身份由外层 mTLS 证书在 handle() 经 BaseContext 注入,任何链位都能读到。
+func NewForwardProxy(m *mitm.Minter, a Authenticator, up *config.Upstream, upstream http.RoundTripper, outerCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), maxInFlight int) *ForwardProxy {
 	if maxInFlight <= 0 {
 		panic("proxy: NewForwardProxy requires maxInFlight > 0")
 	}
 	if outerCert == nil {
 		panic("proxy: NewForwardProxy requires outerCert")
 	}
-	allowSet := make(map[string]bool, len(allow))
-	for _, h := range allow {
-		allowSet[h] = true
-	}
-	handler := conditionalAuth(up)(
-		RateLimitByDevice(120)(
-			AccessLog(nil)(
+	handler := AccessLog(nil)(
+		conditionalAuth(up)(
+			RateLimitByDevice(120)(
 				forwardSwap(upstream),
 			),
 		),
 	)
 	return &ForwardProxy{
-		minter:    m,
-		handler:   handler,
-		auth:      a,
-		allow:     allowSet,
+		minter:  m,
+		handler: handler,
+		auth:    a,
+		passDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
 		outerCert: outerCert,
 		sema:      make(chan struct{}, maxInFlight),
+		conns:     make(map[string]map[net.Conn]struct{}),
+	}
+}
+
+// registerConn 把外层连接登记到其设备指纹(P1-2:供 RevokeConns 主动断开)。
+func (fp *ForwardProxy) registerConn(fingerprint string, c net.Conn) {
+	fp.connMu.Lock()
+	defer fp.connMu.Unlock()
+	set := fp.conns[fingerprint]
+	if set == nil {
+		set = make(map[net.Conn]struct{})
+		fp.conns[fingerprint] = set
+	}
+	set[c] = struct{}{}
+}
+
+// unregisterConn 在 handle 退出时注销连接。
+func (fp *ForwardProxy) unregisterConn(fingerprint string, c net.Conn) {
+	fp.connMu.Lock()
+	defer fp.connMu.Unlock()
+	if set := fp.conns[fingerprint]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(fp.conns, fingerprint)
+		}
+	}
+}
+
+// RevokeConns 关闭这些 fingerprint 的所有既有外层连接——吊销即时生效:既有长连接被断,claude 重连时
+// 新外层 mTLS 握手被 VerifyPeerCertificate 拒(指纹已不在 devices.json)。供 DeviceStore.SetOnRevoke 回调。
+// 先锁内收集、锁外 Close:tls.Conn.Close 发 close_notify 带 5s 写超时,锁外 Close 避免持 connMu 期间
+// 被某个慢 Close 卡住、阻塞所有 register/unregister/revoke(unregisterConn 在 handle 另一 goroutine,
+// 与本锁是竞争、非重入)。
+func (fp *ForwardProxy) RevokeConns(fingerprints []string) {
+	fp.connMu.Lock()
+	var toClose []net.Conn
+	for _, f := range fingerprints {
+		for c := range fp.conns[f] {
+			toClose = append(toClose, c)
+		}
+	}
+	fp.connMu.Unlock()
+	for _, c := range toClose {
+		_ = c.Close()
 	}
 }
 
@@ -186,7 +269,13 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	defer func() { <-fp.sema }() // 释放并发槽位(与 Serve 的 fp.sema<-struct{}{} 配对)
 	// 外层 TLS（双向 mTLS）：呈现真 LE 身份证书；要求并按指纹白名单校验客户端证书。
 	// 此后所有读写都走 outer（Close(outer) 即 Close(rawConn)）。
-	var connDevice auth.Device // 由 VerifyPeerCertificate 在握手内捕获（消二次 Lookup 的热重载 TOCTOU）
+	// connDevice 由 VerifyPeerCertificate 在握手内一次性捕获（消二次 Lookup 的热重载 TOCTOU），此后该外层
+	// 连接所有内层请求经 BaseContext 复用这份快照。已知权衡(P3-16):连接生命周期内 Device 快照不刷新——
+	// 同指纹的属性变更（rotate 改 upstream/rate_limit，或 remove+add 被同一 poll 周期合并）不会断既有长连接,
+	// 故活跃 keep-alive 连接继续按握手时的旧 upstream token / rate_limit 服务,改绑要等设备重连(新握手取新值)。
+	// 吊销（指纹从 devices.json 删除）路径不受影响:store.reload 的删除 diff → onRevoke → RevokeConns 主动断连,
+	// claude 重连时新 mTLS 握手被拒。属性变更的即时传播需扩展 reload diff（store.go,不在本工区），此处如实记录。
+	var connDevice auth.Device
 	outer := tls.Server(rawConn, &tls.Config{
 		GetCertificate: fp.outerCert,
 		ClientAuth:     tls.RequireAnyClientCert,
@@ -207,20 +296,29 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 		outer.Close()
 		return
 	}
-	br := bufio.NewReader(outer)
-	// 手动字节累加器(pre-200 cap):CONNECT 行 + 每个头行长度累加,超 maxConnectHeaderBytes → 400 + Close。
-	// 不用 io.LimitReader 包 conn——会被 bufio 预读误计并破坏 br.Buffered()/prefixConn 回放。
-	line, err := br.ReadString('\n')
+	// 握手成功:把该外层连接登记到其设备指纹,供吊销时主动断开(P1-2);handle 退出时注销。
+	fp.registerConn(connDevice.CertSHA256, outer)
+	defer fp.unregisterConn(connDevice.CertSHA256, outer)
+	// register 后复查一次,堵「握手时 Lookup 读到旧表(设备在)→ registerConn 之间设备被吊销、
+	// RevokeConns 遍历时本连接尚未入表而漏关」的 TOCTOU 窗口:此刻起 RevokeConns 必能看到本连接;
+	// 若窗口内已被吊销,这里自行关闭,使吊销严格即时。
+	if _, ok := fp.auth.Lookup(connDevice.CertSHA256); !ok {
+		outer.Close()
+		return
+	}
+	// bufio 缓冲 = maxConnectHeaderBytes,故 readPreambleLine(ReadSlice) 把单行内存硬钉在缓冲大小:
+	// 无 '\n' 的超长流返回 ErrBufferFull → 400(而非无界累积);手动累加器 byteCount 再卡跨行总量。
+	br := bufio.NewReaderSize(outer, maxConnectHeaderBytes)
+	line, err := readPreambleLine(br)
 	if err != nil {
+		// ErrBufferFull = 单行超过 pre-200 内存上限 → 400(显式拒,叶证书未现签);其余(EOF/读超时)= 客户端走了 → 静默关。
+		if err == bufio.ErrBufferFull {
+			_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		}
 		outer.Close()
 		return
 	}
 	byteCount := len(line)
-	if byteCount > maxConnectHeaderBytes {
-		_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		outer.Close()
-		return
-	}
 	host, ok := connect.ParseConnect(line)
 	if !ok {
 		// 非法/非 CONNECT 请求行 = 客户端错误（区别于 allowlist 策略拒绝的 403）
@@ -230,8 +328,11 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	}
 	// drain CONNECT 头到空行（身份已由外层 mTLS 证书确定，不再解析 Proxy-Authorization）。
 	for {
-		h, err := br.ReadString('\n')
+		h, err := readPreambleLine(br)
 		if err != nil {
+			if err == bufio.ErrBufferFull {
+				_, _ = outer.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			}
 			outer.Close()
 			return
 		}
@@ -245,12 +346,28 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 			break
 		}
 	}
-	// allowlist 纵深防御：已认证设备请求非白名单 host → 403。
-	if !fp.allow[host] {
+	// host 分类（internal/hosts.Classify）：MITM 类（解密换 token）/ 透传类（盲隧道）/ Direct→403（纵深防御）。
+	class := hosts.Classify(host)
+	if class == hosts.Direct {
 		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
 		outer.Close()
 		return
 	}
+	// MITM 与透传都只放行标准 HTTPS :443——CONNECT 端口非 443 = 越权,两条路径对称地显式 403(不静默改写)。
+	// MITM 出站恒拨 :443、透传盲隧道恒拨 :443,故非 443 的 CONNECT 端口在两路都无意义;此前 MITM 分支静默
+	// 把端口当 443 处理与透传分支的「显式 403」不对称(P3-47),现统一在分类后、动作前校验。ParseConnect 已
+	// 保证 line 含合法 host:port(fields[1] 必存在)。
+	if _, port, err := net.SplitHostPort(strings.Fields(line)[1]); err != nil || port != "443" {
+		_, _ = outer.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n"))
+		outer.Close()
+		return
+	}
+	if class == hosts.Passthrough {
+		// 透传类盲隧道:拨真上游成功才回 200，再盲转发原始字节（不现签叶证书、不进 MITM）。
+		fp.tunnel(outer, br, host)
+		return
+	}
+	// MITM 类：回 200 后跑内层嵌套 TLS。
 	if _, err := outer.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		outer.Close()
 		return
@@ -279,11 +396,83 @@ func (fp *ForwardProxy) handle(rawConn net.Conn) {
 	srv := &http.Server{
 		Handler:           fp.handler,
 		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       idleTimeout, // keep-alive 请求间空闲超时(P2-6);否则靠 ReadHeaderTimeout 30s 兜底、过短致正常使用频繁重连
 		BaseContext: func(net.Listener) context.Context {
-			return context.WithValue(context.Background(), deviceKey, connDevice)
+			// 注入设备(认证身份)+ connectHost(已验证 MITM 的 CONNECT 目标)——后者使 forwardSwap 把出站
+			// 绑定到此 host,杜绝内层请求 Host 头把真 token 导向任意域名(P0)。host 已经 ParseConnect
+			// 规范化且 ∈ MITMHosts(Classify=MITM 才走到这),故是 api/console.anthropic.com 之一。
+			ctx := context.WithValue(context.Background(), deviceKey, connDevice)
+			return context.WithValue(ctx, connectHostKey, host)
 		},
 	}
 	_ = srv.Serve(&oneConnListener{conn: nc, closed: closed})
+}
+
+// tunnel 处理透传类 host：拨真上游（passDial）→ 成功才回 200 → 盲双向转发原始字节。
+// 不现签叶证书、不解密、不碰任何头——claude 与真上游端到端做 TLS（cc-mysub 只搬 TCP 字节），
+// 故不扩解密面、不破坏 cert pinning，仅把出口 IP 收敛到统一出口。outerR 为 outer 的 bufio 读端
+// （可能已缓冲 claude 流水线发来的内层 ClientHello，必须从它读以免丢字节）。
+func (fp *ForwardProxy) tunnel(outer net.Conn, outerR io.Reader, host string) {
+	// 拨号设超时：上游黑洞时不让 handle goroutine + 并发槽位无限期挂住（outer 的握手 deadline
+	// 此刻不读 outer、管不到拨号）。透传仅放行 :443（见 handle 的端口校验）。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	up, err := fp.passDial(ctx, "tcp", net.JoinHostPort(host, "443"))
+	if err != nil {
+		// 拨上游失败：CONNECT 尚未回 200，可如实回 502（区别于 MITM 路径 200 后才连上游）。
+		_, _ = outer.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		outer.Close()
+		return
+	}
+	defer up.Close()
+	if _, err := outer.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		outer.Close()
+		return
+	}
+	// 隧道已建立：清除握手 deadline，否则长连接 relay 会被 15s 读超时打断。
+	_ = outer.SetReadDeadline(time.Time{})
+	// 可观测性：记录经出口透传的 host（不解密 body，仅目标 host——已知于 allowlist，非用户内容）。
+	// 与 MITM 路径的 AccessLog 对称，亦供 egress 审计断言 cc-mysub 确实经此转发遥测/更新。
+	slog.Info("passthrough", "host", host)
+	relayBlind(outer, outerR, up, idleTimeout)
+}
+
+// relayBlind 双向盲拷贝 outer<->up，任一方向结束即收尾（关闭两端解除另一方向阻塞）。
+// outerR 为 outer 的读端（可能已缓冲），写仍用裸 outer。idle>0 时加空闲回收（P2-6）:任一方向有字节
+// 流动就把双向 read deadline 刷新到 now+idle（故单向流量如下载不会误断），双向静默超 idle → Read
+// 超时 → 断、释放 sema 槽。
+func relayBlind(outer net.Conn, outerR io.Reader, up net.Conn, idle time.Duration) {
+	touch := func() {
+		if idle > 0 {
+			d := time.Now().Add(idle)
+			_ = outer.SetReadDeadline(d)
+			_ = up.SetReadDeadline(d)
+		}
+	}
+	touch()
+	done := make(chan struct{}, 2)
+	cp := func(dst net.Conn, src io.Reader) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				touch() // 任一方向有流量 → 刷新双向 deadline（单向流量不误断）
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go cp(up, outerR)
+	go cp(outer, up)
+	<-done
+	outer.Close()
+	up.Close()
+	<-done
 }
 
 // prefixConn 在读取底层 conn 之前先回放 prefix（被 bufio 预读的 TLS 字节）。

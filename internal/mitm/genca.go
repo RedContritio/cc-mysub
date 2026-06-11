@@ -13,7 +13,8 @@ import (
 )
 
 // GenerateCA 生成一对自签 ECDSA P-256 CA（cert+key），PEM 编码返回。
-// 供 cc-mysub 一次性建立自有 CA（外层身份 + 内层 MITM 现签的根）。
+// 供 cc-mysub 一次性建立自有 CA，仅作内层 MITM 现签根（设备经 NODE_EXTRA_CA_CERTS 信任）；
+// 外层 TLS 身份用真 LE 证书、走设备系统信任验真，与本 CA 无关。
 func GenerateCA(commonName string) (certPEM, keyPEM []byte, err error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -18,6 +18,9 @@ func ParseConnect(line string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	// 规范化为 DNS 等价形态(lowercase + 剥尾点 FQDN)再校验/返回:host 直通 hosts.Classify 收口判定
+	// 与内层现签叶证书,若不规范,API.ANTHROPIC.COM / api.anthropic.com. 等变体会绕过收口(fail-open)。
+	host = strings.ToLower(strings.TrimRight(host, "."))
 	if !ValidHost(host) {
 		return "", false
 	}

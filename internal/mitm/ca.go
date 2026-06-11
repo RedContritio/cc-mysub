@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"time"
 )
 
 // CA 持有已解析的 CA 证书与对应的签名私钥。
@@ -36,6 +37,11 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 		// KeyUsage==0 表示未限制用途，放行；非零但缺 CertSign 则不能签发叶证书。
 		return nil, fmt.Errorf("mitm: CA certificate lacks KeyUsageCertSign")
 	}
+	// 过期的 CA：CreateCertificate 不校验 parent 有效期，mint 会照常成功，错误推迟到设备验链
+	// 才以含糊提示暴露。加载期 fail-fast 让过期一目了然（治理总纲：错误可见、最该 fail-fast 的位置）。
+	if now := time.Now(); now.After(cert.NotAfter) {
+		return nil, fmt.Errorf("mitm: CA certificate expired at %s", cert.NotAfter.Format(time.RFC3339))
+	}
 
 	// 解析私钥：先试 EC SEC1，再试 PKCS8
 	keyBlock, _ := pem.Decode(keyPEM)
@@ -61,6 +67,16 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 			return nil, fmt.Errorf("mitm: PKCS8 key type %T does not implement crypto.Signer", raw)
 		}
 		signer = s
+	}
+
+	// 私钥必须与 CA 证书公钥配对。外层身份证书走 tls.X509KeyPair 自带该校验，内层 CA 这条手工
+	// 解析路径需对称补上——否则 crt/key 错配（部分备份恢复、手工搬动其一）会通过 LoadCA，Minter
+	// 用一把与 CA 证书不对应的私钥签发叶证书，错误推迟到每条 MITM 连接的设备握手才暴露。
+	pub, ok := cert.PublicKey.(interface {
+		Equal(crypto.PublicKey) bool
+	})
+	if !ok || !pub.Equal(signer.Public()) {
+		return nil, fmt.Errorf("mitm: CA private key does not match certificate public key")
 	}
 
 	return &CA{Cert: cert, Signer: signer}, nil

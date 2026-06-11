@@ -3,13 +3,43 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.user.cc-mysub</string>
+
+  <!-- 持真 setup-token 池 + 内层 CA 私钥的进程不该恒以 root 跑。本模板默认 frp 形态
+       (config.json listen=127.0.0.1:8788,见 config.example.json / frpc.example.toml):
+       监听非特权端口、无需 root → 用专用低权限用户。
+       前置:operator 先建该用户(macOS:`sudo sysadminctl -addUser _cc-mysub -roleAccount`,
+       或 dscl),并把下面的 config-dir 与日志目录 chown 给它。
+       仅「直连公网 443」形态需特权:改用 root + `setcap cap_net_bind_service`(Linux)或保持
+       frp 形态,不要为绑 443 而让整个业务进程跑 root。 -->
+  <key>UserName</key><string>_cc-mysub</string>
+
+  <!-- LaunchDaemon 的最小环境不含 HOME,默认配置目录(XDG/HOME)不可解析;cc-mysub 仅在
+       --config-dir 缺省时才解析默认目录,显式钉死绝对路径即不依赖 HOME、可直接启动。
+       改成你的实际配置目录(须由上面的 UserName 可读;ca.key/upstream.json 须 0600 且属主为该用户)。 -->
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/bin/cc-mysub</string>
+    <string>--config-dir</string>
+    <string>/usr/local/etc/cc-mysub</string>
   </array>
+
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/cc-mysub.log</string>
-  <key>StandardErrorPath</key><string>/tmp/cc-mysub.err.log</string>
+
+  <!-- SuccessfulExit=false:仅在进程异常退出(非零)时由 launchd 拉起;正常/优雅退出(0)不被强行
+       重启,避免与 operator 的 `launchctl stop` 互搏。配置错误导致的无意义 crash-loop,其根因由上面
+       显式 --config-dir 消除(配置一旦能被找到,就不再因 LoadConfig 失败而退出);极端情况下 launchd 默认
+       ThrottleInterval(10s)兜底限制重启频率。 -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+
+  <!-- 日志不落世界可读、可被本地用户预占/符号链接劫持、且被 macOS 周期清理的 /tmp 固定路径。
+       访问日志含设备 label/路径/用量与基线告警(诊断面 + 安全观测面)。改写到专属受限目录:
+       前置 operator 建好 `/var/log/cc-mysub`、chmod 700、chown 给上面的 UserName
+       —— 目录 0700 即提供 0600 语义(他用户无法进入读取/篡改),不依赖 launchd 创建文件时的 umask。
+       长期运行建议配 newsyslog/logrotate 轮转。 -->
+  <key>StandardOutPath</key><string>/var/log/cc-mysub/cc-mysub.log</string>
+  <key>StandardErrorPath</key><string>/var/log/cc-mysub/cc-mysub.err.log</string>
 </dict>
 </plist>

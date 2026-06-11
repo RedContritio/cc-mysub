@@ -23,6 +23,12 @@ func TestBaselineInboundWarnings(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer x")
 			r.Header.Set("anthropic-beta", "oauth-2025-04-20")
 		}, nil},
+		// P3-3: 真匿名遥测/注册表请求按设计无 oauth beta 头,不应误报 missing_oauth_beta(否则噪声淹没真信号)。
+		{"anonymous no creds no beta", func(r *http.Request) {}, nil},
+		// 带凭据(x-api-key)却缺 oauth beta 才是异常:既报 creds_in_xapikey 也报 missing_oauth_beta。
+		{"x-api-key only missing beta", func(r *http.Request) {
+			r.Header.Set("X-Api-Key", "x")
+		}, []string{"creds_in_xapikey", "missing_oauth_beta"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

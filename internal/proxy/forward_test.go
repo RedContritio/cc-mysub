@@ -79,28 +79,31 @@ func newTestClientCert(t *testing.T, cn string) tls.Certificate {
 func TestRewrite_Conditional(t *testing.T) {
 	var gotAuth, gotXAPIKey []string
 	var mu sync.Mutex
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		mu.Lock()
 		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
 		gotXAPIKey = append(gotXAPIKey, r.Header.Get("X-Api-Key"))
 		mu.Unlock()
-		w.WriteHeader(200)
-	}))
-	defer up.Close()
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-	h := newRewriteHandler(cfgUp, nil)
-	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	h := newRewriteHandler(cfgUp, rt)
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('8'), Upstream: "b"}
+	// connectHost 注入(生产由 handle BaseContext 注入);出站绑定它,与内层请求 Host 无关。
+	withCtx := func(r *http.Request) *http.Request {
+		ctx := context.WithValue(r.Context(), deviceKey, dev)
+		ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+		return r.WithContext(ctx)
+	}
 
 	// (1) 有入站凭据 + ctx 设备(upstream b) → 换成该设备的 setup-token (b→REAL-B); X-Api-Key 须被删
-	r1 := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
+	r1 := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
 	r1.Header.Set("Authorization", "Bearer placeholder")
 	r1.Header.Set("X-Api-Key", "should-be-stripped")
-	r1 = r1.WithContext(context.WithValue(r1.Context(), deviceKey, dev))
-	h.ServeHTTP(httptest.NewRecorder(), r1)
+	h.ServeHTTP(httptest.NewRecorder(), withCtx(r1))
 	// (2) 无任何入站凭据 (真匿名遥测) → 透传不注入、不碰任何头
-	r2 := httptest.NewRequest("POST", up.URL+"/api/event_logging/v2/batch", nil)
-	r2 = r2.WithContext(context.WithValue(r2.Context(), deviceKey, dev))
-	h.ServeHTTP(httptest.NewRecorder(), r2)
+	r2 := httptest.NewRequest("POST", "https://api.anthropic.com/api/event_logging/v2/batch", nil)
+	h.ServeHTTP(httptest.NewRecorder(), withCtx(r2))
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -122,6 +125,36 @@ func TestRewrite_Conditional(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestForwardSwap_BindsOutboundToConnectHost(P0 回归,codex 全仓审查):出站目标必须绑定到
+// handle() 验证过的 CONNECT host(经 connectHostKey 注入),绝不信内层请求的 Host/URL.Host——
+// 否则不可信但已登记的设备发 Host: attacker(或 absolute-form URL)就能把换上的真 token 导向任意域名。
+func TestForwardSwap_BindsOutboundToConnectHost(t *testing.T) {
+	var gotHost, gotAuth string
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotHost = req.URL.Host
+		gotAuth = req.Header.Get("Authorization")
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: make(http.Header), Request: req}, nil
+	})
+	h := forwardSwap(rt)
+	// 不可信设备的内层请求:absolute-form URL + Host 头都指向 attacker,且带真 token(conditionalAuth
+	// 已注入 realToken)。connectHostKey=api.anthropic.com 是 handle() 验过的 MITM CONNECT host。
+	req := httptest.NewRequest("POST", "https://attacker.example/leak", nil)
+	req.Host = "attacker.example"
+	ctx := context.WithValue(req.Context(), realTokenKey, "REAL-SECRET")
+	ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+	h.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+	if gotHost != "api.anthropic.com" {
+		t.Errorf("SECURITY: 出站 host=%q, 应绑定 CONNECT host api.anthropic.com(不得信内层请求)", gotHost)
+	}
+	if gotAuth != "Bearer REAL-SECRET" {
+		t.Errorf("auth=%q want Bearer REAL-SECRET", gotAuth)
+	}
+}
+
 func TestRewrite_HitButUpstreamMissing(t *testing.T) {
 	// ctx 设备命中，但其 upstream id 不在池 → PickToken 返回 "" → 502，不转发
 	var hits int
@@ -129,7 +162,7 @@ func TestRewrite_HitButUpstreamMissing(t *testing.T) {
 	defer up.Close()
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	h := newRewriteHandler(cfgUp, nil)
-	dev := auth.Device{Label: "laptop", Upstream: "zzz"} // 指向不存在的 id
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('9'), Upstream: "zzz"} // 指向不存在的 id
 	r := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
 	r.Header.Set("Authorization", "Bearer placeholder")
 	r = r.WithContext(context.WithValue(r.Context(), deviceKey, dev))
@@ -176,7 +209,7 @@ func genCA(t *testing.T) (certPEM, keyPEM []byte) {
 // newMTLSProxy 装配一个 ForwardProxy：外层 TLS 身份用 ocWriteSelfSigned 产的自签证书经
 // NewOuterCertLoader 加载；内层 MITM 用 genCA 产的 CA → minter；store 由 fpToUpstream（客户端
 // 证书指纹 → upstream id）构造。返回 proxy + 内层 CA 池（client 验内层 api.anthropic.com 叶证书用）。
-func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Upstream, upstream http.RoundTripper, allow []string, maxInFlight int) (*ForwardProxy, *x509.CertPool) {
+func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Upstream, upstream http.RoundTripper, maxInFlight int) (*ForwardProxy, *x509.CertPool) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -187,7 +220,7 @@ func newMTLSProxy(t *testing.T, fpToUpstream map[string]string, cfgUp *config.Up
 	store := newTestStore(t, fpToUpstream)
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(minter, store, cfgUp, upstream, allow, NewOuterCertLoader(cp, kp), maxInFlight)
+	fp := NewForwardProxy(minter, store, cfgUp, upstream, NewOuterCertLoader(cp, kp), maxInFlight)
 	caPool := x509.NewCertPool()
 	caPool.AddCert(ca.Cert)
 	return fp, caPool
@@ -240,6 +273,56 @@ func connect200(t *testing.T, outer net.Conn, host string) *bufio.Reader {
 	return br
 }
 
+// TestRevokeConns 验证 P1-2:RevokeConns 关闭目标 fingerprint 的所有既有连接,不碰其它 fingerprint。
+func TestRevokeConns(t *testing.T) {
+	fp := &ForwardProxy{conns: make(map[string]map[net.Conn]struct{})}
+	a1, a1p := net.Pipe()
+	a2, a2p := net.Pipe()
+	b1, b1p := net.Pipe()
+	defer func() { a1p.Close(); a2p.Close(); b1p.Close() }()
+	fp.registerConn("fpA", a1)
+	fp.registerConn("fpA", a2)
+	fp.registerConn("fpB", b1)
+
+	fp.RevokeConns([]string{"fpA"})
+
+	// fpA 的 a1/a2 被关:对已关 net.Pipe 端 Write 应失败
+	for i, c := range []net.Conn{a1, a2} {
+		_ = c.SetDeadline(time.Now().Add(time.Second))
+		if _, err := c.Write([]byte("x")); err == nil {
+			t.Errorf("revoked conn %d still writable", i)
+		}
+	}
+	// fpB 的 b1 不受影响:仍可写(peer 读走)
+	go func() { buf := make([]byte, 1); _, _ = b1p.Read(buf) }()
+	_ = b1.SetDeadline(time.Now().Add(time.Second))
+	if _, err := b1.Write([]byte("y")); err != nil {
+		t.Errorf("non-target conn closed: %v", err)
+	}
+}
+
+// TestForwardProxy_RevokeClosesActiveConn 端到端验证 P1-2:已建立的外层连接被 handle 注册后,
+// RevokeConns 关它 → 客户端侧读到连接断开(吊销即时生效,不必等连接自然结束)。
+func TestForwardProxy_RevokeClosesActiveConn(t *testing.T) {
+	clientCert := newTestClientCert(t, "device-leaf")
+	cfp := auth.CertFingerprint(clientCert.Certificate[0])
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	br := connect200(t, outer, "api.anthropic.com") // 握手+CONNECT 完成 → handle 已 registerConn(cfp)
+
+	fp.RevokeConns([]string{cfp}) // 主动吊销该指纹的既有连接
+
+	// 客户端侧:连接被服务端关 → 读到 EOF/error(而非阻塞到超时)
+	_ = outer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := br.Read(make([]byte, 1)); err == nil {
+		t.Error("revoked active connection still readable (server did not close it)")
+	}
+}
+
 func TestForwardProxy_EndToEnd(t *testing.T) {
 	// 1) 假真上游 (TLS)，记录每个请求的 Authorization
 	var gotAuth []string
@@ -264,7 +347,7 @@ func TestForwardProxy_EndToEnd(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com", "console.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, 8)
 	addr := serveProxy(t, fp)
 
 	// helper-style client: 外层 mTLS 到 cc-mysub(出示已登记 client cert) → CONNECT(无 Proxy-Auth) → 200 → 内层 TLS
@@ -312,7 +395,7 @@ func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -322,6 +405,112 @@ func TestForwardProxy_AllowlistRejectsNonAnthropic(t *testing.T) {
 	status, _ := bufio.NewReader(outer).ReadString('\n')
 	if !strings.Contains(status, "403") {
 		t.Errorf("non-allowlisted host must get 403 (policy reject), got %q", status)
+	}
+}
+
+// TestForwardProxy_PassthroughTunnelsWithoutMITM：透传类 host → cc-mysub 盲隧道转发到真上游，
+// device 与真上游端到端做 TLS（cc-mysub 不解密、绝不现签叶证书）。证明：① 字节端到端通到上游；
+// ② 透传 host 不触发 CertFor（不 MITM）。
+func TestForwardProxy_PassthroughTunnelsWithoutMITM(t *testing.T) {
+	const passHost = "api.datadoghq.com" // 透传类（精确 passthrough host，hosts.Classify→Passthrough）
+
+	// 假上游（真 TLS 服务端）：device 经盲隧道与它端到端做 TLS；记录收到请求数证明字节通。
+	var hits int
+	var mu sync.Mutex
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	// spy minter 断言透传 host 绝不现签叶证书；allow 空、passthrough=[passHost]。
+	fp, spy, clientCert := newSpyProxy(t)
+	// 注入 passDial：把透传上游重定向到假上游（替代真 DNS）。
+	fp.passDial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upstreamAddr)
+	}
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	br := connect200(t, outer, passHost) // 透传路径：先拨上游成功才回 200
+	if n := br.Buffered(); n != 0 {
+		t.Fatalf("unexpected %d buffered bytes after CONNECT 200", n)
+	}
+	// device 在盲隧道内与假上游端到端做 TLS（InsecureSkipVerify 跳过自签校验；cc-mysub 不参与）。
+	inner := tls.Client(outer, &tls.Config{InsecureSkipVerify: true, ServerName: passHost})
+	req, _ := http.NewRequest("POST", "https://"+passHost+"/api/v2/logs", nil)
+	if err := req.Write(inner); err != nil {
+		t.Fatalf("inner write through tunnel: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(inner), req)
+	if err != nil {
+		t.Fatalf("inner read through tunnel: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("tunnel upstream status=%d want 204", resp.StatusCode)
+	}
+	mu.Lock()
+	got := hits
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("upstream hits=%d want 1 (blind tunnel must deliver bytes end-to-end)", got)
+	}
+	if spy.called(passHost) {
+		t.Errorf("SECURITY: minted leaf for passthrough host %q (must NOT MITM/decrypt)", passHost)
+	}
+}
+
+// TestForwardProxy_PassthroughDialFailureIs502：透传上游拨号失败 → 502（CONNECT 尚未回 200，
+// 故可如实回错），且不现签叶证书。
+func TestForwardProxy_PassthroughDialFailureIs502(t *testing.T) {
+	const passHost = "api.datadoghq.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, io.EOF // 模拟拨号失败
+	}
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	outer.Write([]byte("CONNECT " + passHost + ":443 HTTP/1.1\r\nHost: " + passHost + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "502") {
+		t.Errorf("passthrough dial failure must be 502, got %q", status)
+	}
+	if strings.Contains(status, "200") {
+		t.Errorf("must not 200 when upstream dial fails: %q", status)
+	}
+	if spy.called(passHost) {
+		t.Errorf("minted leaf on dial-failure path (must NOT)")
+	}
+}
+
+// TestForwardProxy_PassthroughNon443Rejected：透传只放行 :443。非 443 端口 → 403(在拨号前拒),
+// 不现签叶证书。passDial 设为返回 io.EOF：若端口校验误放行,tunnel 会拨号并回 502——故拿到 403
+// (而非 502)即证明在拨号前就被端口校验拒掉,堵住「借盲隧道把出口当任意端口 port-forward」。
+func TestForwardProxy_PassthroughNon443Rejected(t *testing.T) {
+	const passHost = "api.datadoghq.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	fp.passDial = func(ctx context.Context, network, addr string) (net.Conn, error) { return nil, io.EOF }
+	addr := serveProxy(t, fp)
+
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	outer.Write([]byte("CONNECT " + passHost + ":8080 HTTP/1.1\r\nHost: " + passHost + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "403") {
+		t.Errorf("非 443 透传须 403(拨号前拒), got %q", status)
+	}
+	if strings.Contains(status, "502") {
+		t.Errorf("不应进到拨号(502 说明端口校验漏放行): %q", status)
+	}
+	if spy.called(passHost) {
+		t.Error("非 443 透传被拒路径不应现签叶证书")
 	}
 }
 
@@ -353,7 +542,7 @@ func TestForwardProxy_NoClientCertHandshakeFails(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	assertOuterRejected(t, addr, &tls.Config{InsecureSkipVerify: true})
@@ -365,7 +554,7 @@ func TestForwardProxy_UnregisteredClientCertHandshakeFails(t *testing.T) {
 	registered := newTestClientCert(t, "device-leaf")
 	rfp := auth.CertFingerprint(registered.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
-	fp, _ := newMTLSProxy(t, map[string]string{rfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 8)
+	fp, _ := newMTLSProxy(t, map[string]string{rfp: "b"}, cfgUp, nil, 8)
 	addr := serveProxy(t, fp)
 
 	stranger := newTestClientCert(t, "stranger") // 指纹不在 store
@@ -374,6 +563,70 @@ func TestForwardProxy_UnregisteredClientCertHandshakeFails(t *testing.T) {
 
 // TestPrefixConn_ReplaysPrefixThenConn 确定性验证 prefixConn 先回放 prefix 再读底层 conn，
 // 字节顺序无丢失/错位（handle 流水线分支的握手关键路径，整跳难以确定性触发故单测此逻辑）。
+// TestRelayBlind_IdleTimeout 验证 P2-6:双向静默超过 idle → relayBlind 断开返回(回收 sema 槽)。
+func TestRelayBlind_IdleTimeout(t *testing.T) {
+	outerA, outerB := net.Pipe()
+	upA, upB := net.Pipe()
+	defer func() { outerB.Close(); upB.Close() }()
+	done := make(chan struct{})
+	go func() {
+		relayBlind(outerA, outerA, upA, 150*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done: // idle 超时断开
+	case <-time.After(3 * time.Second):
+		t.Fatal("relayBlind did not idle-timeout on silent connection")
+	}
+}
+
+// TestRelayBlind_UnidirectionalKeepsAlive 验证 P2-6 的 correctness:单向流量(如下载,只 up→outer)
+// 不应误触发 idle 断开——任一方向有字节就刷新双向 deadline。idle=1s 宽松以抗 -race 时序抖动。
+func TestRelayBlind_UnidirectionalKeepsAlive(t *testing.T) {
+	outerA, outerB := net.Pipe()
+	upA, upB := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		relayBlind(outerA, outerA, upA, time.Second)
+		close(done)
+	}()
+	stop := make(chan struct{})
+	go func() { // up→outer 持续发(模拟下载)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = upB.SetWriteDeadline(time.Now().Add(2 * time.Second))
+				if _, err := upB.Write([]byte("data")); err != nil {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}()
+	go func() { // outerB 读走,否则 relay 写 outerA 阻塞
+		buf := make([]byte, 64)
+		for {
+			_ = outerB.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := outerB.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+		close(stop)
+		outerB.Close()
+		upB.Close()
+		t.Error("relayBlind idle-timed out despite unidirectional traffic")
+	case <-time.After(600 * time.Millisecond): // < idle 1s,单向流量应保活
+		close(stop)
+		outerB.Close()
+		upB.Close()
+	}
+}
+
 func TestPrefixConn_ReplaysPrefixThenConn(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -425,7 +678,7 @@ func (s *spyMinter) called(host string) bool {
 // newSpyProxy builds a running-ready ForwardProxy whose minter is a spy, plus the spy
 // and a registered client cert for outer-mTLS dialing. inner RoundTripper is nil (no
 // inner request is expected on the 400/403 paths). allow lists the MITM hosts.
-func newSpyProxy(t *testing.T, allow []string) (*ForwardProxy, *spyMinter, tls.Certificate) {
+func newSpyProxy(t *testing.T) (*ForwardProxy, *spyMinter, tls.Certificate) {
 	t.Helper()
 	caPEM, keyPEM := genCA(t)
 	ca, err := mitm.LoadCA(caPEM, keyPEM)
@@ -439,14 +692,14 @@ func newSpyProxy(t *testing.T, allow []string) (*ForwardProxy, *spyMinter, tls.C
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	dir := t.TempDir()
 	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
-	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, allow, NewOuterCertLoader(cp, kp), 8)
+	fp := NewForwardProxy(spy.inner, store, cfgUp, nil, NewOuterCertLoader(cp, kp), 8)
 	fp.minter = spy // 覆写为 spy(both satisfy certMinter)
 	return fp, spy, clientCert
 }
 
 func TestForwardProxy_OversizedConnectHeaderIs400(t *testing.T) {
 	const host = "api.anthropic.com"
-	fp, spy, clientCert := newSpyProxy(t, []string{host})
+	fp, spy, clientCert := newSpyProxy(t)
 	addr := serveProxy(t, fp)
 	outer := outerDial(t, addr, clientCert)
 	defer outer.Close()
@@ -500,7 +753,7 @@ func TestForwardProxy_InnerSwapNoProxyAuthBodyIntact(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -540,7 +793,7 @@ func TestForwardProxy_ShedsWhenSaturated(t *testing.T) {
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	// maxInFlight=1: the proxy can hold exactly one in-flight handle.
-	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, []string{"api.anthropic.com"}, 1)
+	fp, _ := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, nil, 1)
 	addr := serveProxy(t, fp)
 
 	// Client A: complete outer mTLS + CONNECT, then PARK (never send inner
@@ -572,7 +825,7 @@ func TestForwardProxy_AnonInnerPassesThrough(t *testing.T) {
 	clientCert := newTestClientCert(t, "device-leaf")
 	cfp := auth.CertFingerprint(clientCert.Certificate[0])
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "sk-ant-oat01-REAL"}}}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, spy, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -627,7 +880,7 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 		},
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
-	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, []string{"api.anthropic.com"}, 8)
+	fp, caPool := newMTLSProxy(t, map[string]string{cfp: "b"}, cfgUp, upstreamTransport, 8)
 	addr := serveProxy(t, fp)
 
 	outer := outerDial(t, addr, clientCert)
@@ -654,5 +907,234 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 	defer mu.Unlock()
 	if gotAuth != "Bearer REAL-B" {
 		t.Errorf("app-token swap: upstream Authorization=%q want Bearer REAL-B", gotAuth)
+	}
+}
+
+// TestConditionalAuth_NoDeviceFailsClosed 验证 P2-38:fail-closed 安全契约——入站有凭据但 ctx 无设备
+// (或设备缺规范指纹) → 502 no_device,绝不 fall-through 到 up.PickToken("")=默认真 token,且上游零命中。
+// 哨兵=CanonicalFingerprint(身份字段),与下游 RateLimitByDevice 同维度:label 是展示别名非身份,
+// 合法指纹 + 空 label 的设备必须放行,不得误诊为 no_device(终审反馈)。
+func TestConditionalAuth_NoDeviceFailsClosed(t *testing.T) {
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "sk-ant-oat01-REAL"}}}
+	var upHits int
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { upHits++; w.WriteHeader(200) })
+	h := conditionalAuth(cfgUp)(next)
+
+	check := func(name string, withCtx func(*http.Request) *http.Request) {
+		r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+		r.Header.Set("Authorization", "Bearer placeholder")
+		if withCtx != nil {
+			r = withCtx(r)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadGateway {
+			t.Errorf("%s: got %d want 502", name, w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "no_device") {
+			t.Errorf("%s: body=%q want no_device", name, w.Body.String())
+		}
+	}
+	check("no device in ctx", nil)
+	check("missing fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop"}))
+	})
+	check("non-canonical fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: "ABC123"}))
+	})
+	check("uppercase 64-hex fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: strings.ToUpper(fpHex('a'))}))
+	})
+	if upHits != 0 {
+		t.Errorf("SECURITY: upstream must never be reached on no_device (default-token leak), hits=%d", upHits)
+	}
+	// 合法指纹 + 空 label:身份在场(store.reload 不要求 label 非空),必须放行——
+	// label 维度哨兵会在此误诊 502(身份在场,缺的只是别名)。
+	r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	r.Header.Set("Authorization", "Bearer placeholder")
+	r = r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "", CertSHA256: fpHex('7')}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 || upHits != 1 {
+		t.Errorf("valid-fingerprint empty-label device must pass conditionalAuth: code=%d upHits=%d", w.Code, upHits)
+	}
+}
+
+// TestNewForwardProxy_PanicsOnBadArgs 验证 P3-39:两条以 panic 强制的输入契约。
+func TestNewForwardProxy_PanicsOnBadArgs(t *testing.T) {
+	caPEM, keyPEM := genCA(t)
+	ca, err := mitm.LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minter := mitm.NewMinter(ca, time.Hour)
+	store := newTestStore(t, map[string]string{})
+	cfgUp := &config.Upstream{}
+	dir := t.TempDir()
+	cp, kp := ocWriteSelfSigned(t, dir, "cc.example")
+	oc := NewOuterCertLoader(cp, kp)
+
+	mustPanic := func(name string, fn func()) {
+		defer func() {
+			if recover() == nil {
+				t.Errorf("%s: expected panic, got none", name)
+			}
+		}()
+		fn()
+	}
+	mustPanic("maxInFlight==0", func() { NewForwardProxy(minter, store, cfgUp, nil, oc, 0) })
+	mustPanic("maxInFlight<0", func() { NewForwardProxy(minter, store, cfgUp, nil, oc, -1) })
+	mustPanic("outerCert==nil", func() { NewForwardProxy(minter, store, cfgUp, nil, nil, 8) })
+}
+
+// TestForwardProxy_OversizedConnectFirstLineIs400 验证 P3-40:pre-200 首行本身超长(CONNECT 行 padding
+// 撑过 maxConnectHeaderBytes,仍带 \r\n 终止)→ 400,不现签叶证书(此前只覆盖了头行分支)。
+func TestForwardProxy_OversizedConnectFirstLineIs400(t *testing.T) {
+	const host = "api.anthropic.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	big := strings.Repeat("a", maxConnectHeaderBytes+100)
+	_, _ = outer.Write([]byte("CONNECT " + big + ":443 HTTP/1.1\r\n\r\n"))
+	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	all, _ := io.ReadAll(outer)
+	if !strings.Contains(string(all), "400") {
+		t.Errorf("oversized first CONNECT line must be 400, got %q", all)
+	}
+	if strings.Contains(string(all), "200 Connection Established") {
+		t.Errorf("SECURITY: 200 on oversized first line: %q", all)
+	}
+	if spy.called(host) {
+		t.Errorf("minted leaf despite oversized first line")
+	}
+}
+
+// TestForwardProxy_NewlinelessFloodIs400 验证 P2-0:无 '\n' 终止符的超长流——ReadSlice 缓冲(=maxConnectHeaderBytes)
+// 填满即 ErrBufferFull → 400,内存硬钉在缓冲大小(此前 ReadString 会无界累积整行才检查,8KB 上限对此路径不生效)。
+func TestForwardProxy_NewlinelessFloodIs400(t *testing.T) {
+	const host = "api.anthropic.com"
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	// "CONNECT " 起头后持续灌字节、永不发 '\n'。
+	flood := []byte("CONNECT " + strings.Repeat("a", maxConnectHeaderBytes+4096))
+	_ = outer.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_, _ = outer.Write(flood)
+	_ = outer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	all, _ := io.ReadAll(outer)
+	if !strings.Contains(string(all), "400") {
+		t.Errorf("newline-less oversized flood must be 400, got %q", all)
+	}
+	if strings.Contains(string(all), "200") {
+		t.Errorf("must not 200 on flood: %q", all)
+	}
+	if spy.called(host) {
+		t.Errorf("minted leaf despite newline-less flood")
+	}
+}
+
+// TestForwardProxy_MITMNon443Rejected 验证 P3-47:MITM 类 host 的 CONNECT 端口非 443 → 与透传对称地
+// 显式 403(不静默当 443 处理),且在现签叶证书前就拒。
+func TestForwardProxy_MITMNon443Rejected(t *testing.T) {
+	const host = "api.anthropic.com" // MITM 类
+	fp, spy, clientCert := newSpyProxy(t)
+	addr := serveProxy(t, fp)
+	outer := outerDial(t, addr, clientCert)
+	defer outer.Close()
+	_, _ = outer.Write([]byte("CONNECT " + host + ":8080 HTTP/1.1\r\nHost: " + host + "\r\n\r\n"))
+	status, _ := bufio.NewReader(outer).ReadString('\n')
+	if !strings.Contains(status, "403") {
+		t.Errorf("MITM host on non-443 must be 403, got %q", status)
+	}
+	if strings.Contains(status, "200") {
+		t.Errorf("must not 200 on non-443 MITM CONNECT: %q", status)
+	}
+	if spy.called(host) {
+		t.Errorf("contract: minted leaf for non-443 MITM CONNECT (must reject before mint)")
+	}
+}
+
+// TestRewrite_XApiKeyOnlyStripped 验证 P3-48:仅 X-Api-Key 入站(HasInboundCredential 算凭据)→ 走带凭据分支,
+// 上游不见 X-Api-Key、Authorization 换成真 token(钉住「带凭据分支删 X-Api-Key」不变量)。
+func TestRewrite_XApiKeyOnlyStripped(t *testing.T) {
+	var gotAuth, gotXAPIKey string
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotAuth = r.Header.Get("Authorization")
+		gotXAPIKey = r.Header.Get("X-Api-Key")
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	h := newRewriteHandler(cfgUp, rt)
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('0'), Upstream: "b"}
+	r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	r.Header.Set("X-Api-Key", "should-be-stripped") // 无 Authorization,仅 x-api-key
+	ctx := context.WithValue(r.Context(), deviceKey, dev)
+	ctx = context.WithValue(ctx, connectHostKey, "api.anthropic.com")
+	h.ServeHTTP(httptest.NewRecorder(), r.WithContext(ctx))
+	if gotXAPIKey != "" {
+		t.Errorf("X-Api-Key not stripped on x-api-key-only inbound: got %q", gotXAPIKey)
+	}
+	if gotAuth != "Bearer REAL-B" {
+		t.Errorf("Authorization not swapped: got %q want Bearer REAL-B", gotAuth)
+	}
+}
+
+// TestAccessLog_RecordsShortCircuitRejections 验证 P2-2:AccessLog 在最外层(生产链序),使 RateLimit 的 429 与
+// conditionalAuth 的 502(no_upstream_token / no_device)短路拒绝也产生 AccessRecord——被拒流量不再对日志失明。
+func TestAccessLog_RecordsShortCircuitRejections(t *testing.T) {
+	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header), Request: r}, nil
+	})
+	var recs []AccessRecord
+	sink := func(rec AccessRecord) { recs = append(recs, rec) }
+	// 与 NewForwardProxy 同序:AccessLog 最外层。
+	chain := AccessLog(sink)(conditionalAuth(cfgUp)(RateLimitByDevice(1)(forwardSwap(rt))))
+
+	mk := func(dev auth.Device, injectDev bool) int {
+		r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", strings.NewReader("{}"))
+		r.Header.Set("Authorization", "Bearer placeholder")
+		ctx := context.WithValue(r.Context(), connectHostKey, "api.anthropic.com")
+		if injectDev {
+			ctx = context.WithValue(ctx, deviceKey, dev)
+		}
+		w := httptest.NewRecorder()
+		chain.ServeHTTP(w, r.WithContext(ctx))
+		return w.Code
+	}
+
+	devOK := auth.Device{Label: "laptop", Upstream: "b", CertSHA256: fpHex('6'), RateLimit: 1}
+	if code := mk(devOK, true); code != 200 {
+		t.Fatalf("first request got %d want 200", code)
+	}
+	if code := mk(devOK, true); code != http.StatusTooManyRequests {
+		t.Fatalf("second request got %d want 429", code)
+	}
+	if code := mk(auth.Device{Label: "x", Upstream: "zzz"}, true); code != http.StatusBadGateway {
+		t.Fatalf("missing upstream got %d want 502", code)
+	}
+	if code := mk(auth.Device{}, false); code != http.StatusBadGateway {
+		t.Fatalf("no_device got %d want 502", code)
+	}
+
+	if len(recs) != 4 {
+		t.Fatalf("AccessLog must record all 4 requests incl. rejections, got %d", len(recs))
+	}
+	var got429, got502 int
+	for _, r := range recs {
+		switch r.Status {
+		case http.StatusTooManyRequests:
+			got429++
+		case http.StatusBadGateway:
+			got502++
+		}
+	}
+	if got429 != 1 {
+		t.Errorf("429 rejection not logged (count=%d)", got429)
+	}
+	if got502 != 2 {
+		t.Errorf("502 rejections not logged (count=%d want 2)", got502)
 	}
 }

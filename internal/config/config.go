@@ -4,7 +4,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
+
+// DefaultDir 解析默认配置目录：优先 XDG_CONFIG_HOME，否则用户主目录下 .config/cc-mysub。
+// HOME/用户主目录不可解析时返回 error——绝不静默回退到文件系统根下的 /.config/cc-mysub。
+// LaunchDaemon 最小环境不含 HOME；调用方仅在 --config-dir 缺省时才调用，显式目录绝不经过这里
+// （否则 plist 钉死的 --config-dir 会被默认解析的 fail-fast 抢跑，Backlog P1）。
+func DefaultDir() (string, error) {
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "cc-mysub"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("无法确定配置目录: %w; 请设置 XDG_CONFIG_HOME 或显式传 --config-dir", err)
+	}
+	return filepath.Join(home, ".config", "cc-mysub"), nil
+}
 
 // ClientConfig holds the deployment-facing constants used to generate a
 // per-device `myclaude` wrapper (see `cc-mysub add-device`). They are fixed for
@@ -91,7 +107,30 @@ func LoadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
+// OwnerOnly 校验已取得的 FileInfo 无 group/other 权限位；path 仅用于错误文本。
+// 与 RequireOwnerOnly 同语义，供热路径复用自己已做的 stat（避免二次 stat）。
+func OwnerOnly(fi os.FileInfo, path string) error {
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("%s perm %#o too open (group/other-accessible); chmod 600", path, perm)
+	}
+	return nil
+}
+
+// RequireOwnerOnly 校验 path 仅属主可访问(mode 无 group/other 位)。敏感凭据(setup-token 池 /
+// MITM CA 私钥)若 group/other-accessible,同机其他用户或误同步会读到真 token / CA 私钥 →
+// fail-closed 拒绝启动(治理总纲:错误可见)。README 要求 upstream.json/ca.key chmod 600。
+func RequireOwnerOnly(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	return OwnerOnly(fi, path)
+}
+
 func LoadUpstream(path string) (*Upstream, error) {
+	if err := RequireOwnerOnly(path); err != nil {
+		return nil, fmt.Errorf("upstream perm: %w", err)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read upstream: %w", err)

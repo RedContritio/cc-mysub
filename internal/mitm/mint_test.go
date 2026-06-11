@@ -66,6 +66,39 @@ func TestMinter_RemintAfterExpiry(t *testing.T) {
 	}
 }
 
+// TestMinter_ClockSkewMargin 钉住叶证书两端的时钟偏差裕量下限：NotBefore 至少回溯、
+// NotAfter 至少在 (mint+ttl) 之外预留同等裕量，覆盖设备分钟级时钟漂移而不在缓存窗口内握手失败。
+// 下限取 10 分钟，远大于原先 1 分钟的脆弱余量，回归防止裕量被悄悄收窄回去。
+func TestMinter_ClockSkewMargin(t *testing.T) {
+	const wantMin = 10 * time.Minute
+	caPEM, keyPEM := genTestCA(t)
+	ca, err := LoadCA(caPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ttl = time.Hour
+	m := NewMinter(ca, ttl)
+
+	before := time.Now()
+	c, err := m.CertFor("skew.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	leaf := c.Leaf
+
+	// NotBefore 必须早于「现签时刻」至少 wantMin。用 after 作现签时刻的上界，
+	// NotBefore <= after - wantMin 即保证回溯裕量 >= wantMin。
+	if !leaf.NotBefore.Before(after.Add(-wantMin)) {
+		t.Errorf("NotBefore=%v, want <= %v (backdate >= %v)", leaf.NotBefore, after.Add(-wantMin), wantMin)
+	}
+	// NotAfter 必须晚于 (现签时刻 + ttl) 至少 wantMin。用 before 作现签时刻的下界，
+	// NotAfter >= before + ttl + wantMin 即保证尾端裕量 >= wantMin。
+	if !leaf.NotAfter.After(before.Add(ttl + wantMin)) {
+		t.Errorf("NotAfter=%v, want >= %v (tail margin >= %v beyond ttl)", leaf.NotAfter, before.Add(ttl+wantMin), wantMin)
+	}
+}
+
 // TestMinter_ConcurrentSafe 验证并发调用 CertFor 无数据竞争，
 // 且多 goroutine 获取到的是同一个缓存指针。
 func TestMinter_ConcurrentSafe(t *testing.T) {

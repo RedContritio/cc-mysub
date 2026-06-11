@@ -63,3 +63,53 @@ func TestEnsureCAIdempotent(t *testing.T) {
 		t.Error("ca.key was regenerated on second call (must be idempotent)")
 	}
 }
+
+// TestEnsureCARejectsOrphanKey 契约(P2,finding 12):ca.key 在场而 ca.crt 缺失(误删)时,绝不自动
+// 重生(会截断覆盖既存私钥、不可逆作废所有设备);报错并保留原私钥字节不变。
+func TestEnsureCARejectsOrphanKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ca.key")
+	orig := []byte("-----BEGIN EC PRIVATE KEY-----\nb3JpZ2luYWw=\n-----END EC PRIVATE KEY-----\n")
+	if err := os.WriteFile(keyPath, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCA(dir, "cc-mysub CA"); err == nil {
+		t.Fatal("expected error when ca.key present but ca.crt missing (must not auto-regenerate)")
+	}
+	if got := mustRead(t, keyPath); string(got) != string(orig) {
+		t.Error("orphan ca.key must not be overwritten by EnsureCA")
+	}
+}
+
+// TestEnsureCARejectsOrphanCrt 契约(finding 12):ca.crt 在场而 ca.key 缺失时报错,不静默接受
+// 半存在状态(否则错误推迟到服务端重启或设备内层握手才以含糊错误暴露)。
+func TestEnsureCARejectsOrphanCrt(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), []byte("whatever"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCA(dir, "cc-mysub CA"); err == nil {
+		t.Fatal("expected error when ca.crt present but ca.key missing")
+	}
+}
+
+// TestEnsureCARejectsCorruptCrt 契约(finding 12):两文件都在但 ca.crt 不可解析/不配对时,幂等闸经
+// mitm.LoadCA 验证失败即 fail-fast 报错,不静默返回成功;ca.key 不被触碰。
+func TestEnsureCARejectsCorruptCrt(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := EnsureCA(dir, "cc-mysub CA"); err != nil {
+		t.Fatalf("EnsureCA bootstrap: %v", err)
+	}
+	keyPath := filepath.Join(dir, "ca.key")
+	keyBefore := mustRead(t, keyPath)
+	// 损坏 ca.crt(非法 PEM),保留 ca.key。
+	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), []byte("not a certificate"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureCA(dir, "cc-mysub CA"); err == nil {
+		t.Fatal("expected error when ca.crt is corrupt / not a valid CA")
+	}
+	if got := mustRead(t, keyPath); string(got) != string(keyBefore) {
+		t.Error("EnsureCA must not touch ca.key when rejecting a corrupt ca.crt")
+	}
+}

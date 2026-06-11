@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, dev]   # dev = 日常工作分支(id 54): push 即跑 race 测试,不等到开 PR 才一次性暴露
   pull_request:
 jobs:
   test:
@@ -10,6 +10,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.22.12'   # 与 release.yml 精确对齐(id 55): CI 验证的工具链 = 发布构建的工具链,不浮动
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { echo "::error::gofmt drift — run gofmt -w on:"; gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test ./... -race -count=1
+  install-e2e:
+    # install.sh 自助入网端到端契约守卫(id 52): ci/install/run.sh 此前不挂任何 workflow = 死守卫,
+    # SHA256SUMS 格式 / 探针三态 / device-init 输出格式 / 全链换 token 任一破坏 CI 都不显形。脚本 hermetic
+    # (自建二进制 + release mock + 本地 mTLS,无外网真依赖),挂 PR/push 触发。独立 job,不阻塞 test 信号。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.12'
+      - name: install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssl ca-certificates curl python3
+      - name: run install.sh e2e (真 mTLS 轮询 + add-device 批准 + 全链换 token)
+        run: sudo -E "$(command -v bash)" ci/install/run.sh

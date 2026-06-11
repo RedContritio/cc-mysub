@@ -1,0 +1,22 @@
+# known-hosts.txt — 第三方收口域名基线(漂移守卫)
+#
+# egress-audit 的漂移守卫(ci/egress/hostscan)对 claude latest 静态扫描遥测/控制面域名候选,经
+# Monitored 排除自家域名(*.anthropic.com / *.claude.ai / *.claude.com / *.claudeusercontent.com /
+# *.ant.dev——经 internal/hosts.FirstPartySuffixes 后缀自动收口、零维护),只剩需人决策的第三方候选,
+# 再 diff 本文件。出现基线外的新第三方域名 → CI 报错,逼人分类:
+#   • 新遥测厂商 / 新 datadog region 等会带 IP 的 → 加进 hosts.PassthroughExact 收口 + 本文件
+#   • 第三方 MCP/SDK 死码、确认不发流量的 → 仅记进本文件,保持直连
+#
+# 故本基线只列「需精确登记的第三方域名」——自家域名不在此(靠后缀自适应收口,CC 新增自家端点不触发
+# 守卫)。定位见 ci/egress/hostscan/main.go、docs/SUBSCRIPTION-FORWARDING.md。
+# 基线对应版本:Claude Code 2.1.170。空行与 # 行被 diff 忽略;域名行不要加行内注释。
+
+# ── 第三方,已纳入 hosts.PassthroughExact 收口(经 cc-mysub 出口,对该第三方隐藏设备 IP) ──
+# CC 自发遥测:datadog 日志 intake(DD-API-KEY 非用户 token)
+http-intake.logs.us5.datadoghq.com
+# 二进制硬编码的第三方 MCP(连用户自己的第三方账号;档位 C 一并收口)
+api.datadoghq.com
+mcp.sentry.dev
+# Anthropic 的 FedRAMP/govcloud 部署(域名属第三方平台 fedstart.com,精确登记不后缀)
+claude.fedstart.com
+claude-staging.fedstart.com

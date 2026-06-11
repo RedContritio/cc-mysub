@@ -69,8 +69,8 @@ func clientLeaf(t *testing.T) tls.Certificate {
 }
 
 // newTrusting 构造 splitter 并白盒注入测试 CA pool（生产走系统信任验真 LE；测试用自签需注入）。
-func newTrusting(host string, clientCert tls.Certificate, caPool *x509.CertPool, allow []string, dial dialFunc) *Splitter {
-	sp := New(host, clientCert, allow, dial)
+func newTrusting(host string, clientCert tls.Certificate, caPool *x509.CertPool, extraAllow []string, dial dialFunc) *Splitter {
+	sp := New(host, clientCert, extraAllow, dial)
 	sp.tlsCfg.RootCAs = caPool
 	return sp
 }
@@ -182,7 +182,7 @@ func TestSplitter_RoutesAnthropicToUpstreamElseDirect(t *testing.T) {
 		dMu.Unlock()
 		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
 	}
-	sp := newTrusting(serverName, clientLeaf(t), caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting(serverName, clientLeaf(t), caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestSplitter_AllowBranchPresentsClientCertNoProxyAuth(t *testing.T) {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
 	}
-	sp := newTrusting(serverName, myCert, caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting(serverName, myCert, caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +333,7 @@ func TestSplitter_DirectBranchHasNoProxyAuth(t *testing.T) {
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
 	}
-	sp := newTrusting("cc.example", clientLeaf(t), caPool, []string{"api.anthropic.com"}, dial)
+	sp := newTrusting("cc.example", clientLeaf(t), caPool, nil, dial)
 	spLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -361,5 +361,244 @@ func TestSplitter_DirectBranchHasNoProxyAuth(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for direct-branch forwarded bytes")
+	}
+}
+
+// TestSplitter_ExtraAllowForceChains：--allow 把一个不在 hosts.Classify 收口集的 host
+// （rogue.example→Direct）强制 chain 到 cc-mysub（设备侧 override）。证明 extraAllow 生效——
+// 它走 chain 分支（拨 serverName:443）而非 direct 分支。cc-mysub 端是否放行是其 allowlist 的事
+// （非清单 host 仍 403，见 proxy 测试与 stage_split Probe D）。
+func TestSplitter_ExtraAllowForceChains(t *testing.T) {
+	const serverName = "cc.example"
+	cert, caPool := selfSigned(t, serverName)
+
+	var upHost string
+	gotCh := make(chan string, 1)
+	upLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		h, err := readConnectHost(c)
+		if err != nil {
+			return
+		}
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		gotCh <- h
+		buf := make([]byte, 256)
+		for {
+			if _, e := c.Read(buf); e != nil {
+				return
+			}
+		}
+	}()
+
+	directLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directLn.Close()
+
+	// dial 按 addr 分流：chain 分支拨 serverName:443→upLn；direct 分支拨 target→directLn。
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == net.JoinHostPort(serverName, "443") {
+			return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, directLn.Addr().String())
+	}
+	sp := newTrusting(serverName, clientLeaf(t), caPool, []string{"rogue.example"}, dial)
+	spLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spLn.Close()
+	go sp.Serve(spLn)
+
+	c, err := net.Dial("tcp", spLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("CONNECT rogue.example:443 HTTP/1.1\r\nHost: rogue.example:443\r\n\r\n"))
+	br := bufio.NewReader(c)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("client status %q", status)
+	}
+
+	select {
+	case upHost = <-gotCh:
+		if upHost != "rogue.example:443" {
+			t.Errorf("cc-mysub should see force-chained rogue.example:443, got %q", upHost)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout: --allow host was not chained to cc-mysub (extraAllow ignored?)")
+	}
+}
+
+// TestSplitter_DialTimeoutUnblocksBlackholeDial：黑洞拨号(honor ctx、永不连上)在 dialTimeout 后
+// 被超时解除,handle 回 502 而非永久挂死——覆盖 chain(拨 host:443)与 direct(拨 target)两个拨号点。
+// 无修复时 dial 用 context.Background() → `<-ctx.Done()` 永不返回 → 客户端读永久阻塞(测试超时失败)。
+func TestSplitter_DialTimeoutUnblocksBlackholeDial(t *testing.T) {
+	const serverName = "cc.example"
+	_, caPool := selfSigned(t, serverName)
+	// 黑洞拨号:遵守 ctx,直到 ctx 超时才返回(模拟 SYN 无响应的不可达目标)。
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	sp := newTrusting(serverName, clientLeaf(t), caPool, nil, dial)
+	sp.dialTimeout = 150 * time.Millisecond
+	spLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spLn.Close()
+	go sp.Serve(spLn)
+
+	for _, target := range []string{"api.anthropic.com:443" /*chain*/, "evil.example:443" /*direct*/} {
+		t.Run(target, func(t *testing.T) {
+			c, err := net.Dial("tcp", spLn.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.Write([]byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n"))
+			_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+			br := bufio.NewReader(c)
+			status, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatalf("client read after blackhole dial: %v (dial 未设超时,handle 永久挂死?)", err)
+			}
+			if !strings.Contains(status, "502") {
+				t.Errorf("黑洞拨号应回 502,得 %q", status)
+			}
+		})
+	}
+}
+
+// TestSplitter_ChainSetupDeadlineUnblocksStalledServer：cc-mysub 完成 TCP+TLS 握手但永不回 CONNECT
+// 200(established-but-idle 停滞),setupTimeout 后被超时解除,handle 回 502 而非永久挂死。无修复时
+// `up.Handshake()`/`ubr.ReadString` 在 established TCP 上无 OS 级超时 → 永久阻塞、泄漏 goroutine/FD。
+func TestSplitter_ChainSetupDeadlineUnblocksStalledServer(t *testing.T) {
+	const serverName = "cc.example"
+	cert, caPool := selfSigned(t, serverName)
+
+	upLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	stall := make(chan struct{})
+	defer close(stall)
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _, _ = readConnectBlock(c) // 驱动 TLS 握手 + 消费 CONNECT 块,然后停滞
+		<-stall                       // 永不回 200(established-but-idle)
+	}()
+
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
+	}
+	sp := newTrusting(serverName, clientLeaf(t), caPool, nil, dial)
+	sp.setupTimeout = 200 * time.Millisecond
+	spLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spLn.Close()
+	go sp.Serve(spLn)
+
+	c, err := net.Dial("tcp", spLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(c)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("client read after stalled cc-mysub: %v (setup deadline 未解除挂起?)", err)
+	}
+	if !strings.Contains(status, "502") {
+		t.Errorf("stalled cc-mysub 应回 502,得 %q", status)
+	}
+}
+
+// TestSplitter_RelayIdleTimeoutRecoversSilentTunnel：隧道建立后双向静默,idleTimeout 后 relay 回收
+// 并关闭连接(客户端读到 EOF/连接关闭,而非客户端自身的读 deadline 超时)。验证已建隧道不会永久占用
+// goroutine/FD,与服务端 forward.go 的 idleTimeout 对称。
+func TestSplitter_RelayIdleTimeoutRecoversSilentTunnel(t *testing.T) {
+	const serverName = "cc.example"
+	cert, caPool := selfSigned(t, serverName)
+
+	upLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	go func() {
+		c, err := upLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, _, err := readConnectBlock(c); err != nil {
+			return
+		}
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		buf := make([]byte, 256) // 隧道建立后保持静默,等对端(splitter idle 回收)关闭
+		for {
+			if _, e := c.Read(buf); e != nil {
+				return
+			}
+		}
+	}()
+
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, upLn.Addr().String())
+	}
+	sp := newTrusting(serverName, clientLeaf(t), caPool, nil, dial)
+	sp.idleTimeout = 150 * time.Millisecond
+	spLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spLn.Close()
+	go sp.Serve(spLn)
+
+	c, err := net.Dial("tcp", spLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n"))
+	// 客户端自身设一个远大于 idleTimeout 的读 deadline,用以区分「idle 回收生效(EOF/连接关闭)」与
+	//「回收未生效(读在客户端自身 deadline 上超时)」。
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	br := bufio.NewReader(c)
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(status, "200") {
+		t.Fatalf("expected 200 Connection Established, got %q err=%v", status, err)
+	}
+	if _, err := br.ReadString('\n'); err != nil { // 读掉 200 后的空行,之后隧道内应无任何字节
+		t.Fatalf("read blank line after 200: %v", err)
+	}
+	// 隧道已建立、双向静默:idle 回收应在 idleTimeout 后关闭连接,客户端读到 EOF/连接关闭。
+	if _, err := br.Read(make([]byte, 64)); err == nil {
+		t.Fatal("silent tunnel 未被 idle 回收(读到了数据?)")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("idle 回收未触发:客户端读在自身 deadline 超时而非连接关闭: %v", err)
 	}
 }

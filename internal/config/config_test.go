@@ -69,6 +69,34 @@ func TestUpstream_PoolAndLegacy(t *testing.T) {
 	}
 }
 
+// TestRequireOwnerOnly 校验敏感凭据文件的 fail-closed 权限门：仅 0600(或更严)放行，
+// 任何 group/other 可访问位被拒(codex 全仓审查 P1-3)。
+func TestRequireOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	priv := filepath.Join(dir, "priv")
+	if err := os.WriteFile(priv, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireOwnerOnly(priv); err != nil {
+		t.Errorf("0600 应通过: %v", err)
+	}
+	for _, mode := range []os.FileMode{0o640, 0o644, 0o604, 0o660, 0o666} {
+		p := filepath.Join(dir, "open")
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil { // 绕开 umask,确保实际 mode
+			t.Fatal(err)
+		}
+		if err := RequireOwnerOnly(p); err == nil {
+			t.Errorf("mode %#o 应被拒(group/other-accessible)", mode)
+		}
+	}
+	if err := RequireOwnerOnly(filepath.Join(dir, "nonexist")); err == nil {
+		t.Error("缺失文件应报错")
+	}
+}
+
 // TestParseUpstream_StrictContract 覆盖严格契约：两种 token 全空、空池、池条目空 id/token、重复 id 均须报错。
 func TestParseUpstream_StrictContract(t *testing.T) {
 	cases := map[string]string{
@@ -83,4 +111,44 @@ func TestParseUpstream_StrictContract(t *testing.T) {
 			t.Errorf("%s: expected error, got nil", name)
 		}
 	}
+}
+
+// TestDefaultDir 守 id 56：HOME/用户主目录不可解析时 DefaultDir 返回 error，
+// 绝不静默回退到文件系统根下的 /.config/cc-mysub（LaunchDaemon 最小环境无 HOME 时的 crash-loop 根因）。
+func TestDefaultDir(t *testing.T) {
+	t.Run("XDG_CONFIG_HOME wins", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", "/xdg")
+		t.Setenv("HOME", "/home/ignored")
+		got, err := DefaultDir()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if want := filepath.Join("/xdg", "cc-mysub"); got != want {
+			t.Errorf("got %q want %q", got, want)
+		}
+	})
+
+	t.Run("HOME fallback", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", "")
+		t.Setenv("HOME", "/home/alice")
+		got, err := DefaultDir()
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if want := filepath.Join("/home/alice", ".config", "cc-mysub"); got != want {
+			t.Errorf("got %q want %q", got, want)
+		}
+	})
+
+	t.Run("no HOME, no XDG → error (no root fallback)", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", "")
+		t.Setenv("HOME", "")
+		got, err := DefaultDir()
+		if err == nil {
+			t.Fatalf("expected error when HOME unresolvable, got %q (must not silently fall back to /.config)", got)
+		}
+		if got != "" {
+			t.Errorf("on error the path must be empty, got %q", got)
+		}
+	})
 }
