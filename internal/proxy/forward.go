@@ -36,7 +36,9 @@ const (
 // （由 handle() 经 http.Server.BaseContext 注入 ctx 的 deviceKey），不再从内层 token 取。
 //   - 入站无凭据（匿名遥测）→ 放行，不读 device、不注入 realToken、不碰任何头（匿名零注入）
 //   - 入站有凭据 + ctx 有设备 D → real=up.PickToken(D.Upstream)；real==""→502；注入 realToken 放行
-//   - 入站有凭据但 ctx 无设备 = 编程错（BaseContext 必注入）→ 502，绝不静默用默认 token
+//   - 入站有凭据但 ctx 无设备 = 编程错（BaseContext 必注入）→ 502，绝不静默用默认 token。
+//     哨兵按身份字段校验(CanonicalFingerprint,与 RateLimitByDevice 同维度):store.reload 保证表内
+//     指纹恒规范、但不要求 label 非空——label 是展示别名,空 label 不构成 no_device(终审反馈)。
 func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +47,7 @@ func conditionalAuth(up *config.Upstream) func(http.Handler) http.Handler {
 				return
 			}
 			d, ok := r.Context().Value(deviceKey).(auth.Device)
-			if !ok || d.Label == "" {
+			if !ok || !auth.CanonicalFingerprint(d.CertSHA256) {
 				writeJSONError(w, http.StatusBadGateway, "no_device", "authenticated connection missing device identity")
 				return
 			}

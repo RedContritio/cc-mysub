@@ -88,7 +88,7 @@ func TestRewrite_Conditional(t *testing.T) {
 	})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "REAL-A"}, {ID: "b", Token: "REAL-B"}}}
 	h := newRewriteHandler(cfgUp, rt)
-	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('8'), Upstream: "b"}
 	// connectHost 注入(生产由 handle BaseContext 注入);出站绑定它,与内层请求 Host 无关。
 	withCtx := func(r *http.Request) *http.Request {
 		ctx := context.WithValue(r.Context(), deviceKey, dev)
@@ -162,7 +162,7 @@ func TestRewrite_HitButUpstreamMissing(t *testing.T) {
 	defer up.Close()
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	h := newRewriteHandler(cfgUp, nil)
-	dev := auth.Device{Label: "laptop", Upstream: "zzz"} // 指向不存在的 id
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('9'), Upstream: "zzz"} // 指向不存在的 id
 	r := httptest.NewRequest("POST", up.URL+"/v1/messages", nil)
 	r.Header.Set("Authorization", "Bearer placeholder")
 	r = r.WithContext(context.WithValue(r.Context(), deviceKey, dev))
@@ -911,7 +911,9 @@ func TestForwardProxy_PipelinedValidTokenDeliversInnerBytes(t *testing.T) {
 }
 
 // TestConditionalAuth_NoDeviceFailsClosed 验证 P2-38:fail-closed 安全契约——入站有凭据但 ctx 无设备
-// (或空 Label) → 502 no_device,绝不 fall-through 到 up.PickToken("")=默认真 token,且上游零命中。
+// (或设备缺规范指纹) → 502 no_device,绝不 fall-through 到 up.PickToken("")=默认真 token,且上游零命中。
+// 哨兵=CanonicalFingerprint(身份字段),与下游 RateLimitByDevice 同维度:label 是展示别名非身份,
+// 合法指纹 + 空 label 的设备必须放行,不得误诊为 no_device(终审反馈)。
 func TestConditionalAuth_NoDeviceFailsClosed(t *testing.T) {
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "a", Token: "sk-ant-oat01-REAL"}}}
 	var upHits int
@@ -934,11 +936,27 @@ func TestConditionalAuth_NoDeviceFailsClosed(t *testing.T) {
 		}
 	}
 	check("no device in ctx", nil)
-	check("empty-label device", func(r *http.Request) *http.Request {
-		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: ""}))
+	check("missing fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop"}))
+	})
+	check("non-canonical fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: "ABC123"}))
+	})
+	check("uppercase 64-hex fingerprint", func(r *http.Request) *http.Request {
+		return r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "laptop", CertSHA256: strings.ToUpper(fpHex('a'))}))
 	})
 	if upHits != 0 {
 		t.Errorf("SECURITY: upstream must never be reached on no_device (default-token leak), hits=%d", upHits)
+	}
+	// 合法指纹 + 空 label:身份在场(store.reload 不要求 label 非空),必须放行——
+	// label 维度哨兵会在此误诊 502(身份在场,缺的只是别名)。
+	r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
+	r.Header.Set("Authorization", "Bearer placeholder")
+	r = r.WithContext(context.WithValue(r.Context(), deviceKey, auth.Device{Label: "", CertSHA256: fpHex('7')}))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 || upHits != 1 {
+		t.Errorf("valid-fingerprint empty-label device must pass conditionalAuth: code=%d upHits=%d", w.Code, upHits)
 	}
 }
 
@@ -1049,7 +1067,7 @@ func TestRewrite_XApiKeyOnlyStripped(t *testing.T) {
 	})
 	cfgUp := &config.Upstream{OAuthTokens: []config.UpstreamToken{{ID: "b", Token: "REAL-B"}}}
 	h := newRewriteHandler(cfgUp, rt)
-	dev := auth.Device{Label: "laptop", Upstream: "b"}
+	dev := auth.Device{Label: "laptop", CertSHA256: fpHex('0'), Upstream: "b"}
 	r := httptest.NewRequest("POST", "https://api.anthropic.com/v1/messages", nil)
 	r.Header.Set("X-Api-Key", "should-be-stripped") // 无 Authorization,仅 x-api-key
 	ctx := context.WithValue(r.Context(), deviceKey, dev)
