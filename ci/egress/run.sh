@@ -158,7 +158,7 @@ gen_audit_pki() {
   openssl x509 -req -in "$AUDIT_CA/$PROXY_HOST.csr" -CA "$AUDIT_CA/ca.crt" -CAkey "$AUDIT_CA/ca.key" \
     -CAcreateserial -days 1 -extfile <(printf "subjectAltName=DNS:%s" "$PROXY_HOST") \
     -out "$WORK/cfg/certs/$PROXY_HOST.crt" >/dev/null 2>&1 || fail "openssl leaf $PROXY_HOST"
-  chmod 600 "$WORK/cfg/certs/$PROXY_HOST.key" # cc-mysub 启动校验外层私钥权限(P1-3),openssl 默认 644 会被拒
+  chmod 600 "$WORK/cfg/certs/$PROXY_HOST.key" # cc-mysub 每次握手校验外层私钥权限(启动探载同路径,Backlog P2),openssl 默认 644 会被拒
   # Install audit CA into the container system trust store so cc-mysub's
   # http.DefaultTransport (system roots) trusts the mock's api.anthropic.com cert.
   $SUDO cp "$AUDIT_CA/ca.crt" /usr/local/share/ca-certificates/egress-audit-ca.crt 2>/dev/null \
